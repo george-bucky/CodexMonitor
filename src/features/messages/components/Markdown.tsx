@@ -25,6 +25,22 @@ export function Markdown({
   onOpenFileLinkMenu,
 }: MarkdownProps) {
   const content = codeBlock ? `\`\`\`\n${value}\n\`\`\`` : value;
+  const normalizeExternalUrl = (url: string) => {
+    const lower = url.toLowerCase();
+    if (
+      lower.startsWith("http://") ||
+      lower.startsWith("https://") ||
+      lower.startsWith("mailto:")
+    ) {
+      return url;
+    }
+    if (lower.startsWith("www.")) {
+      return `https://${url}`;
+    }
+    return null;
+  };
+  const shouldOpenExternal = (event: React.MouseEvent) =>
+    event.metaKey || event.ctrlKey;
   const handleFileLinkClick = (event: React.MouseEvent, path: string) => {
     event.preventDefault();
     event.stopPropagation();
@@ -44,11 +60,12 @@ export function Markdown({
         remarkPlugins={[remarkGfm, remarkFileLinks]}
         urlTransform={(url) => {
           const hasScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(url);
+          const lowerUrl = url.toLowerCase();
           if (
             isFileLinkUrl(url) ||
-            url.startsWith("http://") ||
-            url.startsWith("https://") ||
-            url.startsWith("mailto:") ||
+            lowerUrl.startsWith("http://") ||
+            lowerUrl.startsWith("https://") ||
+            lowerUrl.startsWith("mailto:") ||
             url.startsWith("#") ||
             url.startsWith("/") ||
             url.startsWith("./") ||
@@ -78,10 +95,8 @@ export function Markdown({
                 </a>
               );
             }
-            const isExternal =
-              url.startsWith("http://") ||
-              url.startsWith("https://") ||
-              url.startsWith("mailto:");
+            const externalUrl = normalizeExternalUrl(url);
+            const isExternal = Boolean(externalUrl);
 
             if (!isExternal) {
               return <a href={href}>{children}</a>;
@@ -93,8 +108,12 @@ export function Markdown({
                 onClick={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
-                  void openUrl(url);
+                  if (!shouldOpenExternal(event)) {
+                    return;
+                  }
+                  void openUrl(externalUrl ?? url);
                 }}
+                title="Cmd-click to open link"
               >
                 {children}
               </a>

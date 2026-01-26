@@ -13,6 +13,26 @@ import {
 } from "../../../services/tauri";
 
 const MAX_BUFFER_CHARS = 200_000;
+const DEFAULT_TERMINAL_FOREGROUND = "#d9dee7";
+
+function readCssColor(variableName: string, fallback: string) {
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+  const value = getComputedStyle(document.documentElement)
+    .getPropertyValue(variableName)
+    .trim();
+  return value || fallback;
+}
+
+function buildTerminalTheme() {
+  const foreground = readCssColor("--text-faint", DEFAULT_TERMINAL_FOREGROUND);
+  return {
+    background: "transparent",
+    foreground,
+    cursor: foreground,
+  };
+}
 
 type UseTerminalSessionOptions = {
   activeWorkspace: WorkspaceInfo | null;
@@ -61,6 +81,7 @@ export function useTerminalSession({
   const [status, setStatus] = useState<TerminalStatus>("idle");
   const [message, setMessage] = useState("Open a terminal to start a session.");
   const [hasSession, setHasSession] = useState(false);
+  const [terminalTheme, setTerminalTheme] = useState(buildTerminalTheme);
   const cleanupTerminalSession = useCallback((workspaceId: string, terminalId: string) => {
     const key = `${workspaceId}:${terminalId}`;
     outputBuffersRef.current.delete(key);
@@ -96,6 +117,49 @@ export function useTerminalSession({
     terminal.refresh(0, lastRow);
     terminal.focus();
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const root = document.documentElement;
+    const updateTheme = () => {
+      setTerminalTheme(buildTerminalTheme());
+    };
+    const observer =
+      typeof MutationObserver === "undefined"
+        ? null
+        : new MutationObserver((mutations) => {
+            if (mutations.some((mutation) => mutation.attributeName === "data-theme")) {
+              updateTheme();
+            }
+          });
+    observer?.observe(root, { attributes: true, attributeFilter: ["data-theme"] });
+    const media = window.matchMedia
+      ? window.matchMedia("(prefers-color-scheme: light)")
+      : null;
+    if (media?.addEventListener) {
+      media.addEventListener("change", updateTheme);
+    } else if (media?.addListener) {
+      media.addListener(updateTheme);
+    }
+    return () => {
+      observer?.disconnect();
+      if (media?.removeEventListener) {
+        media.removeEventListener("change", updateTheme);
+      } else if (media?.removeListener) {
+        media.removeListener(updateTheme);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!terminalRef.current) {
+      return;
+    }
+    terminalRef.current.options.theme = terminalTheme;
+    refreshTerminal();
+  }, [refreshTerminal, terminalTheme]);
 
   const syncActiveBuffer = useCallback(
     (key: string) => {
@@ -154,11 +218,7 @@ export function useTerminalSession({
         fontSize: 12,
         fontFamily: "Menlo, Monaco, \"Courier New\", monospace",
         allowTransparency: true,
-        theme: {
-          background: "transparent",
-          foreground: "#d9dee7",
-          cursor: "#d9dee7",
-        },
+        theme: terminalTheme,
         scrollback: 5000,
       });
       const fitAddon = new FitAddon();
@@ -187,7 +247,7 @@ export function useTerminalSession({
         });
       });
     }
-  }, [isVisible, onDebug]);
+  }, [isVisible, onDebug, terminalTheme]);
 
   useEffect(() => {
     return () => {
