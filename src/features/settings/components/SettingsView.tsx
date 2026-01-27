@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ask, open } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import ChevronDown from "lucide-react/dist/esm/icons/chevron-down";
 import ChevronUp from "lucide-react/dist/esm/icons/chevron-up";
 import LayoutGrid from "lucide-react/dist/esm/icons/layout-grid";
@@ -8,19 +9,28 @@ import Mic from "lucide-react/dist/esm/icons/mic";
 import Keyboard from "lucide-react/dist/esm/icons/keyboard";
 import Stethoscope from "lucide-react/dist/esm/icons/stethoscope";
 import TerminalSquare from "lucide-react/dist/esm/icons/terminal-square";
+import FileText from "lucide-react/dist/esm/icons/file-text";
 import Trash2 from "lucide-react/dist/esm/icons/trash-2";
 import X from "lucide-react/dist/esm/icons/x";
 import FlaskConical from "lucide-react/dist/esm/icons/flask-conical";
+import ExternalLink from "lucide-react/dist/esm/icons/external-link";
 import type {
   AppSettings,
   CodexDoctorResult,
   DictationModelStatus,
+  WorkspaceSettings,
+  OpenAppTarget,
   WorkspaceGroup,
   WorkspaceInfo,
 } from "../../../types";
 import { formatDownloadSize } from "../../../utils/formatting";
-import { buildShortcutValue, formatShortcut } from "../../../utils/shortcuts";
+import {
+  buildShortcutValue,
+  formatShortcut,
+  getDefaultInterruptShortcut,
+} from "../../../utils/shortcuts";
 import { clampUiScale } from "../../../utils/uiScale";
+import { getCodexConfigPath } from "../../../services/tauri";
 import {
   DEFAULT_CODE_FONT_FAMILY,
   DEFAULT_UI_FONT_FAMILY,
@@ -30,6 +40,8 @@ import {
   clampCodeFontSize,
   normalizeFontFamily,
 } from "../../../utils/fonts";
+import { DEFAULT_OPEN_APP_ID, OPEN_APP_STORAGE_KEY } from "../../app/constants";
+import { GENERIC_APP_ICON, getKnownOpenAppIcon } from "../../app/utils/openAppIcons";
 
 const DICTATION_MODELS = [
   { id: "tiny", label: "Tiny", size: "75 MB", note: "Fastest, least accurate." },
@@ -38,6 +50,77 @@ const DICTATION_MODELS = [
   { id: "medium", label: "Medium", size: "1.5 GB", note: "High accuracy." },
   { id: "large-v3", label: "Large V3", size: "3.0 GB", note: "Best accuracy, heavy download." },
 ];
+
+type ComposerPreset = AppSettings["composerEditorPreset"];
+
+type ComposerPresetSettings = Pick<
+  AppSettings,
+  | "composerFenceExpandOnSpace"
+  | "composerFenceExpandOnEnter"
+  | "composerFenceLanguageTags"
+  | "composerFenceWrapSelection"
+  | "composerFenceAutoWrapPasteMultiline"
+  | "composerFenceAutoWrapPasteCodeLike"
+  | "composerListContinuation"
+  | "composerCodeBlockCopyUseModifier"
+>;
+
+const COMPOSER_PRESET_LABELS: Record<ComposerPreset, string> = {
+  default: "Default (no helpers)",
+  helpful: "Helpful",
+  smart: "Smart",
+};
+
+const COMPOSER_PRESET_CONFIGS: Record<ComposerPreset, ComposerPresetSettings> = {
+  default: {
+    composerFenceExpandOnSpace: false,
+    composerFenceExpandOnEnter: false,
+    composerFenceLanguageTags: false,
+    composerFenceWrapSelection: false,
+    composerFenceAutoWrapPasteMultiline: false,
+    composerFenceAutoWrapPasteCodeLike: false,
+    composerListContinuation: false,
+    composerCodeBlockCopyUseModifier: false,
+  },
+  helpful: {
+    composerFenceExpandOnSpace: true,
+    composerFenceExpandOnEnter: false,
+    composerFenceLanguageTags: true,
+    composerFenceWrapSelection: true,
+    composerFenceAutoWrapPasteMultiline: true,
+    composerFenceAutoWrapPasteCodeLike: false,
+    composerListContinuation: true,
+    composerCodeBlockCopyUseModifier: false,
+  },
+  smart: {
+    composerFenceExpandOnSpace: true,
+    composerFenceExpandOnEnter: false,
+    composerFenceLanguageTags: true,
+    composerFenceWrapSelection: true,
+    composerFenceAutoWrapPasteMultiline: true,
+    composerFenceAutoWrapPasteCodeLike: true,
+    composerListContinuation: true,
+    composerCodeBlockCopyUseModifier: false,
+  },
+};
+
+const normalizeOverrideValue = (value: string): string | null => {
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+};
+
+const buildWorkspaceOverrideDrafts = (
+  projects: WorkspaceInfo[],
+  prev: Record<string, string>,
+  getValue: (workspace: WorkspaceInfo) => string | null | undefined,
+): Record<string, string> => {
+  const next: Record<string, string> = {};
+  projects.forEach((workspace) => {
+    const existing = prev[workspace.id];
+    next[workspace.id] = existing ?? getValue(workspace) ?? "";
+  });
+  return next;
+};
 
 export type SettingsViewProps = {
   workspaceGroups: WorkspaceGroup[];
@@ -61,9 +144,17 @@ export type SettingsViewProps = {
   reduceTransparency: boolean;
   onToggleTransparency: (value: boolean) => void;
   appSettings: AppSettings;
+  openAppIconById: Record<string, string>;
   onUpdateAppSettings: (next: AppSettings) => Promise<void>;
-  onRunDoctor: (codexBin: string | null) => Promise<CodexDoctorResult>;
+  onRunDoctor: (
+    codexBin: string | null,
+    codexArgs: string | null,
+  ) => Promise<CodexDoctorResult>;
   onUpdateWorkspaceCodexBin: (id: string, codexBin: string | null) => Promise<void>;
+  onUpdateWorkspaceSettings: (
+    id: string,
+    settings: Partial<WorkspaceSettings>,
+  ) => Promise<void>;
   scaleShortcutTitle: string;
   scaleShortcutText: string;
   onTestNotificationSound: () => void;
@@ -74,12 +165,20 @@ export type SettingsViewProps = {
   initialSection?: CodexSection;
 };
 
-type SettingsSection = "projects" | "display" | "dictation" | "shortcuts";
+type SettingsSection =
+  | "projects"
+  | "display"
+  | "composer"
+  | "dictation"
+  | "shortcuts"
+  | "open-apps";
 type CodexSection = SettingsSection | "codex" | "experimental";
 type ShortcutSettingKey =
   | "composerModelShortcut"
   | "composerAccessShortcut"
   | "composerReasoningShortcut"
+  | "composerCollaborationShortcut"
+  | "interruptShortcut"
   | "newAgentShortcut"
   | "newWorktreeAgentShortcut"
   | "newCloneAgentShortcut"
@@ -95,6 +194,8 @@ type ShortcutDraftKey =
   | "model"
   | "access"
   | "reasoning"
+  | "collaboration"
+  | "interrupt"
   | "newAgent"
   | "newWorktreeAgent"
   | "newCloneAgent"
@@ -107,10 +208,14 @@ type ShortcutDraftKey =
   | "cycleWorkspaceNext"
   | "cycleWorkspacePrev";
 
+type OpenAppDraft = OpenAppTarget & { argsText: string };
+
 const shortcutDraftKeyBySetting: Record<ShortcutSettingKey, ShortcutDraftKey> = {
   composerModelShortcut: "model",
   composerAccessShortcut: "access",
   composerReasoningShortcut: "reasoning",
+  composerCollaborationShortcut: "collaboration",
+  interruptShortcut: "interrupt",
   newAgentShortcut: "newAgent",
   newWorktreeAgentShortcut: "newWorktreeAgent",
   newCloneAgentShortcut: "newCloneAgent",
@@ -122,6 +227,19 @@ const shortcutDraftKeyBySetting: Record<ShortcutSettingKey, ShortcutDraftKey> = 
   cycleAgentPrevShortcut: "cycleAgentPrev",
   cycleWorkspaceNextShortcut: "cycleWorkspaceNext",
   cycleWorkspacePrevShortcut: "cycleWorkspacePrev",
+};
+
+const buildOpenAppDrafts = (targets: OpenAppTarget[]): OpenAppDraft[] =>
+  targets.map((target) => ({
+    ...target,
+    argsText: target.args.join(" "),
+  }));
+
+const createOpenAppId = () => {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `open-app-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 };
 
 export function SettingsView({
@@ -139,9 +257,11 @@ export function SettingsView({
   reduceTransparency,
   onToggleTransparency,
   appSettings,
+  openAppIconById,
   onUpdateAppSettings,
   onRunDoctor,
   onUpdateWorkspaceCodexBin,
+  onUpdateWorkspaceSettings,
   scaleShortcutTitle,
   scaleShortcutText,
   onTestNotificationSound,
@@ -153,6 +273,7 @@ export function SettingsView({
 }: SettingsViewProps) {
   const [activeSection, setActiveSection] = useState<CodexSection>("projects");
   const [codexPathDraft, setCodexPathDraft] = useState(appSettings.codexBin ?? "");
+  const [codexArgsDraft, setCodexArgsDraft] = useState(appSettings.codexArgs ?? "");
   const [remoteHostDraft, setRemoteHostDraft] = useState(appSettings.remoteBackendHost);
   const [remoteTokenDraft, setRemoteTokenDraft] = useState(appSettings.remoteBackendToken ?? "");
   const [scaleDraft, setScaleDraft] = useState(
@@ -160,22 +281,37 @@ export function SettingsView({
   );
   const [uiFontDraft, setUiFontDraft] = useState(appSettings.uiFontFamily);
   const [codeFontDraft, setCodeFontDraft] = useState(appSettings.codeFontFamily);
-  const [codeFontSizeDraft, setCodeFontSizeDraft] = useState(
-    appSettings.codeFontSize,
-  );
-  const [overrideDrafts, setOverrideDrafts] = useState<Record<string, string>>({});
+  const [codeFontSizeDraft, setCodeFontSizeDraft] = useState(appSettings.codeFontSize);
+  const [codexBinOverrideDrafts, setCodexBinOverrideDrafts] = useState<
+    Record<string, string>
+  >({});
+  const [codexHomeOverrideDrafts, setCodexHomeOverrideDrafts] = useState<
+    Record<string, string>
+  >({});
+  const [codexArgsOverrideDrafts, setCodexArgsOverrideDrafts] = useState<
+    Record<string, string>
+  >({});
   const [groupDrafts, setGroupDrafts] = useState<Record<string, string>>({});
   const [newGroupName, setNewGroupName] = useState("");
   const [groupError, setGroupError] = useState<string | null>(null);
+  const [openAppDrafts, setOpenAppDrafts] = useState<OpenAppDraft[]>(() =>
+    buildOpenAppDrafts(appSettings.openAppTargets),
+  );
+  const [openAppSelectedId, setOpenAppSelectedId] = useState(
+    appSettings.selectedOpenAppId,
+  );
   const [doctorState, setDoctorState] = useState<{
     status: "idle" | "running" | "done";
     result: CodexDoctorResult | null;
   }>({ status: "idle", result: null });
+  const [openConfigError, setOpenConfigError] = useState<string | null>(null);
   const [isSavingSettings, setIsSavingSettings] = useState(false);
   const [shortcutDrafts, setShortcutDrafts] = useState({
     model: appSettings.composerModelShortcut ?? "",
     access: appSettings.composerAccessShortcut ?? "",
     reasoning: appSettings.composerReasoningShortcut ?? "",
+    collaboration: appSettings.composerCollaborationShortcut ?? "",
+    interrupt: appSettings.interruptShortcut ?? "",
     newAgent: appSettings.newAgentShortcut ?? "",
     newWorktreeAgent: appSettings.newWorktreeAgentShortcut ?? "",
     newCloneAgent: appSettings.newCloneAgentShortcut ?? "",
@@ -202,10 +338,45 @@ export function SettingsView({
     () => groupedWorkspaces.flatMap((group) => group.workspaces),
     [groupedWorkspaces],
   );
+  const hasCodexHomeOverrides = useMemo(
+    () => projects.some((workspace) => workspace.settings.codexHome != null),
+    [projects],
+  );
+
+  useEffect(() => {
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.key !== "Escape") {
+        return;
+      }
+      event.preventDefault();
+      onClose();
+    };
+
+    const handleCloseShortcut = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) {
+        return;
+      }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "w") {
+        event.preventDefault();
+        onClose();
+      }
+    };
+
+    window.addEventListener("keydown", handleEscape);
+    window.addEventListener("keydown", handleCloseShortcut);
+    return () => {
+      window.removeEventListener("keydown", handleEscape);
+      window.removeEventListener("keydown", handleCloseShortcut);
+    };
+  }, [onClose]);
 
   useEffect(() => {
     setCodexPathDraft(appSettings.codexBin ?? "");
   }, [appSettings.codexBin]);
+
+  useEffect(() => {
+    setCodexArgsDraft(appSettings.codexArgs ?? "");
+  }, [appSettings.codexArgs]);
 
   useEffect(() => {
     setRemoteHostDraft(appSettings.remoteBackendHost);
@@ -232,10 +403,17 @@ export function SettingsView({
   }, [appSettings.codeFontSize]);
 
   useEffect(() => {
+    setOpenAppDrafts(buildOpenAppDrafts(appSettings.openAppTargets));
+    setOpenAppSelectedId(appSettings.selectedOpenAppId);
+  }, [appSettings.openAppTargets, appSettings.selectedOpenAppId]);
+
+  useEffect(() => {
     setShortcutDrafts({
       model: appSettings.composerModelShortcut ?? "",
       access: appSettings.composerAccessShortcut ?? "",
       reasoning: appSettings.composerReasoningShortcut ?? "",
+      collaboration: appSettings.composerCollaborationShortcut ?? "",
+      interrupt: appSettings.interruptShortcut ?? "",
       newAgent: appSettings.newAgentShortcut ?? "",
       newWorktreeAgent: appSettings.newWorktreeAgentShortcut ?? "",
       newCloneAgent: appSettings.newCloneAgentShortcut ?? "",
@@ -252,6 +430,8 @@ export function SettingsView({
     appSettings.composerAccessShortcut,
     appSettings.composerModelShortcut,
     appSettings.composerReasoningShortcut,
+    appSettings.composerCollaborationShortcut,
+    appSettings.interruptShortcut,
     appSettings.newAgentShortcut,
     appSettings.newWorktreeAgentShortcut,
     appSettings.newCloneAgentShortcut,
@@ -265,15 +445,40 @@ export function SettingsView({
     appSettings.cycleWorkspacePrevShortcut,
   ]);
 
+  const handleOpenConfig = useCallback(async () => {
+    setOpenConfigError(null);
+    try {
+      const configPath = await getCodexConfigPath();
+      await revealItemInDir(configPath);
+    } catch (error) {
+      setOpenConfigError(
+        error instanceof Error ? error.message : "Unable to open config.",
+      );
+    }
+  }, []);
+
   useEffect(() => {
-    setOverrideDrafts((prev) => {
-      const next: Record<string, string> = {};
-      projects.forEach((workspace) => {
-        next[workspace.id] =
-          prev[workspace.id] ?? workspace.codex_bin ?? "";
-      });
-      return next;
-    });
+    setCodexBinOverrideDrafts((prev) =>
+      buildWorkspaceOverrideDrafts(
+        projects,
+        prev,
+        (workspace) => workspace.codex_bin ?? null,
+      ),
+    );
+    setCodexHomeOverrideDrafts((prev) =>
+      buildWorkspaceOverrideDrafts(
+        projects,
+        prev,
+        (workspace) => workspace.settings.codexHome ?? null,
+      ),
+    );
+    setCodexArgsOverrideDrafts((prev) =>
+      buildWorkspaceOverrideDrafts(
+        projects,
+        prev,
+        (workspace) => workspace.settings.codexArgs ?? null,
+      ),
+    );
   }, [projects]);
 
   useEffect(() => {
@@ -292,8 +497,11 @@ export function SettingsView({
     }
   }, [initialSection]);
 
+  const nextCodexBin = codexPathDraft.trim() ? codexPathDraft.trim() : null;
+  const nextCodexArgs = codexArgsDraft.trim() ? codexArgsDraft.trim() : null;
   const codexDirty =
-    (codexPathDraft.trim() || null) !== (appSettings.codexBin ?? null);
+    nextCodexBin !== (appSettings.codexBin ?? null) ||
+    nextCodexArgs !== (appSettings.codexArgs ?? null);
 
   const trimmedScale = scaleDraft.trim();
   const parsedPercent = trimmedScale
@@ -306,7 +514,8 @@ export function SettingsView({
     try {
       await onUpdateAppSettings({
         ...appSettings,
-        codexBin: codexPathDraft.trim() ? codexPathDraft.trim() : null,
+        codexBin: nextCodexBin,
+        codexArgs: nextCodexArgs,
       });
     } finally {
       setIsSavingSettings(false);
@@ -407,6 +616,131 @@ export function SettingsView({
     });
   };
 
+  const normalizeOpenAppTargets = useCallback(
+    (drafts: OpenAppDraft[]): OpenAppTarget[] =>
+      drafts.map(({ argsText, ...target }) => ({
+        ...target,
+        label: target.label.trim(),
+        appName: (target.appName?.trim() ?? "") || null,
+        command: (target.command?.trim() ?? "") || null,
+        args: argsText.trim() ? argsText.trim().split(/\s+/) : [],
+      })),
+    [],
+  );
+
+  const handleCommitOpenApps = useCallback(
+    async (drafts: OpenAppDraft[], selectedId = openAppSelectedId) => {
+      const nextTargets = normalizeOpenAppTargets(drafts);
+      const nextSelectedId =
+        nextTargets.find((target) => target.id === selectedId)?.id ??
+        nextTargets[0]?.id ??
+        DEFAULT_OPEN_APP_ID;
+      setOpenAppDrafts(buildOpenAppDrafts(nextTargets));
+      setOpenAppSelectedId(nextSelectedId);
+      await onUpdateAppSettings({
+        ...appSettings,
+        openAppTargets: nextTargets,
+        selectedOpenAppId: nextSelectedId,
+      });
+    },
+    [
+      appSettings,
+      normalizeOpenAppTargets,
+      onUpdateAppSettings,
+      openAppSelectedId,
+    ],
+  );
+
+  const handleOpenAppDraftChange = (
+    index: number,
+    updates: Partial<OpenAppDraft>,
+  ) => {
+    setOpenAppDrafts((prev) => {
+      const next = [...prev];
+      const current = next[index];
+      if (!current) {
+        return prev;
+      }
+      next[index] = { ...current, ...updates };
+      return next;
+    });
+  };
+
+  const handleOpenAppKindChange = (index: number, kind: OpenAppTarget["kind"]) => {
+    setOpenAppDrafts((prev) => {
+      const next = [...prev];
+      const current = next[index];
+      if (!current) {
+        return prev;
+      }
+      next[index] = {
+        ...current,
+        kind,
+        appName: kind === "app" ? current.appName ?? "" : null,
+        command: kind === "command" ? current.command ?? "" : null,
+        argsText: kind === "finder" ? "" : current.argsText,
+      };
+      void handleCommitOpenApps(next);
+      return next;
+    });
+  };
+
+  const handleMoveOpenApp = (index: number, direction: "up" | "down") => {
+    const nextIndex = direction === "up" ? index - 1 : index + 1;
+    if (nextIndex < 0 || nextIndex >= openAppDrafts.length) {
+      return;
+    }
+    const next = [...openAppDrafts];
+    const [moved] = next.splice(index, 1);
+    next.splice(nextIndex, 0, moved);
+    setOpenAppDrafts(next);
+    void handleCommitOpenApps(next);
+  };
+
+  const handleDeleteOpenApp = (index: number) => {
+    if (openAppDrafts.length <= 1) {
+      return;
+    }
+    const removed = openAppDrafts[index];
+    const next = openAppDrafts.filter((_, draftIndex) => draftIndex !== index);
+    const nextSelected =
+      removed?.id === openAppSelectedId ? next[0]?.id ?? DEFAULT_OPEN_APP_ID : openAppSelectedId;
+    setOpenAppDrafts(next);
+    void handleCommitOpenApps(next, nextSelected);
+  };
+
+  const handleAddOpenApp = () => {
+    const newTarget: OpenAppDraft = {
+      id: createOpenAppId(),
+      label: "New App",
+      kind: "app",
+      appName: "",
+      command: null,
+      args: [],
+      argsText: "",
+    };
+    const next = [...openAppDrafts, newTarget];
+    setOpenAppDrafts(next);
+    void handleCommitOpenApps(next, newTarget.id);
+  };
+
+  const handleSelectOpenAppDefault = (id: string) => {
+    setOpenAppSelectedId(id);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(OPEN_APP_STORAGE_KEY, id);
+    }
+    void handleCommitOpenApps(openAppDrafts, id);
+  };
+
+  const handleComposerPresetChange = (preset: ComposerPreset) => {
+    const config = COMPOSER_PRESET_CONFIGS[preset];
+    void onUpdateAppSettings({
+      ...appSettings,
+      composerEditorPreset: preset,
+      ...config,
+    });
+  };
+
   const handleBrowseCodex = async () => {
     const selection = await open({ multiple: false, directory: false });
     if (!selection || Array.isArray(selection)) {
@@ -418,16 +752,14 @@ export function SettingsView({
   const handleRunDoctor = async () => {
     setDoctorState({ status: "running", result: null });
     try {
-      const result = await onRunDoctor(
-        codexPathDraft.trim() ? codexPathDraft.trim() : null,
-      );
+      const result = await onRunDoctor(nextCodexBin, nextCodexArgs);
       setDoctorState({ status: "done", result });
     } catch (error) {
       setDoctorState({
         status: "done",
         result: {
           ok: false,
-          codexBin: codexPathDraft.trim() ? codexPathDraft.trim() : null,
+          codexBin: nextCodexBin,
           version: null,
           appServerOk: false,
           details: error instanceof Error ? error.message : String(error),
@@ -456,7 +788,10 @@ export function SettingsView({
     event: React.KeyboardEvent<HTMLInputElement>,
     key: ShortcutSettingKey,
   ) => {
-    if (event.key === "Tab") {
+    if (event.key === "Tab" && key !== "composerCollaborationShortcut") {
+      return;
+    }
+    if (event.key === "Tab" && !event.shiftKey) {
       return;
     }
     event.preventDefault();
@@ -602,6 +937,14 @@ export function SettingsView({
             </button>
             <button
               type="button"
+              className={`settings-nav ${activeSection === "composer" ? "active" : ""}`}
+              onClick={() => setActiveSection("composer")}
+            >
+              <FileText aria-hidden />
+              Composer
+            </button>
+            <button
+              type="button"
               className={`settings-nav ${activeSection === "dictation" ? "active" : ""}`}
               onClick={() => setActiveSection("dictation")}
             >
@@ -615,6 +958,14 @@ export function SettingsView({
             >
               <Keyboard aria-hidden />
               Shortcuts
+            </button>
+            <button
+              type="button"
+              className={`settings-nav ${activeSection === "open-apps" ? "active" : ""}`}
+              onClick={() => setActiveSection("open-apps")}
+            >
+              <ExternalLink aria-hidden />
+              Open in
             </button>
             <button
               type="button"
@@ -1083,6 +1434,219 @@ export function SettingsView({
                 </div>
               </section>
             )}
+            {activeSection === "composer" && (
+              <section className="settings-section">
+                <div className="settings-section-title">Composer</div>
+                <div className="settings-section-subtitle">
+                  Control helpers and formatting behavior inside the message editor.
+                </div>
+                <div className="settings-subsection-title">Presets</div>
+                <div className="settings-subsection-subtitle">
+                  Choose a starting point and fine-tune the toggles below.
+                </div>
+                <div className="settings-field">
+                  <label className="settings-field-label" htmlFor="composer-preset">
+                    Preset
+                  </label>
+                  <select
+                    id="composer-preset"
+                    className="settings-select"
+                    value={appSettings.composerEditorPreset}
+                    onChange={(event) =>
+                      handleComposerPresetChange(
+                        event.target.value as ComposerPreset,
+                      )
+                    }
+                  >
+                    {Object.entries(COMPOSER_PRESET_LABELS).map(([preset, label]) => (
+                      <option key={preset} value={preset}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="settings-help">
+                    Presets update the toggles below. Customize any setting after selecting.
+                  </div>
+                </div>
+                <div className="settings-divider" />
+                <div className="settings-subsection-title">Code fences</div>
+                <div className="settings-toggle-row">
+                  <div>
+                    <div className="settings-toggle-title">Expand fences on Space</div>
+                    <div className="settings-toggle-subtitle">
+                      Typing ``` then Space inserts a fenced block.
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className={`settings-toggle ${appSettings.composerFenceExpandOnSpace ? "on" : ""}`}
+                    onClick={() =>
+                      void onUpdateAppSettings({
+                        ...appSettings,
+                        composerFenceExpandOnSpace: !appSettings.composerFenceExpandOnSpace,
+                      })
+                    }
+                    aria-pressed={appSettings.composerFenceExpandOnSpace}
+                  >
+                    <span className="settings-toggle-knob" />
+                  </button>
+                </div>
+                <div className="settings-toggle-row">
+                  <div>
+                    <div className="settings-toggle-title">Expand fences on Enter</div>
+                    <div className="settings-toggle-subtitle">
+                      Use Enter to expand ``` lines when enabled.
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className={`settings-toggle ${appSettings.composerFenceExpandOnEnter ? "on" : ""}`}
+                    onClick={() =>
+                      void onUpdateAppSettings({
+                        ...appSettings,
+                        composerFenceExpandOnEnter: !appSettings.composerFenceExpandOnEnter,
+                      })
+                    }
+                    aria-pressed={appSettings.composerFenceExpandOnEnter}
+                  >
+                    <span className="settings-toggle-knob" />
+                  </button>
+                </div>
+                <div className="settings-toggle-row">
+                  <div>
+                    <div className="settings-toggle-title">Support language tags</div>
+                    <div className="settings-toggle-subtitle">
+                      Allows ```lang + Space to include a language.
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className={`settings-toggle ${appSettings.composerFenceLanguageTags ? "on" : ""}`}
+                    onClick={() =>
+                      void onUpdateAppSettings({
+                        ...appSettings,
+                        composerFenceLanguageTags: !appSettings.composerFenceLanguageTags,
+                      })
+                    }
+                    aria-pressed={appSettings.composerFenceLanguageTags}
+                  >
+                    <span className="settings-toggle-knob" />
+                  </button>
+                </div>
+                <div className="settings-toggle-row">
+                  <div>
+                    <div className="settings-toggle-title">Wrap selection in fences</div>
+                    <div className="settings-toggle-subtitle">
+                      Wraps selected text when creating a fence.
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className={`settings-toggle ${appSettings.composerFenceWrapSelection ? "on" : ""}`}
+                    onClick={() =>
+                      void onUpdateAppSettings({
+                        ...appSettings,
+                        composerFenceWrapSelection: !appSettings.composerFenceWrapSelection,
+                      })
+                    }
+                    aria-pressed={appSettings.composerFenceWrapSelection}
+                  >
+                    <span className="settings-toggle-knob" />
+                  </button>
+                </div>
+                <div className="settings-toggle-row">
+                  <div>
+                    <div className="settings-toggle-title">Copy blocks without fences</div>
+                    <div className="settings-toggle-subtitle">
+                      When enabled, Copy is plain text. Hold Option to include ``` fences.
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className={`settings-toggle ${appSettings.composerCodeBlockCopyUseModifier ? "on" : ""}`}
+                    onClick={() =>
+                      void onUpdateAppSettings({
+                        ...appSettings,
+                        composerCodeBlockCopyUseModifier:
+                          !appSettings.composerCodeBlockCopyUseModifier,
+                      })
+                    }
+                    aria-pressed={appSettings.composerCodeBlockCopyUseModifier}
+                  >
+                    <span className="settings-toggle-knob" />
+                  </button>
+                </div>
+                <div className="settings-divider" />
+                <div className="settings-subsection-title">Pasting</div>
+                <div className="settings-toggle-row">
+                  <div>
+                    <div className="settings-toggle-title">Auto-wrap multi-line paste</div>
+                    <div className="settings-toggle-subtitle">
+                      Wraps multi-line paste inside a fenced block.
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className={`settings-toggle ${appSettings.composerFenceAutoWrapPasteMultiline ? "on" : ""}`}
+                    onClick={() =>
+                      void onUpdateAppSettings({
+                        ...appSettings,
+                        composerFenceAutoWrapPasteMultiline:
+                          !appSettings.composerFenceAutoWrapPasteMultiline,
+                      })
+                    }
+                    aria-pressed={appSettings.composerFenceAutoWrapPasteMultiline}
+                  >
+                    <span className="settings-toggle-knob" />
+                  </button>
+                </div>
+                <div className="settings-toggle-row">
+                  <div>
+                    <div className="settings-toggle-title">Auto-wrap code-like single lines</div>
+                    <div className="settings-toggle-subtitle">
+                      Wraps long single-line code snippets on paste.
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className={`settings-toggle ${appSettings.composerFenceAutoWrapPasteCodeLike ? "on" : ""}`}
+                    onClick={() =>
+                      void onUpdateAppSettings({
+                        ...appSettings,
+                        composerFenceAutoWrapPasteCodeLike:
+                          !appSettings.composerFenceAutoWrapPasteCodeLike,
+                      })
+                    }
+                    aria-pressed={appSettings.composerFenceAutoWrapPasteCodeLike}
+                  >
+                    <span className="settings-toggle-knob" />
+                  </button>
+                </div>
+                <div className="settings-divider" />
+                <div className="settings-subsection-title">Lists</div>
+                <div className="settings-toggle-row">
+                  <div>
+                    <div className="settings-toggle-title">Continue lists on Shift+Enter</div>
+                    <div className="settings-toggle-subtitle">
+                      Continues numbered and bulleted lists when the line has content.
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className={`settings-toggle ${appSettings.composerListContinuation ? "on" : ""}`}
+                    onClick={() =>
+                      void onUpdateAppSettings({
+                        ...appSettings,
+                        composerListContinuation: !appSettings.composerListContinuation,
+                      })
+                    }
+                    aria-pressed={appSettings.composerListContinuation}
+                  >
+                    <span className="settings-toggle-knob" />
+                  </button>
+                </div>
+              </section>
+            )}
             {activeSection === "dictation" && (
               <section className="settings-section">
                 <div className="settings-section-title">Dictation</div>
@@ -1370,7 +1934,7 @@ export function SettingsView({
                 <div className="settings-divider" />
                 <div className="settings-subsection-title">Composer</div>
                 <div className="settings-subsection-subtitle">
-                  Cycle between model, access, and reasoning modes.
+                  Cycle between model, access, reasoning, and collaboration modes.
                 </div>
                 <div className="settings-field">
                   <div className="settings-field-label">Cycle model</div>
@@ -1442,6 +2006,54 @@ export function SettingsView({
                   </div>
                   <div className="settings-help">
                     Default: {formatShortcut("cmd+shift+r")}
+                  </div>
+                </div>
+                <div className="settings-field">
+                  <div className="settings-field-label">Cycle collaboration mode</div>
+                  <div className="settings-field-row">
+                    <input
+                      className="settings-input settings-input--shortcut"
+                      value={formatShortcut(shortcutDrafts.collaboration)}
+                      onKeyDown={(event) =>
+                        handleShortcutKeyDown(event, "composerCollaborationShortcut")
+                      }
+                      placeholder="Type shortcut"
+                      readOnly
+                    />
+                    <button
+                      type="button"
+                      className="ghost settings-button-compact"
+                      onClick={() => void updateShortcut("composerCollaborationShortcut", null)}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                  <div className="settings-help">
+                    Default: {formatShortcut("shift+tab")}
+                  </div>
+                </div>
+                <div className="settings-field">
+                  <div className="settings-field-label">Stop active run</div>
+                  <div className="settings-field-row">
+                    <input
+                      className="settings-input settings-input--shortcut"
+                      value={formatShortcut(shortcutDrafts.interrupt)}
+                      onKeyDown={(event) =>
+                        handleShortcutKeyDown(event, "interruptShortcut")
+                      }
+                      placeholder="Type shortcut"
+                      readOnly
+                    />
+                    <button
+                      type="button"
+                      className="ghost settings-button-compact"
+                      onClick={() => void updateShortcut("interruptShortcut", null)}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                  <div className="settings-help">
+                    Default: {formatShortcut(getDefaultInterruptShortcut())}
                   </div>
                 </div>
                 <div className="settings-divider" />
@@ -1648,6 +2260,183 @@ export function SettingsView({
                 </div>
               </section>
             )}
+            {activeSection === "open-apps" && (
+              <section className="settings-section">
+                <div className="settings-section-title">Open in</div>
+                <div className="settings-section-subtitle">
+                  Customize the Open in menu shown in the title bar and file previews.
+                </div>
+                <div className="settings-open-apps">
+                  {openAppDrafts.map((target, index) => {
+                    const iconSrc =
+                      getKnownOpenAppIcon(target.id) ??
+                      openAppIconById[target.id] ??
+                      GENERIC_APP_ICON;
+                    return (
+                      <div key={target.id} className="settings-open-app-row">
+                        <div className="settings-open-app-icon-wrap" aria-hidden>
+                          <img
+                            className="settings-open-app-icon"
+                            src={iconSrc}
+                            alt=""
+                            width={18}
+                            height={18}
+                          />
+                        </div>
+                        <div className="settings-open-app-fields">
+                          <label className="settings-open-app-field settings-open-app-field--label">
+                            <span className="settings-visually-hidden">Label</span>
+                            <input
+                              className="settings-input settings-input--compact settings-open-app-input settings-open-app-input--label"
+                              value={target.label}
+                              placeholder="Label"
+                              onChange={(event) =>
+                                handleOpenAppDraftChange(index, {
+                                  label: event.target.value,
+                                })
+                              }
+                              onBlur={() => {
+                                void handleCommitOpenApps(openAppDrafts);
+                              }}
+                              aria-label={`Open app label ${index + 1}`}
+                            />
+                          </label>
+                          <label className="settings-open-app-field settings-open-app-field--type">
+                            <span className="settings-visually-hidden">Type</span>
+                            <select
+                              className="settings-select settings-select--compact settings-open-app-kind"
+                              value={target.kind}
+                              onChange={(event) =>
+                                handleOpenAppKindChange(
+                                  index,
+                                  event.target.value as OpenAppTarget["kind"],
+                                )
+                              }
+                              aria-label={`Open app type ${index + 1}`}
+                            >
+                              <option value="app">App</option>
+                              <option value="command">Command</option>
+                              <option value="finder">Finder</option>
+                            </select>
+                          </label>
+                          {target.kind === "app" && (
+                            <label className="settings-open-app-field settings-open-app-field--appname">
+                              <span className="settings-visually-hidden">App name</span>
+                              <input
+                                className="settings-input settings-input--compact settings-open-app-input settings-open-app-input--appname"
+                                value={target.appName ?? ""}
+                                placeholder="App name"
+                                onChange={(event) =>
+                                  handleOpenAppDraftChange(index, {
+                                    appName: event.target.value,
+                                  })
+                                }
+                                onBlur={() => {
+                                  void handleCommitOpenApps(openAppDrafts);
+                                }}
+                                aria-label={`Open app name ${index + 1}`}
+                              />
+                            </label>
+                          )}
+                          {target.kind === "command" && (
+                            <label className="settings-open-app-field settings-open-app-field--command">
+                              <span className="settings-visually-hidden">Command</span>
+                              <input
+                                className="settings-input settings-input--compact settings-open-app-input settings-open-app-input--command"
+                                value={target.command ?? ""}
+                                placeholder="Command"
+                                onChange={(event) =>
+                                  handleOpenAppDraftChange(index, {
+                                    command: event.target.value,
+                                  })
+                                }
+                                onBlur={() => {
+                                  void handleCommitOpenApps(openAppDrafts);
+                                }}
+                                aria-label={`Open app command ${index + 1}`}
+                              />
+                            </label>
+                          )}
+                          {target.kind !== "finder" && (
+                            <label className="settings-open-app-field settings-open-app-field--args">
+                              <span className="settings-visually-hidden">Args</span>
+                              <input
+                                className="settings-input settings-input--compact settings-open-app-input settings-open-app-input--args"
+                                value={target.argsText}
+                                placeholder="Args"
+                                onChange={(event) =>
+                                  handleOpenAppDraftChange(index, {
+                                    argsText: event.target.value,
+                                  })
+                                }
+                                onBlur={() => {
+                                  void handleCommitOpenApps(openAppDrafts);
+                                }}
+                                aria-label={`Open app args ${index + 1}`}
+                              />
+                            </label>
+                          )}
+                        </div>
+                        <div className="settings-open-app-actions">
+                          <label className="settings-open-app-default">
+                            <input
+                              type="radio"
+                              name="open-app-default"
+                              checked={target.id === openAppSelectedId}
+                              onChange={() => handleSelectOpenAppDefault(target.id)}
+                            />
+                            Default
+                          </label>
+                          <div className="settings-open-app-order">
+                            <button
+                              type="button"
+                              className="ghost icon-button"
+                              onClick={() => handleMoveOpenApp(index, "up")}
+                              disabled={index === 0}
+                              aria-label="Move up"
+                            >
+                              <ChevronUp aria-hidden />
+                            </button>
+                            <button
+                              type="button"
+                              className="ghost icon-button"
+                              onClick={() => handleMoveOpenApp(index, "down")}
+                              disabled={index === openAppDrafts.length - 1}
+                              aria-label="Move down"
+                            >
+                              <ChevronDown aria-hidden />
+                            </button>
+                          </div>
+                          <button
+                            type="button"
+                            className="ghost icon-button"
+                            onClick={() => handleDeleteOpenApp(index)}
+                            disabled={openAppDrafts.length <= 1}
+                            aria-label="Remove app"
+                            title="Remove app"
+                          >
+                            <Trash2 aria-hidden />
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="settings-open-app-footer">
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={handleAddOpenApp}
+                  >
+                    Add app
+                  </button>
+                  <div className="settings-help">
+                    Commands receive the selected path as the final argument. Apps use macOS open
+                    with optional args.
+                  </div>
+                </div>
+              </section>
+            )}
             {activeSection === "codex" && (
               <section className="settings-section">
                 <div className="settings-section-title">Codex</div>
@@ -1679,6 +2468,29 @@ export function SettingsView({
                   </div>
                   <div className="settings-help">
                     Leave empty to use the system PATH resolution.
+                  </div>
+                  <label className="settings-field-label" htmlFor="codex-args">
+                    Default Codex args
+                  </label>
+                  <div className="settings-field-row">
+                    <input
+                      id="codex-args"
+                      className="settings-input"
+                      value={codexArgsDraft}
+                      placeholder="--profile personal"
+                      onChange={(event) => setCodexArgsDraft(event.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => setCodexArgsDraft("")}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                  <div className="settings-help">
+                    Extra flags passed before <code>app-server</code>. Use quotes for values with
+                    spaces.
                   </div>
                 <div className="settings-field-actions">
                   {codexDirty && (
@@ -1836,38 +2648,119 @@ export function SettingsView({
                           <div className="settings-project-path">{workspace.path}</div>
                         </div>
                         <div className="settings-override-actions">
-                          <input
-                            className="settings-input settings-input--compact"
-                            value={overrideDrafts[workspace.id] ?? ""}
-                            placeholder="Use default"
-                            onChange={(event) =>
-                              setOverrideDrafts((prev) => ({
-                                ...prev,
-                                [workspace.id]: event.target.value,
-                              }))
-                            }
-                            onBlur={async () => {
-                              const draft = overrideDrafts[workspace.id] ?? "";
-                              const nextValue = draft.trim() || null;
-                              if (nextValue === (workspace.codex_bin ?? null)) {
-                                return;
+                          <div className="settings-override-field">
+                            <input
+                              className="settings-input settings-input--compact"
+                              value={codexBinOverrideDrafts[workspace.id] ?? ""}
+                              placeholder="Codex binary override"
+                              onChange={(event) =>
+                                setCodexBinOverrideDrafts((prev) => ({
+                                  ...prev,
+                                  [workspace.id]: event.target.value,
+                                }))
                               }
-                              await onUpdateWorkspaceCodexBin(workspace.id, nextValue);
-                            }}
-                          />
-                          <button
-                            type="button"
-                            className="ghost"
-                            onClick={async () => {
-                              setOverrideDrafts((prev) => ({
-                                ...prev,
-                                [workspace.id]: "",
-                              }));
-                              await onUpdateWorkspaceCodexBin(workspace.id, null);
-                            }}
-                          >
-                            Clear
-                          </button>
+                              onBlur={async () => {
+                                const draft = codexBinOverrideDrafts[workspace.id] ?? "";
+                                const nextValue = normalizeOverrideValue(draft);
+                                if (nextValue === (workspace.codex_bin ?? null)) {
+                                  return;
+                                }
+                                await onUpdateWorkspaceCodexBin(workspace.id, nextValue);
+                              }}
+                              aria-label={`Codex binary override for ${workspace.name}`}
+                            />
+                            <button
+                              type="button"
+                              className="ghost"
+                              onClick={async () => {
+                                setCodexBinOverrideDrafts((prev) => ({
+                                  ...prev,
+                                  [workspace.id]: "",
+                                }));
+                                await onUpdateWorkspaceCodexBin(workspace.id, null);
+                              }}
+                            >
+                              Clear
+                            </button>
+                          </div>
+                          <div className="settings-override-field">
+                            <input
+                              className="settings-input settings-input--compact"
+                              value={codexHomeOverrideDrafts[workspace.id] ?? ""}
+                              placeholder="CODEX_HOME override"
+                              onChange={(event) =>
+                                setCodexHomeOverrideDrafts((prev) => ({
+                                  ...prev,
+                                  [workspace.id]: event.target.value,
+                                }))
+                              }
+                              onBlur={async () => {
+                                const draft = codexHomeOverrideDrafts[workspace.id] ?? "";
+                                const nextValue = normalizeOverrideValue(draft);
+                                if (nextValue === (workspace.settings.codexHome ?? null)) {
+                                  return;
+                                }
+                                await onUpdateWorkspaceSettings(workspace.id, {
+                                  codexHome: nextValue,
+                                });
+                              }}
+                              aria-label={`CODEX_HOME override for ${workspace.name}`}
+                            />
+                            <button
+                              type="button"
+                              className="ghost"
+                              onClick={async () => {
+                                setCodexHomeOverrideDrafts((prev) => ({
+                                  ...prev,
+                                  [workspace.id]: "",
+                                }));
+                                await onUpdateWorkspaceSettings(workspace.id, {
+                                  codexHome: null,
+                                });
+                              }}
+                            >
+                              Clear
+                            </button>
+                          </div>
+                          <div className="settings-override-field">
+                            <input
+                              className="settings-input settings-input--compact"
+                              value={codexArgsOverrideDrafts[workspace.id] ?? ""}
+                              placeholder="Codex args override"
+                              onChange={(event) =>
+                                setCodexArgsOverrideDrafts((prev) => ({
+                                  ...prev,
+                                  [workspace.id]: event.target.value,
+                                }))
+                              }
+                              onBlur={async () => {
+                                const draft = codexArgsOverrideDrafts[workspace.id] ?? "";
+                                const nextValue = normalizeOverrideValue(draft);
+                                if (nextValue === (workspace.settings.codexArgs ?? null)) {
+                                  return;
+                                }
+                                await onUpdateWorkspaceSettings(workspace.id, {
+                                  codexArgs: nextValue,
+                                });
+                              }}
+                              aria-label={`Codex args override for ${workspace.name}`}
+                            />
+                            <button
+                              type="button"
+                              className="ghost"
+                              onClick={async () => {
+                                setCodexArgsOverrideDrafts((prev) => ({
+                                  ...prev,
+                                  [workspace.id]: "",
+                                }));
+                                await onUpdateWorkspaceSettings(workspace.id, {
+                                  codexArgs: null,
+                                });
+                              }}
+                            >
+                              Clear
+                            </button>
+                          </div>
                         </div>
                       </div>
                     ))}
@@ -1885,9 +2778,30 @@ export function SettingsView({
                 <div className="settings-section-subtitle">
                   Preview features that may change or be removed.
                 </div>
+                {hasCodexHomeOverrides && (
+                  <div className="settings-help">
+                    Experimental flags are stored in the default CODEX_HOME config.toml.
+                    <br />
+                    Workspace overrides are not updated.
+                  </div>
+                )}
                 <div className="settings-toggle-row">
                   <div>
-                    <div className="settings-toggle-title">Collab mode</div>
+                    <div className="settings-toggle-title">Config file</div>
+                    <div className="settings-toggle-subtitle">
+                      Open the Codex config in Finder.
+                    </div>
+                  </div>
+                  <button type="button" className="ghost" onClick={handleOpenConfig}>
+                    Open in Finder
+                  </button>
+                </div>
+                {openConfigError && (
+                  <div className="settings-help">{openConfigError}</div>
+                )}
+                <div className="settings-toggle-row">
+                  <div>
+                    <div className="settings-toggle-title">Multi-agent</div>
                     <div className="settings-toggle-subtitle">
                       Enable multi-agent collaboration tools in Codex.
                     </div>
@@ -1902,6 +2816,30 @@ export function SettingsView({
                       })
                     }
                     aria-pressed={appSettings.experimentalCollabEnabled}
+                  >
+                    <span className="settings-toggle-knob" />
+                  </button>
+                </div>
+                <div className="settings-toggle-row">
+                  <div>
+                    <div className="settings-toggle-title">Collaboration modes</div>
+                    <div className="settings-toggle-subtitle">
+                      Enable collaboration mode presets (Code, Plan).
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className={`settings-toggle ${
+                      appSettings.experimentalCollaborationModesEnabled ? "on" : ""
+                    }`}
+                    onClick={() =>
+                      void onUpdateAppSettings({
+                        ...appSettings,
+                        experimentalCollaborationModesEnabled:
+                          !appSettings.experimentalCollaborationModesEnabled,
+                      })
+                    }
+                    aria-pressed={appSettings.experimentalCollaborationModesEnabled}
                   >
                     <span className="settings-toggle-knob" />
                   </button>

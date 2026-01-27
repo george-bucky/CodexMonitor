@@ -4,9 +4,42 @@ const MAX_ITEMS_PER_THREAD = 200;
 const MAX_ITEM_TEXT = 20000;
 const TOOL_OUTPUT_RECENT_ITEMS = 40;
 const NO_TRUNCATE_TOOL_TYPES = new Set(["fileChange", "commandExecution"]);
+const READ_COMMANDS = new Set(["cat", "sed", "head", "tail", "less", "more", "nl"]);
+const LIST_COMMANDS = new Set(["ls", "tree", "find", "fd"]);
+const SEARCH_COMMANDS = new Set(["rg", "grep", "ripgrep", "findstr"]);
+const PATH_HINT_REGEX = /[\\/]/;
+const PATHLIKE_REGEX = /(\.[a-z0-9]+$)|(^\.{1,2}$)/i;
+const GLOB_HINT_REGEX = /[*?[\]{}]/;
+const RG_FLAGS_WITH_VALUES = new Set([
+  "-g",
+  "--glob",
+  "--iglob",
+  "-t",
+  "--type",
+  "--type-add",
+  "--type-not",
+  "-m",
+  "--max-count",
+  "-A",
+  "-B",
+  "-C",
+  "--context",
+  "--max-depth",
+]);
 
 function asString(value: unknown) {
   return typeof value === "string" ? value : value ? String(value) : "";
+}
+
+function asNumber(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
 }
 
 function truncateText(text: string, maxLength = MAX_ITEM_TEXT) {
@@ -47,6 +80,9 @@ export function normalizeItem(item: ConversationItem): ConversationItem {
   if (item.kind === "message") {
     return { ...item, text: truncateText(item.text) };
   }
+  if (item.kind === "explore") {
+    return item;
+  }
   if (item.kind === "reasoning") {
     return {
       ...item,
@@ -82,6 +118,303 @@ export function normalizeItem(item: ConversationItem): ConversationItem {
   return item;
 }
 
+function cleanCommandText(commandText: string) {
+  if (!commandText) {
+    return "";
+  }
+  const trimmed = commandText.trim();
+  const shellMatch = trimmed.match(
+    /^(?:\/\S+\/)?(?:bash|zsh|sh|fish)(?:\.exe)?\s+-lc\s+(?:(['"])([\s\S]+)\1|([\s\S]+))$/,
+  );
+  const inner = shellMatch ? (shellMatch[2] ?? shellMatch[3] ?? "") : trimmed;
+  const cdMatch = inner.match(
+    /^\s*cd\s+[^&;]+(?:\s*&&\s*|\s*;\s*)([\s\S]+)$/i,
+  );
+  const stripped = cdMatch ? cdMatch[1] : inner;
+  return stripped.trim();
+}
+
+function tokenizeCommand(command: string) {
+  const tokens: string[] = [];
+  const regex = /"([^"]*)"|'([^']*)'|`([^`]*)`|(\S+)/g;
+  let match: RegExpExecArray | null = regex.exec(command);
+  while (match) {
+    const [, doubleQuoted, singleQuoted, backticked, bare] = match;
+    const value = doubleQuoted ?? singleQuoted ?? backticked ?? bare ?? "";
+    if (value) {
+      tokens.push(value);
+    }
+    match = regex.exec(command);
+  }
+  return tokens;
+}
+
+function splitCommandSegments(command: string) {
+  return command
+    .split(/\s*(?:&&|;)\s*/g)
+    .map((segment) => trimAtPipe(segment))
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+}
+
+function trimAtPipe(command: string) {
+  if (!command) {
+    return "";
+  }
+  let inSingle = false;
+  let inDouble = false;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (char === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (char === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (char !== "|" || inSingle || inDouble) {
+      continue;
+    }
+    const prev = index > 0 ? command[index - 1] : "";
+    const next = index + 1 < command.length ? command[index + 1] : "";
+    const prevIsSpace = prev === "" || /\s/.test(prev);
+    const nextIsSpace = next === "" || /\s/.test(next);
+    if (!prevIsSpace || !nextIsSpace) {
+      continue;
+    }
+    return command.slice(0, index).trim();
+  }
+  return command.trim();
+}
+
+function isOptionToken(token: string) {
+  return token.startsWith("-");
+}
+
+function isPathLike(token: string) {
+  if (!token || isOptionToken(token)) {
+    return false;
+  }
+  if (GLOB_HINT_REGEX.test(token)) {
+    return false;
+  }
+  return PATH_HINT_REGEX.test(token) || PATHLIKE_REGEX.test(token);
+}
+
+function collectNonFlagOperands(tokens: string[], commandName: string) {
+  const operands: string[] = [];
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (isOptionToken(token)) {
+      if (commandName === "rg" && RG_FLAGS_WITH_VALUES.has(token)) {
+        index += 1;
+      }
+      continue;
+    }
+    operands.push(token);
+  }
+  return operands;
+}
+
+function findPathTokens(tokens: string[]) {
+  const commandName = tokens[0]?.toLowerCase() ?? "";
+  const positional = collectNonFlagOperands(tokens, commandName);
+  const pathLike = positional.filter(isPathLike);
+  return pathLike.length > 0 ? pathLike : positional;
+}
+
+function normalizeCommandStatus(status?: string) {
+  const normalized = (status ?? "").toLowerCase();
+  return /(pending|running|processing|started|in_progress)/.test(normalized)
+    ? "exploring"
+    : "explored";
+}
+
+function isFailedStatus(status?: string) {
+  const normalized = (status ?? "").toLowerCase();
+  return /(fail|error)/.test(normalized);
+}
+
+type ExploreEntry = Extract<ConversationItem, { kind: "explore" }>["entries"][number];
+type ExploreItem = Extract<ConversationItem, { kind: "explore" }>;
+
+function parseSearch(tokens: string[]): ExploreEntry | null {
+  const commandName = tokens[0]?.toLowerCase() ?? "";
+  const hasFilesFlag = tokens.some((token) => token === "--files");
+  if (tokens[0] === "rg" && hasFilesFlag) {
+    const paths = findPathTokens(tokens);
+    const path = paths[paths.length - 1] || "rg --files";
+    return { kind: "list", label: path };
+  }
+  const positional = collectNonFlagOperands(tokens, commandName);
+  if (positional.length === 0) {
+    return null;
+  }
+  const query = positional[0];
+  const rawPath = positional.length > 1 ? positional[1] : "";
+  const path =
+    commandName === "rg" ? rawPath : rawPath && isPathLike(rawPath) ? rawPath : "";
+  const label = path ? `${query} in ${path}` : query;
+  return { kind: "search", label };
+}
+
+function parseRead(tokens: string[]): ExploreEntry[] | null {
+  const paths = findPathTokens(tokens).filter(Boolean);
+  if (paths.length === 0) {
+    return null;
+  }
+  const entries = paths.map((path) => {
+    const name = path.split(/[\\/]/g).filter(Boolean).pop() ?? path;
+    return name && name !== path
+      ? ({ kind: "read", label: name, detail: path } satisfies ExploreEntry)
+      : ({ kind: "read", label: path } satisfies ExploreEntry);
+  });
+  const seen = new Set<string>();
+  const deduped: ExploreEntry[] = [];
+  for (const entry of entries) {
+    const key = entry.detail ? `${entry.label}|${entry.detail}` : entry.label;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(entry);
+  }
+  return deduped;
+}
+
+function parseList(tokens: string[]): ExploreEntry {
+  const paths = findPathTokens(tokens);
+  const path = paths[paths.length - 1];
+  return { kind: "list", label: path || tokens[0] };
+}
+
+function parseCommandSegment(command: string): ExploreEntry[] | null {
+  const tokens = tokenizeCommand(command);
+  if (tokens.length === 0) {
+    return null;
+  }
+  const commandName = tokens[0].toLowerCase();
+  if (READ_COMMANDS.has(commandName)) {
+    return parseRead(tokens);
+  }
+  if (LIST_COMMANDS.has(commandName)) {
+    return [parseList(tokens)];
+  }
+  if (SEARCH_COMMANDS.has(commandName)) {
+    const entry = parseSearch(tokens);
+    return entry ? [entry] : null;
+  }
+  return null;
+}
+
+function coalesceReadEntries(entries: ExploreEntry[]) {
+  const result: ExploreEntry[] = [];
+  const seenReads = new Set<string>();
+
+  for (const entry of entries) {
+    if (entry.kind !== "read") {
+      result.push(entry);
+      continue;
+    }
+    const key = entry.detail ? `${entry.label}|${entry.detail}` : entry.label;
+    if (seenReads.has(key)) {
+      continue;
+    }
+    seenReads.add(key);
+    result.push(entry);
+  }
+  return result;
+}
+
+function mergeExploreEntries(base: ExploreEntry[], next: ExploreEntry[]) {
+  const merged = [...base, ...next];
+  const seen = new Set<string>();
+  const deduped: ExploreEntry[] = [];
+  for (const entry of merged) {
+    const key = `${entry.kind}|${entry.label}|${entry.detail ?? ""}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(entry);
+  }
+  return deduped;
+}
+
+function summarizeCommandExecution(item: Extract<ConversationItem, { kind: "tool" }>) {
+  if (isFailedStatus(item.status)) {
+    return null;
+  }
+  const rawCommand = item.title.replace(/^Command:\s*/i, "").trim();
+  const cleaned = cleanCommandText(rawCommand);
+  if (!cleaned) {
+    return null;
+  }
+  const segments = splitCommandSegments(cleaned);
+  if (segments.length === 0) {
+    return null;
+  }
+  const entries: ExploreEntry[] = [];
+  for (const segment of segments) {
+    const parsed = parseCommandSegment(segment);
+    if (!parsed) {
+      return null;
+    }
+    entries.push(...parsed);
+  }
+  if (entries.length === 0) {
+    return null;
+  }
+  const coalescedEntries = coalesceReadEntries(entries);
+  const status: ExploreItem["status"] = normalizeCommandStatus(item.status);
+  const summary: ExploreItem = {
+    id: item.id,
+    kind: "explore",
+    status,
+    entries: coalescedEntries,
+  };
+  return summary;
+}
+
+function summarizeExploration(items: ConversationItem[]) {
+  const result: ConversationItem[] = [];
+
+  for (const item of items) {
+    if (item.kind === "explore") {
+      const last = result[result.length - 1];
+      if (last?.kind === "explore" && last.status === item.status) {
+        result[result.length - 1] = {
+          ...last,
+          entries: mergeExploreEntries(last.entries, item.entries),
+        };
+        continue;
+      }
+      result.push(item);
+      continue;
+    }
+    if (item.kind === "tool" && item.toolType === "commandExecution") {
+      const summary = summarizeCommandExecution(item);
+      if (!summary) {
+        result.push(item);
+        continue;
+      }
+      const last = result[result.length - 1];
+      if (last?.kind === "explore" && last.status === summary.status) {
+        result[result.length - 1] = {
+          ...last,
+          entries: mergeExploreEntries(last.entries, summary.entries),
+        };
+        continue;
+      }
+      result.push(summary);
+      continue;
+    }
+    result.push(item);
+  }
+  return result;
+}
+
 export function prepareThreadItems(items: ConversationItem[]) {
   const filtered: ConversationItem[] = [];
   for (const item of items) {
@@ -102,8 +435,9 @@ export function prepareThreadItems(items: ConversationItem[]) {
     normalized.length > MAX_ITEMS_PER_THREAD
       ? normalized.slice(-MAX_ITEMS_PER_THREAD)
       : normalized;
-  const cutoff = Math.max(0, limited.length - TOOL_OUTPUT_RECENT_ITEMS);
-  return limited.map((item, index) => {
+  const summarized = summarizeExploration(limited);
+  const cutoff = Math.max(0, summarized.length - TOOL_OUTPUT_RECENT_ITEMS);
+  return summarized.map((item, index) => {
     if (index >= cutoff || item.kind !== "tool") {
       return item;
     }
@@ -135,9 +469,23 @@ export function getThreadTimestamp(thread: Record<string, unknown>) {
   const raw =
     (thread.updatedAt ?? thread.updated_at ?? thread.createdAt ?? thread.created_at) ??
     0;
-  const numeric = typeof raw === "string" ? Number(raw) : Number(raw);
+  let numeric: number;
+  if (typeof raw === "string") {
+    const asNumber = Number(raw);
+    if (Number.isFinite(asNumber)) {
+      numeric = asNumber;
+    } else {
+      const parsed = Date.parse(raw);
+      if (!Number.isFinite(parsed)) {
+        return 0;
+      }
+      numeric = parsed;
+    }
+  } else {
+    numeric = Number(raw);
+  }
   if (!Number.isFinite(numeric) || numeric <= 0) {
-    return Date.now();
+    return 0;
   }
   return numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
 }
@@ -158,8 +506,18 @@ export function buildConversationItem(
   if (!id || !type) {
     return null;
   }
-  if (type === "agentMessage" || type === "userMessage") {
+  if (type === "agentMessage") {
     return null;
+  }
+  if (type === "userMessage") {
+    const content = Array.isArray(item.content) ? item.content : [];
+    const text = userInputsToText(content);
+    return {
+      id,
+      kind: "message",
+      role: "user",
+      text: text || "[message]",
+    };
   }
   if (type === "reasoning") {
     const summary = asString(item.summary ?? "");
@@ -172,6 +530,7 @@ export function buildConversationItem(
     const command = Array.isArray(item.command)
       ? item.command.map((part) => asString(part)).join(" ")
       : asString(item.command ?? "");
+    const durationMs = asNumber(item.durationMs ?? item.duration_ms);
     return {
       id,
       kind: "tool",
@@ -180,6 +539,7 @@ export function buildConversationItem(
       detail: asString(item.cwd ?? ""),
       status: asString(item.status ?? ""),
       output: asString(item.aggregatedOutput ?? ""),
+      durationMs,
     };
   }
   if (type === "fileChange") {
@@ -433,145 +793,6 @@ function chooseRicherItem(remote: ConversationItem, local: ConversationItem) {
   return remote;
 }
 
-const DEDUPE_MESSAGE_ROLES = new Set(["user", "assistant"]);
-const ASSISTANT_DEDUPE_WINDOW = 6;
-const USER_DEDUPE_WINDOW = 6;
-
-function dedupeAdjacentMessageDuplicates(
-  items: ConversationItem[],
-  remoteIds: Set<string>,
-) {
-  const deduped: ConversationItem[] = [];
-  for (const item of items) {
-    const previous = deduped[deduped.length - 1];
-    if (
-      item.kind === "message" &&
-      DEDUPE_MESSAGE_ROLES.has(item.role) &&
-      previous?.kind === "message" &&
-      previous.role === item.role &&
-      previous.text.trim() === item.text.trim()
-    ) {
-      const previousIsRemote = remoteIds.has(previous.id);
-      const currentIsRemote = remoteIds.has(item.id);
-      if (currentIsRemote && !previousIsRemote) {
-        deduped[deduped.length - 1] = item;
-      }
-      continue;
-    }
-    deduped.push(item);
-  }
-  return deduped;
-}
-
-function choosePreferredMessageDuplicate(
-  previous: ConversationItem,
-  current: ConversationItem,
-  remoteIds: Set<string>,
-) {
-  const previousIsRemote = remoteIds.has(previous.id);
-  const currentIsRemote = remoteIds.has(current.id);
-  if (previousIsRemote !== currentIsRemote) {
-    return currentIsRemote ? current : previous;
-  }
-  return current;
-}
-
-function dedupeAssistantMessagesWithinWindow(
-  items: ConversationItem[],
-  remoteIds: Set<string>,
-  windowSize = ASSISTANT_DEDUPE_WINDOW,
-) {
-  const deduped: ConversationItem[] = [];
-  for (const item of items) {
-    if (item.kind !== "message" || item.role !== "assistant") {
-      deduped.push(item);
-      continue;
-    }
-    const trimmed = item.text.trim();
-    if (!trimmed) {
-      deduped.push(item);
-      continue;
-    }
-    let matchedIndex: number | null = null;
-    for (
-      let index = deduped.length - 1;
-      index >= 0 && deduped.length - index <= windowSize;
-      index -= 1
-    ) {
-      const previous = deduped[index];
-      if (
-        previous.kind === "message" &&
-        previous.role === "assistant" &&
-        previous.text.trim() === trimmed
-      ) {
-        matchedIndex = index;
-        break;
-      }
-    }
-    if (matchedIndex === null) {
-      deduped.push(item);
-      continue;
-    }
-    const previous = deduped[matchedIndex];
-    const preferred = choosePreferredMessageDuplicate(previous, item, remoteIds);
-    if (preferred === item) {
-      deduped[matchedIndex] = item;
-    }
-  }
-  return deduped;
-}
-
-function dedupeUserMessagesWithinWindow(
-  items: ConversationItem[],
-  remoteIds: Set<string>,
-  windowSize = USER_DEDUPE_WINDOW,
-) {
-  const deduped: ConversationItem[] = [];
-  for (const item of items) {
-    if (item.kind !== "message" || item.role !== "user") {
-      deduped.push(item);
-      continue;
-    }
-    const trimmed = item.text.trim();
-    if (!trimmed) {
-      deduped.push(item);
-      continue;
-    }
-    let matchedIndex: number | null = null;
-    for (
-      let index = deduped.length - 1;
-      index >= 0 && deduped.length - index <= windowSize;
-      index -= 1
-    ) {
-      const previous = deduped[index];
-      if (
-        previous.kind === "message" &&
-        previous.role === "user" &&
-        previous.text.trim() === trimmed
-      ) {
-        matchedIndex = index;
-        break;
-      }
-    }
-    if (matchedIndex === null) {
-      deduped.push(item);
-      continue;
-    }
-    const previous = deduped[matchedIndex];
-    const previousIsRemote = remoteIds.has(previous.id);
-    const currentIsRemote = remoteIds.has(item.id);
-    if (previousIsRemote === currentIsRemote) {
-      deduped.push(item);
-      continue;
-    }
-    const preferred = choosePreferredMessageDuplicate(previous, item, remoteIds);
-    if (preferred === item) {
-      deduped[matchedIndex] = item;
-    }
-  }
-  return deduped;
-}
-
 export function mergeThreadItems(
   remoteItems: ConversationItem[],
   localItems: ConversationItem[],
@@ -579,7 +800,6 @@ export function mergeThreadItems(
   if (!localItems.length) {
     return remoteItems;
   }
-  const remoteIds = new Set(remoteItems.map((item) => item.id));
   const byId = new Map(remoteItems.map((item) => [item.id, item]));
   const merged = remoteItems.map((item) => {
     const local = localItems.find((entry) => entry.id === item.id);
@@ -590,10 +810,5 @@ export function mergeThreadItems(
       merged.push(item);
     }
   });
-  const dedupedAdjacent = dedupeAdjacentMessageDuplicates(merged, remoteIds);
-  const dedupedAssistants = dedupeAssistantMessagesWithinWindow(
-    dedupedAdjacent,
-    remoteIds,
-  );
-  return dedupeUserMessagesWithinWindow(dedupedAssistants, remoteIds);
+  return merged;
 }

@@ -3,6 +3,9 @@ export type WorkspaceSettings = {
   sortOrder?: number | null;
   groupId?: string | null;
   gitRoot?: string | null;
+  codexHome?: string | null;
+  codexArgs?: string | null;
+  launchScript?: string | null;
 };
 
 export type WorkspaceGroup = {
@@ -48,12 +51,19 @@ export type ConversationItem =
   | { id: string; kind: "review"; state: "started" | "completed"; text: string }
   | {
       id: string;
+      kind: "explore";
+      status: "exploring" | "explored";
+      entries: { kind: "read" | "search" | "list" | "run"; label: string; detail?: string }[];
+    }
+  | {
+      id: string;
       kind: "tool";
       toolType: string;
       title: string;
       detail: string;
       status?: string;
       output?: string;
+      durationMs?: number | null;
       changes?: { path: string; kind?: string; diff?: string }[];
     };
 
@@ -73,8 +83,32 @@ export type AccessMode = "read-only" | "current" | "full-access";
 export type BackendMode = "local" | "remote";
 export type ThemePreference = "system" | "light" | "dark";
 
+
+export type ComposerEditorPreset = "default" | "helpful" | "smart";
+
+export type ComposerEditorSettings = {
+  preset: ComposerEditorPreset;
+  expandFenceOnSpace: boolean;
+  expandFenceOnEnter: boolean;
+  fenceLanguageTags: boolean;
+  fenceWrapSelection: boolean;
+  autoWrapPasteMultiline: boolean;
+  autoWrapPasteCodeLike: boolean;
+  continueListOnShiftEnter: boolean;
+};
+
+export type OpenAppTarget = {
+  id: string;
+  label: string;
+  kind: "app" | "command" | "finder";
+  appName?: string | null;
+  command?: string | null;
+  args: string[];
+};
+
 export type AppSettings = {
   codexBin: string | null;
+  codexArgs: string | null;
   backendMode: BackendMode;
   remoteBackendHost: string;
   remoteBackendToken: string | null;
@@ -82,6 +116,8 @@ export type AppSettings = {
   composerModelShortcut: string | null;
   composerAccessShortcut: string | null;
   composerReasoningShortcut: string | null;
+  composerCollaborationShortcut: string | null;
+  interruptShortcut: string | null;
   newAgentShortcut: string | null;
   newWorktreeAgentShortcut: string | null;
   newCloneAgentShortcut: string | null;
@@ -102,13 +138,25 @@ export type AppSettings = {
   codeFontSize: number;
   notificationSoundsEnabled: boolean;
   experimentalCollabEnabled: boolean;
+  experimentalCollaborationModesEnabled: boolean;
   experimentalSteerEnabled: boolean;
   experimentalUnifiedExecEnabled: boolean;
   dictationEnabled: boolean;
   dictationModelId: string;
   dictationPreferredLanguage: string | null;
   dictationHoldKey: string | null;
+  composerEditorPreset: ComposerEditorPreset;
+  composerFenceExpandOnSpace: boolean;
+  composerFenceExpandOnEnter: boolean;
+  composerFenceLanguageTags: boolean;
+  composerFenceWrapSelection: boolean;
+  composerFenceAutoWrapPasteMultiline: boolean;
+  composerFenceAutoWrapPasteCodeLike: boolean;
+  composerListContinuation: boolean;
+  composerCodeBlockCopyUseModifier: boolean;
   workspaceGroups: WorkspaceGroup[];
+  openAppTargets: OpenAppTarget[];
+  selectedOpenAppId: string;
 };
 
 export type CodexDoctorResult = {
@@ -125,9 +173,42 @@ export type CodexDoctorResult = {
 
 export type ApprovalRequest = {
   workspace_id: string;
-  request_id: number;
+  request_id: number | string;
   method: string;
   params: Record<string, unknown>;
+};
+
+export type RequestUserInputOption = {
+  label: string;
+  description: string;
+};
+
+export type RequestUserInputQuestion = {
+  id: string;
+  header: string;
+  question: string;
+  options?: RequestUserInputOption[];
+};
+
+export type RequestUserInputParams = {
+  thread_id: string;
+  turn_id: string;
+  item_id: string;
+  questions: RequestUserInputQuestion[];
+};
+
+export type RequestUserInputRequest = {
+  workspace_id: string;
+  request_id: number | string;
+  params: RequestUserInputParams;
+};
+
+export type RequestUserInputAnswer = {
+  answers: string[];
+};
+
+export type RequestUserInputResponse = {
+  answers: Record<string, RequestUserInputAnswer>;
 };
 
 export type GitFileStatus = {
@@ -140,12 +221,24 @@ export type GitFileStatus = {
 export type GitFileDiff = {
   path: string;
   diff: string;
+  isBinary?: boolean;
+  isImage?: boolean;
+  oldImageData?: string | null;
+  newImageData?: string | null;
+  oldImageMime?: string | null;
+  newImageMime?: string | null;
 };
 
 export type GitCommitDiff = {
   path: string;
   status: string;
   diff: string;
+  isBinary?: boolean;
+  isImage?: boolean;
+  oldImageData?: string | null;
+  newImageData?: string | null;
+  oldImageMime?: string | null;
+  newImageMime?: string | null;
 };
 
 export type GitLogEntry = {
@@ -304,7 +397,7 @@ export type ModelOption = {
   displayName: string;
   description: string;
   supportedReasoningEfforts: { reasoningEffort: string; description: string }[];
-  defaultReasoningEffort: string;
+  defaultReasoningEffort: string | null;
   isDefault: boolean;
 };
 

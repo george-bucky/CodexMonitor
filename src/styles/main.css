@@ -26,6 +26,24 @@
   -webkit-app-region: drag;
 }
 
+.main-header,
+.main-header *,
+.main-topbar,
+.main-topbar * {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.main-header input,
+.main-header textarea,
+.main-header [contenteditable="true"],
+.main-topbar input,
+.main-topbar textarea,
+.main-topbar [contenteditable="true"] {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 .workspace-header {
   display: flex;
   align-items: center;
@@ -97,6 +115,9 @@
 
 .open-app-button .open-app-action,
 .open-app-button .open-app-toggle {
+  display: flex;
+  justify-content: center;
+  align-items: center;
   border: none;
   background: transparent;
   box-shadow: none;
@@ -158,6 +179,64 @@
 .open-app-option.is-active {
   background: var(--surface-hover);
   color: var(--text-stronger);
+}
+
+.launch-script-menu {
+  position: relative;
+}
+
+.launch-script-buttons {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.launch-script-popover {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  min-width: 240px;
+  padding: 12px;
+  border-radius: 12px;
+  z-index: 5;
+}
+
+.launch-script-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-stronger);
+  margin-bottom: 8px;
+}
+
+.launch-script-textarea {
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--border-muted);
+  background: var(--surface-control);
+  color: var(--text-strong);
+  padding: 8px;
+  font-size: 12px;
+  resize: vertical;
+  min-height: 96px;
+}
+
+.launch-script-help {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.launch-script-error {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-danger);
+}
+
+.launch-script-actions {
+  margin-top: 10px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .main-header-action {
@@ -588,6 +667,16 @@
   gap: 6px;
 }
 
+.branch-search {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.branch-search .branch-input {
+  flex: 1;
+}
+
 
 .branch-action {
   display: inline-flex;
@@ -650,6 +739,18 @@
 
 .branch-create-button:hover {
   background: var(--surface-control-hover);
+}
+
+.branch-create-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+  background: var(--surface-card);
+}
+
+.branch-create-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+  padding: 2px 8px 0;
 }
 
 .branch-list {
@@ -715,18 +816,24 @@
   display: flex;
   min-height: 0;
   min-width: 0;
+  isolation: isolate;
 }
 
 .content-layer.is-hidden {
   opacity: 0;
   pointer-events: none;
   visibility: hidden;
+  position: absolute;
+  z-index: -1;
+  contain: layout style paint;
 }
 
 .content-layer.is-active {
   opacity: 1;
   pointer-events: auto;
   visibility: visible;
+  z-index: 0;
+  contain: layout style paint;
 }
 
 .app.reduced-transparency .content {

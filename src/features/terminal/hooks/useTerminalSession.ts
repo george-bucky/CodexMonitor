@@ -13,26 +13,6 @@ import {
 } from "../../../services/tauri";
 
 const MAX_BUFFER_CHARS = 200_000;
-const DEFAULT_TERMINAL_FOREGROUND = "#d9dee7";
-
-function readCssColor(variableName: string, fallback: string) {
-  if (typeof window === "undefined") {
-    return fallback;
-  }
-  const value = getComputedStyle(document.documentElement)
-    .getPropertyValue(variableName)
-    .trim();
-  return value || fallback;
-}
-
-function buildTerminalTheme() {
-  const foreground = readCssColor("--text-faint", DEFAULT_TERMINAL_FOREGROUND);
-  return {
-    background: "transparent",
-    foreground,
-    cursor: foreground,
-  };
-}
 
 type UseTerminalSessionOptions = {
   activeWorkspace: WorkspaceInfo | null;
@@ -41,11 +21,22 @@ type UseTerminalSessionOptions = {
   onDebug?: (entry: DebugEntry) => void;
 };
 
+type TerminalAppearance = {
+  theme: {
+    background: string;
+    foreground: string;
+    cursor: string;
+    selection?: string;
+  };
+  fontFamily: string;
+};
+
 export type TerminalSessionState = {
   status: TerminalStatus;
   message: string;
   containerRef: RefObject<HTMLDivElement | null>;
   hasSession: boolean;
+  readyKey: string | null;
   cleanupTerminalSession: (workspaceId: string, terminalId: string) => void;
 };
 
@@ -60,6 +51,48 @@ function appendBuffer(existing: string | undefined, data: string): string {
 function shouldIgnoreTerminalError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
   return message.includes("Terminal session not found");
+}
+
+function getTerminalAppearance(container: HTMLElement | null): TerminalAppearance {
+  if (typeof window === "undefined") {
+    return {
+      theme: {
+        background: "transparent",
+        foreground: "#d9dee7",
+        cursor: "#d9dee7",
+      },
+      fontFamily: "Menlo, Monaco, \"Courier New\", monospace",
+    };
+  }
+
+  const target = container ?? document.documentElement;
+  const styles = getComputedStyle(target);
+  const background =
+    styles.getPropertyValue("--terminal-background").trim() ||
+    styles.getPropertyValue("--surface-debug").trim() ||
+    styles.getPropertyValue("--surface-panel").trim() ||
+    "#11151b";
+  const foreground =
+    styles.getPropertyValue("--terminal-foreground").trim() ||
+    styles.getPropertyValue("--text-stronger").trim() ||
+    "#d9dee7";
+  const cursor =
+    styles.getPropertyValue("--terminal-cursor").trim() || foreground;
+  const selection = styles.getPropertyValue("--terminal-selection").trim();
+  const fontFamily =
+    styles.getPropertyValue("--terminal-font-family").trim() ||
+    styles.getPropertyValue("--code-font-family").trim() ||
+    "Menlo, Monaco, \"Courier New\", monospace";
+
+  return {
+    theme: {
+      background,
+      foreground,
+      cursor,
+      selection: selection || undefined,
+    },
+    fontFamily,
+  };
 }
 
 export function useTerminalSession({
@@ -81,15 +114,26 @@ export function useTerminalSession({
   const [status, setStatus] = useState<TerminalStatus>("idle");
   const [message, setMessage] = useState("Open a terminal to start a session.");
   const [hasSession, setHasSession] = useState(false);
-  const [terminalTheme, setTerminalTheme] = useState(buildTerminalTheme);
+  const [terminalAppearance, setTerminalAppearance] = useState(() =>
+    getTerminalAppearance(null),
+  );
+  const [readyKey, setReadyKey] = useState<string | null>(null);
+  const [sessionResetCounter, setSessionResetCounter] = useState(0);
   const cleanupTerminalSession = useCallback((workspaceId: string, terminalId: string) => {
     const key = `${workspaceId}:${terminalId}`;
     outputBuffersRef.current.delete(key);
     openedSessionsRef.current.delete(key);
+    if (readyKey === key) {
+      setReadyKey(null);
+    }
+    setSessionResetCounter((prev) => prev + 1);
     if (activeKeyRef.current === key) {
       terminalRef.current?.reset();
+      setHasSession(false);
+      setStatus("idle");
+      setMessage("Open a terminal to start a session.");
     }
-  }, []);
+  }, [readyKey]);
 
   const activeKey = useMemo(() => {
     if (!activeWorkspace || !activeTerminalId) {
@@ -124,8 +168,9 @@ export function useTerminalSession({
     }
     const root = document.documentElement;
     const updateTheme = () => {
-      setTerminalTheme(buildTerminalTheme());
+      setTerminalAppearance(getTerminalAppearance(containerRef.current));
     };
+    updateTheme();
     const observer =
       typeof MutationObserver === "undefined"
         ? null
@@ -157,9 +202,10 @@ export function useTerminalSession({
     if (!terminalRef.current) {
       return;
     }
-    terminalRef.current.options.theme = terminalTheme;
+    terminalRef.current.options.theme = terminalAppearance.theme;
+    terminalRef.current.options.fontFamily = terminalAppearance.fontFamily;
     refreshTerminal();
-  }, [refreshTerminal, terminalTheme]);
+  }, [refreshTerminal, terminalAppearance]);
 
   const syncActiveBuffer = useCallback(
     (key: string) => {
@@ -213,12 +259,14 @@ export function useTerminalSession({
     }
 
     if (!terminalRef.current && containerRef.current) {
+      const appearance = getTerminalAppearance(containerRef.current);
+      setTerminalAppearance(appearance);
       const terminal = new Terminal({
         cursorBlink: true,
         fontSize: 12,
-        fontFamily: "Menlo, Monaco, \"Courier New\", monospace",
+        fontFamily: appearance.fontFamily,
         allowTransparency: true,
-        theme: terminalTheme,
+        theme: appearance.theme,
         scrollback: 5000,
       });
       const fitAddon = new FitAddon();
@@ -247,7 +295,7 @@ export function useTerminalSession({
         });
       });
     }
-  }, [isVisible, onDebug, terminalTheme]);
+  }, [isVisible, onDebug]);
 
   useEffect(() => {
     return () => {
@@ -264,17 +312,21 @@ export function useTerminalSession({
   useEffect(() => {
     if (!isVisible) {
       setHasSession(false);
+      setReadyKey(null);
       return;
     }
     if (!activeWorkspace || !activeTerminalId) {
       setStatus("idle");
       setMessage("Open a terminal to start a session.");
       setHasSession(false);
+      setReadyKey(null);
       return;
     }
     if (!terminalRef.current || !fitAddonRef.current) {
       setStatus("idle");
       setMessage("Preparing terminal...");
+      setHasSession(false);
+      setReadyKey(null);
       return;
     }
     const key = `${activeWorkspace.id}:${activeTerminalId}`;
@@ -293,6 +345,7 @@ export function useTerminalSession({
       setStatus("ready");
       setMessage("Terminal ready.");
       setHasSession(true);
+      setReadyKey(key);
       if (renderedKeyRef.current !== key) {
         syncActiveBuffer(key);
         renderedKeyRef.current = key;
@@ -313,6 +366,7 @@ export function useTerminalSession({
     onDebug,
     refreshTerminal,
     syncActiveBuffer,
+    sessionResetCounter,
   ]);
 
   useEffect(() => {
@@ -375,6 +429,7 @@ export function useTerminalSession({
     message,
     containerRef,
     hasSession,
+    readyKey,
     cleanupTerminalSession,
   };
 }

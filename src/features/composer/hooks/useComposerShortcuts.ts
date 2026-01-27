@@ -9,14 +9,19 @@ type UseComposerShortcutsOptions = {
   modelShortcut: string | null;
   accessShortcut: string | null;
   reasoningShortcut: string | null;
+  collaborationShortcut: string | null;
   models: ModelOption[];
+  collaborationModes: { id: string; label: string }[];
   selectedModelId: string | null;
   onSelectModel: (id: string) => void;
+  selectedCollaborationModeId: string | null;
+  onSelectCollaborationMode: (id: string | null) => void;
   accessMode: AccessMode;
   onSelectAccessMode: (mode: AccessMode) => void;
   reasoningOptions: string[];
   selectedEffort: string | null;
   onSelectEffort: (effort: string) => void;
+  reasoningSupported: boolean;
 };
 
 const ACCESS_ORDER: AccessMode[] = ["read-only", "current", "full-access"];
@@ -26,14 +31,19 @@ export function useComposerShortcuts({
   modelShortcut,
   accessShortcut,
   reasoningShortcut,
+  collaborationShortcut,
   models,
+  collaborationModes,
   selectedModelId,
   onSelectModel,
+  selectedCollaborationModeId,
+  onSelectCollaborationMode,
   accessMode,
   onSelectAccessMode,
   reasoningOptions,
   selectedEffort,
   onSelectEffort,
+  reasoningSupported,
 }: UseComposerShortcutsOptions) {
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -68,7 +78,7 @@ export function useComposerShortcuts({
       }
       if (matchesShortcut(event, reasoningShortcut)) {
         event.preventDefault();
-        if (reasoningOptions.length === 0) {
+        if (!reasoningSupported || reasoningOptions.length === 0) {
           return;
         }
         const currentIndex = reasoningOptions.indexOf(selectedEffort ?? "");
@@ -78,6 +88,24 @@ export function useComposerShortcuts({
         if (nextEffort) {
           onSelectEffort(nextEffort);
         }
+        return;
+      }
+      if (
+        collaborationModes.length > 0 &&
+        matchesShortcut(event, collaborationShortcut)
+      ) {
+        event.preventDefault();
+        const currentIndex = collaborationModes.findIndex(
+          (mode) => mode.id === selectedCollaborationModeId,
+        );
+        const nextIndex =
+          currentIndex >= 0
+            ? (currentIndex + 1) % collaborationModes.length
+            : 0;
+        const nextMode = collaborationModes[nextIndex];
+        if (nextMode) {
+          onSelectCollaborationMode(nextMode.id);
+        }
       }
     };
 
@@ -86,13 +114,18 @@ export function useComposerShortcuts({
   }, [
     accessMode,
     accessShortcut,
+    collaborationModes,
+    collaborationShortcut,
     modelShortcut,
     models,
+    onSelectCollaborationMode,
     onSelectAccessMode,
     onSelectEffort,
     onSelectModel,
     reasoningOptions,
     reasoningShortcut,
+    reasoningSupported,
+    selectedCollaborationModeId,
     selectedEffort,
     selectedModelId,
     textareaRef,

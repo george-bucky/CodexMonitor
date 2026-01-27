@@ -67,8 +67,9 @@ pub(crate) fn build_menu<R: tauri::Runtime>(
         .build(handle)?;
     let check_updates_item =
         MenuItemBuilder::with_id("check_for_updates", "Check for Updates...").build(handle)?;
-    let settings_item =
-        MenuItemBuilder::with_id("file_open_settings", "Settings...").build(handle)?;
+    let settings_item = MenuItemBuilder::with_id("file_open_settings", "Settings...")
+        .accelerator("CmdOrCtrl+,")
+        .build(handle)?;
     let app_menu = Submenu::with_items(
         handle,
         app_name.clone(),
@@ -167,15 +168,27 @@ pub(crate) fn build_menu<R: tauri::Runtime>(
         MenuItemBuilder::with_id("composer_cycle_reasoning", "Cycle Reasoning Mode")
             .accelerator("CmdOrCtrl+Shift+R")
             .build(handle)?;
+    let cycle_collaboration_item = MenuItemBuilder::with_id(
+        "composer_cycle_collaboration",
+        "Cycle Collaboration Mode",
+    )
+    .accelerator("Shift+Tab")
+    .build(handle)?;
     registry.register("composer_cycle_model", &cycle_model_item);
     registry.register("composer_cycle_access", &cycle_access_item);
     registry.register("composer_cycle_reasoning", &cycle_reasoning_item);
+    registry.register("composer_cycle_collaboration", &cycle_collaboration_item);
 
     let composer_menu = Submenu::with_items(
         handle,
         "Composer",
         true,
-        &[&cycle_model_item, &cycle_access_item, &cycle_reasoning_item],
+        &[
+            &cycle_model_item,
+            &cycle_access_item,
+            &cycle_reasoning_item,
+            &cycle_collaboration_item,
+        ],
     )?;
 
     let toggle_projects_sidebar_item =
@@ -363,6 +376,9 @@ pub(crate) fn handle_menu_event<R: tauri::Runtime>(
         "composer_cycle_model" => emit_menu_event(app, "menu-composer-cycle-model"),
         "composer_cycle_access" => emit_menu_event(app, "menu-composer-cycle-access"),
         "composer_cycle_reasoning" => emit_menu_event(app, "menu-composer-cycle-reasoning"),
+        "composer_cycle_collaboration" => {
+            emit_menu_event(app, "menu-composer-cycle-collaboration")
+        }
         "window_minimize" => {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.minimize();
@@ -379,6 +395,8 @@ pub(crate) fn handle_menu_event<R: tauri::Runtime>(
 
 fn emit_menu_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: &str) {
     if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
         let _ = window.emit(event, ());
     } else {
         let _ = app.emit(event, ());

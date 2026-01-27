@@ -78,8 +78,16 @@ const createLocalStorage = () => {
   };
 };
 
-Object.defineProperty(globalThis, "localStorage", {
-  value: createLocalStorage(),
-  configurable: true,
-  writable: true,
-});
+const hasLocalStorage = "localStorage" in globalThis;
+const existingLocalStorage = hasLocalStorage
+  ? (globalThis as { localStorage?: Storage }).localStorage
+  : null;
+
+if (!existingLocalStorage || typeof existingLocalStorage.clear !== "function") {
+  const localStorage = createLocalStorage();
+  Object.defineProperty(globalThis, "localStorage", {
+    value: localStorage,
+    configurable: true,
+    writable: true,
+  });
+}

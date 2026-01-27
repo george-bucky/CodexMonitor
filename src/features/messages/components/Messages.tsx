@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Brain from "lucide-react/dist/esm/icons/brain";
 import Check from "lucide-react/dist/esm/icons/check";
 import ChevronDown from "lucide-react/dist/esm/icons/chevron-down";
@@ -12,19 +12,34 @@ import Search from "lucide-react/dist/esm/icons/search";
 import Terminal from "lucide-react/dist/esm/icons/terminal";
 import Users from "lucide-react/dist/esm/icons/users";
 import Wrench from "lucide-react/dist/esm/icons/wrench";
-import type { ConversationItem } from "../../../types";
+import type {
+  ConversationItem,
+  OpenAppTarget,
+  RequestUserInputRequest,
+  RequestUserInputResponse,
+} from "../../../types";
 import { Markdown } from "./Markdown";
 import { DiffBlock } from "../../git/components/DiffBlock";
 import { languageFromPath } from "../../../utils/syntax";
 import { useFileLinkOpener } from "../hooks/useFileLinkOpener";
+import { RequestUserInputMessage } from "../../app/components/RequestUserInputMessage";
 
 type MessagesProps = {
   items: ConversationItem[];
   threadId: string | null;
+  workspaceId?: string | null;
   isThinking: boolean;
   processingStartedAt?: number | null;
   lastDurationMs?: number | null;
   workspacePath?: string | null;
+  openTargets: OpenAppTarget[];
+  selectedOpenAppId: string;
+  codeBlockCopyUseModifier?: boolean;
+  userInputRequests?: RequestUserInputRequest[];
+  onUserInputSubmit?: (
+    request: RequestUserInputRequest,
+    response: RequestUserInputResponse,
+  ) => void;
 };
 
 type ToolSummary = {
@@ -47,6 +62,7 @@ type MessageRowProps = {
   item: Extract<ConversationItem, { kind: "message" }>;
   isCopied: boolean;
   onCopy: (item: Extract<ConversationItem, { kind: "message" }>) => void;
+  codeBlockCopyUseModifier?: boolean;
   onOpenFileLink?: (path: string) => void;
   onOpenFileLinkMenu?: (event: React.MouseEvent, path: string) => void;
 };
@@ -75,9 +91,18 @@ type ToolRowProps = {
   onToggle: (id: string) => void;
   onOpenFileLink?: (path: string) => void;
   onOpenFileLinkMenu?: (event: React.MouseEvent, path: string) => void;
+  onRequestAutoScroll?: () => void;
 };
 
-type ToolGroupItem = Extract<ConversationItem, { kind: "tool" | "reasoning" }>;
+type ExploreRowProps = {
+  item: Extract<ConversationItem, { kind: "explore" }>;
+};
+
+type CommandOutputProps = {
+  output: string;
+};
+
+type ToolGroupItem = Extract<ConversationItem, { kind: "tool" | "reasoning" | "explore" }>;
 
 type ToolGroup = {
   id: string;
@@ -140,7 +165,7 @@ function formatCount(value: number, singular: string, plural: string) {
 }
 
 function isToolGroupItem(item: ConversationItem): item is ToolGroupItem {
-  return item.kind === "tool" || item.kind === "reasoning";
+  return item.kind === "tool" || item.kind === "reasoning" || item.kind === "explore";
 }
 
 function buildToolGroups(items: ConversationItem[]): MessageListEntry[] {
@@ -151,7 +176,9 @@ function buildToolGroups(items: ConversationItem[]): MessageListEntry[] {
     if (buffer.length === 0) {
       return;
     }
-    const toolCount = buffer.filter((item) => item.kind === "tool").length;
+    const toolCount = buffer.filter(
+      (item) => item.kind === "tool" || item.kind === "explore",
+    ).length;
     const messageCount = buffer.length - toolCount;
     if (toolCount === 0 || buffer.length === 1) {
       buffer.forEach((item) => entries.push({ kind: "item", item }));
@@ -347,6 +374,8 @@ function scrollKeyForItems(items: ConversationItem[]) {
       return `${last.id}-${last.text.length}`;
     case "reasoning":
       return `${last.id}-${last.summary.length}-${last.content.length}`;
+    case "explore":
+      return `${last.id}-${last.status}-${last.entries.length}`;
     case "tool":
       return `${last.id}-${last.status ?? ""}-${last.output?.length ?? 0}`;
     case "diff":
@@ -408,6 +437,7 @@ const MessageRow = memo(function MessageRow({
   item,
   isCopied,
   onCopy,
+  codeBlockCopyUseModifier,
   onOpenFileLink,
   onOpenFileLinkMenu,
 }: MessageRowProps) {
@@ -417,6 +447,8 @@ const MessageRow = memo(function MessageRow({
         <Markdown
           value={item.text}
           className="markdown"
+          codeBlockStyle="message"
+          codeBlockCopyUseModifier={codeBlockCopyUseModifier}
           onOpenFileLink={onOpenFileLink}
           onOpenFileLinkMenu={onOpenFileLinkMenu}
         />
@@ -553,6 +585,7 @@ const ToolRow = memo(function ToolRow({
   onToggle,
   onOpenFileLink,
   onOpenFileLinkMenu,
+  onRequestAutoScroll,
 }: ToolRowProps) {
   const isFileChange = item.toolType === "fileChange";
   const isCommand = item.toolType === "commandExecution";
@@ -581,6 +614,36 @@ const ToolRow = memo(function ToolRow({
   const shouldFadeCommand =
     isCommand && !isExpanded && (summaryValue?.length ?? 0) > 80;
   const showToolOutput = isExpanded && (!isFileChange || !hasChanges);
+  const normalizedStatus = (item.status ?? "").toLowerCase();
+  const isCommandRunning = isCommand && /in[_\s-]*progress|running|started/.test(normalizedStatus);
+  const commandDurationMs =
+    typeof item.durationMs === "number" ? item.durationMs : null;
+  const isLongRunning = commandDurationMs !== null && commandDurationMs >= 1200;
+  const [showLiveOutput, setShowLiveOutput] = useState(false);
+
+  useEffect(() => {
+    if (!isCommandRunning) {
+      setShowLiveOutput(false);
+      return;
+    }
+    const timeoutId = window.setTimeout(() => {
+      setShowLiveOutput(true);
+    }, 600);
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [isCommandRunning]);
+
+  const showCommandOutput =
+    isCommand &&
+    summary.output &&
+    (isExpanded || (isCommandRunning && showLiveOutput) || isLongRunning);
+
+  useEffect(() => {
+    if (showCommandOutput && isCommandRunning && showLiveOutput) {
+      onRequestAutoScroll?.();
+    }
+  }, [isCommandRunning, onRequestAutoScroll, showCommandOutput, showLiveOutput]);
   return (
     <div className={`tool-inline ${isExpanded ? "tool-inline-expanded" : ""}`}>
       <button
@@ -666,7 +729,8 @@ const ToolRow = memo(function ToolRow({
             onOpenFileLinkMenu={onOpenFileLinkMenu}
           />
         )}
-        {showToolOutput && summary.output && (
+        {showCommandOutput && <CommandOutput output={summary.output ?? ""} />}
+        {showToolOutput && summary.output && !isCommand && (
           <Markdown
             value={summary.output}
             className="tool-inline-output markdown"
@@ -680,13 +744,115 @@ const ToolRow = memo(function ToolRow({
   );
 });
 
+const CommandOutput = memo(function CommandOutput({ output }: CommandOutputProps) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [isPinned, setIsPinned] = useState(true);
+  const lines = useMemo(() => {
+    if (!output) {
+      return [];
+    }
+    return output.split(/\r?\n/);
+  }, [output]);
+  const maxStoredLines = 200;
+  const lineWindow = useMemo(() => {
+    if (lines.length <= maxStoredLines) {
+      return { offset: 0, lines };
+    }
+    const startIndex = lines.length - maxStoredLines;
+    return { offset: startIndex, lines: lines.slice(startIndex) };
+  }, [lines]);
+
+  const handleScroll = useCallback(() => {
+    const node = containerRef.current;
+    if (!node) {
+      return;
+    }
+    const threshold = 6;
+    const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+    setIsPinned(distanceFromBottom <= threshold);
+  }, []);
+
+  useEffect(() => {
+    const node = containerRef.current;
+    if (!node || !isPinned) {
+      return;
+    }
+    node.scrollTop = node.scrollHeight;
+  }, [lineWindow, isPinned]);
+
+  if (lineWindow.lines.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="tool-inline-terminal" role="log" aria-live="polite">
+      <div
+        className="tool-inline-terminal-lines"
+        ref={containerRef}
+        onScroll={handleScroll}
+      >
+        {lineWindow.lines.map((line, index) => (
+          <div
+            key={`${lineWindow.offset + index}-${line}`}
+            className="tool-inline-terminal-line"
+          >
+            {line || " "}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+});
+
+function exploreKindLabel(kind: ExploreRowProps["item"]["entries"][number]["kind"]) {
+  return kind[0].toUpperCase() + kind.slice(1);
+}
+
+const ExploreRow = memo(function ExploreRow({ item }: ExploreRowProps) {
+  const title = item.status === "exploring" ? "Exploring" : "Explored";
+  return (
+    <div className="tool-inline explore-inline">
+      <div className="tool-inline-bar-toggle" aria-hidden />
+      <div className="tool-inline-content">
+        <div className="explore-inline-header">
+          <Terminal
+            className={`tool-inline-icon ${
+              item.status === "exploring" ? "processing" : "completed"
+            }`}
+            size={14}
+            aria-hidden
+          />
+          <span className="explore-inline-title">{title}</span>
+        </div>
+        <div className="explore-inline-list">
+          {item.entries.map((entry, index) => (
+            <div key={`${entry.kind}-${entry.label}-${index}`} className="explore-inline-item">
+              <span className="explore-inline-kind">{exploreKindLabel(entry.kind)}</span>
+              <span className="explore-inline-label">{entry.label}</span>
+              {entry.detail && entry.detail !== entry.label && (
+                <span className="explore-inline-detail">{entry.detail}</span>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+});
+
 export const Messages = memo(function Messages({
   items,
   threadId,
+  workspaceId = null,
   isThinking,
   processingStartedAt = null,
   lastDurationMs = null,
   workspacePath = null,
+  openTargets,
+  selectedOpenAppId,
+  codeBlockCopyUseModifier = false,
+  userInputRequests = [],
+  onUserInputSubmit,
 }: MessagesProps) {
   const SCROLL_THRESHOLD_PX = 120;
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -698,11 +864,26 @@ export const Messages = memo(function Messages({
   );
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const copyTimeoutRef = useRef<number | null>(null);
-  const scrollKey = scrollKeyForItems(items);
-  const { openFileLink, showFileLinkMenu } = useFileLinkOpener(workspacePath);
+  const activeUserInputRequestId =
+    threadId && userInputRequests.length
+      ? (userInputRequests.find(
+          (request) =>
+            request.params.thread_id === threadId &&
+            (!workspaceId || request.workspace_id === workspaceId),
+        )?.request_id ?? null)
+      : null;
+  const scrollKey = `${scrollKeyForItems(items)}-${activeUserInputRequestId ?? "no-input"}`;
+  const { openFileLink, showFileLinkMenu } = useFileLinkOpener(
+    workspacePath,
+    openTargets,
+    selectedOpenAppId,
+  );
 
-  const isNearBottom = (node: HTMLDivElement) =>
-    node.scrollHeight - node.scrollTop - node.clientHeight <= SCROLL_THRESHOLD_PX;
+  const isNearBottom = useCallback(
+    (node: HTMLDivElement) =>
+      node.scrollHeight - node.scrollTop - node.clientHeight <= SCROLL_THRESHOLD_PX,
+    [SCROLL_THRESHOLD_PX],
+  );
 
   const updateAutoScroll = () => {
     if (!containerRef.current) {
@@ -710,6 +891,19 @@ export const Messages = memo(function Messages({
     }
     autoScrollRef.current = isNearBottom(containerRef.current);
   };
+
+  const requestAutoScroll = useCallback(() => {
+    if (!bottomRef.current) {
+      return;
+    }
+    const container = containerRef.current;
+    const shouldScroll =
+      autoScrollRef.current || (container ? isNearBottom(container) : true);
+    if (!shouldScroll) {
+      return;
+    }
+    bottomRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [isNearBottom]);
 
   useEffect(() => {
     autoScrollRef.current = true;
@@ -793,9 +987,19 @@ export const Messages = memo(function Messages({
         window.cancelAnimationFrame(raf2);
       }
     };
-  }, [scrollKey, isThinking]);
+  }, [scrollKey, isThinking, isNearBottom]);
 
   const groupedItems = buildToolGroups(visibleItems);
+  const hasActiveUserInputRequest = activeUserInputRequestId !== null;
+  const userInputNode =
+    hasActiveUserInputRequest && onUserInputSubmit ? (
+      <RequestUserInputMessage
+        requests={userInputRequests}
+        activeThreadId={threadId}
+        activeWorkspaceId={workspaceId}
+        onSubmit={onUserInputSubmit}
+      />
+    ) : null;
 
   const renderItem = (item: ConversationItem) => {
     if (item.kind === "message") {
@@ -806,6 +1010,7 @@ export const Messages = memo(function Messages({
           item={item}
           isCopied={isCopied}
           onCopy={handleCopyMessage}
+          codeBlockCopyUseModifier={codeBlockCopyUseModifier}
           onOpenFileLink={openFileLink}
           onOpenFileLinkMenu={showFileLinkMenu}
         />
@@ -847,8 +1052,12 @@ export const Messages = memo(function Messages({
           onToggle={toggleExpanded}
           onOpenFileLink={openFileLink}
           onOpenFileLinkMenu={showFileLinkMenu}
+          onRequestAutoScroll={requestAutoScroll}
         />
       );
+    }
+    if (item.kind === "explore") {
+      return <ExploreRow key={item.id} item={item} />;
     }
     return null;
   };
@@ -902,13 +1111,14 @@ export const Messages = memo(function Messages({
         }
         return renderItem(entry.item);
       })}
+      {userInputNode}
       <WorkingIndicator
         isThinking={isThinking}
         processingStartedAt={processingStartedAt}
         lastDurationMs={lastDurationMs}
         hasItems={items.length > 0}
       />
-      {!items.length && (
+      {!items.length && !userInputNode && (
         <div className="empty messages-empty">
           Start a thread and send a prompt to the agent.
         </div>

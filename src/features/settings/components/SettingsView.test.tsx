@@ -9,7 +9,7 @@ import {
 } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { describe, expect, it, vi } from "vitest";
-import type { AppSettings } from "../../../types";
+import type { AppSettings, WorkspaceInfo } from "../../../types";
 import { SettingsView } from "./SettingsView";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -19,6 +19,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 const baseSettings: AppSettings = {
   codexBin: null,
+  codexArgs: null,
   backendMode: "local",
   remoteBackendHost: "127.0.0.1:4732",
   remoteBackendToken: null,
@@ -26,6 +27,8 @@ const baseSettings: AppSettings = {
   composerModelShortcut: null,
   composerAccessShortcut: null,
   composerReasoningShortcut: null,
+  composerCollaborationShortcut: null,
+  interruptShortcut: null,
   newAgentShortcut: null,
   newWorktreeAgentShortcut: null,
   newCloneAgentShortcut: null,
@@ -48,13 +51,34 @@ const baseSettings: AppSettings = {
   codeFontSize: 11,
   notificationSoundsEnabled: true,
   experimentalCollabEnabled: false,
+  experimentalCollaborationModesEnabled: false,
   experimentalSteerEnabled: false,
   experimentalUnifiedExecEnabled: false,
   dictationEnabled: false,
   dictationModelId: "base",
   dictationPreferredLanguage: null,
   dictationHoldKey: null,
+  composerEditorPreset: "default",
+  composerFenceExpandOnSpace: false,
+  composerFenceExpandOnEnter: false,
+  composerFenceLanguageTags: false,
+  composerFenceWrapSelection: false,
+  composerFenceAutoWrapPasteMultiline: false,
+  composerFenceAutoWrapPasteCodeLike: false,
+  composerListContinuation: false,
+  composerCodeBlockCopyUseModifier: false,
   workspaceGroups: [],
+  openAppTargets: [
+    {
+      id: "vscode",
+      label: "VS Code",
+      kind: "app",
+      appName: "Visual Studio Code",
+      command: null,
+      args: [],
+    },
+  ],
+  selectedOpenAppId: "vscode",
 };
 
 const createDoctorResult = () => ({
@@ -82,6 +106,11 @@ const renderDisplaySection = (
     options.onUpdateAppSettings ?? vi.fn().mockResolvedValue(undefined);
   const onToggleTransparency = options.onToggleTransparency ?? vi.fn();
   const props: ComponentProps<typeof SettingsView> = {
+    reduceTransparency: options.reduceTransparency ?? false,
+    onToggleTransparency,
+    appSettings: { ...baseSettings, ...options.appSettings },
+    openAppIconById: {},
+    onUpdateAppSettings,
     workspaceGroups: [],
     groupedWorkspaces: [],
     ungroupedLabel: "Ungrouped",
@@ -93,12 +122,9 @@ const renderDisplaySection = (
     onMoveWorkspaceGroup: vi.fn().mockResolvedValue(null),
     onDeleteWorkspaceGroup: vi.fn().mockResolvedValue(null),
     onAssignWorkspaceGroup: vi.fn().mockResolvedValue(null),
-    reduceTransparency: options.reduceTransparency ?? false,
-    onToggleTransparency,
-    appSettings: { ...baseSettings, ...options.appSettings },
-    onUpdateAppSettings,
     onRunDoctor: vi.fn().mockResolvedValue(createDoctorResult()),
     onUpdateWorkspaceCodexBin: vi.fn().mockResolvedValue(undefined),
+    onUpdateWorkspaceSettings: vi.fn().mockResolvedValue(undefined),
     scaleShortcutTitle: "Scale shortcut",
     scaleShortcutText: "Use Command +/-",
     onTestNotificationSound: vi.fn(),
@@ -139,7 +165,13 @@ describe("SettingsView Display", () => {
     if (!row) {
       throw new Error("Expected reduce transparency row");
     }
-    fireEvent.click(within(row).getByRole("button"));
+    const toggle = row.querySelector(
+      "button.settings-toggle",
+    ) as HTMLButtonElement | null;
+    if (!toggle) {
+      throw new Error("Expected reduce transparency toggle");
+    }
+    fireEvent.click(toggle);
 
     expect(onToggleTransparency).toHaveBeenCalledWith(true);
   });
@@ -252,5 +284,146 @@ describe("SettingsView Display", () => {
         expect.objectContaining({ notificationSoundsEnabled: true }),
       );
     });
+  });
+});
+
+describe("SettingsView Codex overrides", () => {
+  it("updates workspace Codex args override on blur", async () => {
+    const onUpdateWorkspaceSettings = vi.fn().mockResolvedValue(undefined);
+    const workspace: WorkspaceInfo = {
+      id: "w1",
+      name: "Workspace",
+      path: "/tmp/workspace",
+      connected: false,
+      codex_bin: null,
+      kind: "main",
+      parentId: null,
+      worktree: null,
+      settings: { sidebarCollapsed: false, codexArgs: null },
+    };
+
+    render(
+      <SettingsView
+        workspaceGroups={[]}
+        groupedWorkspaces={[
+          { id: null, name: "Ungrouped", workspaces: [workspace] },
+        ]}
+        ungroupedLabel="Ungrouped"
+        onClose={vi.fn()}
+        onMoveWorkspace={vi.fn()}
+        onDeleteWorkspace={vi.fn()}
+        onCreateWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onRenameWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onMoveWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onDeleteWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onAssignWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        reduceTransparency={false}
+        onToggleTransparency={vi.fn()}
+        appSettings={baseSettings}
+        openAppIconById={{}}
+        onUpdateAppSettings={vi.fn().mockResolvedValue(undefined)}
+        onRunDoctor={vi.fn().mockResolvedValue(createDoctorResult())}
+        onUpdateWorkspaceCodexBin={vi.fn().mockResolvedValue(undefined)}
+        onUpdateWorkspaceSettings={onUpdateWorkspaceSettings}
+        scaleShortcutTitle="Scale shortcut"
+        scaleShortcutText="Use Command +/-"
+        onTestNotificationSound={vi.fn()}
+        dictationModelStatus={null}
+        onDownloadDictationModel={vi.fn()}
+        onCancelDictationDownload={vi.fn()}
+        onRemoveDictationModel={vi.fn()}
+        initialSection="codex"
+      />,
+    );
+
+    const input = screen.getByLabelText("Codex args override for Workspace");
+    fireEvent.change(input, { target: { value: "--profile dev" } });
+    fireEvent.blur(input);
+
+    await waitFor(() => {
+      expect(onUpdateWorkspaceSettings).toHaveBeenCalledWith("w1", {
+        codexArgs: "--profile dev",
+      });
+    });
+  });
+});
+
+describe("SettingsView Shortcuts", () => {
+  it("closes on Cmd+W", () => {
+    const onClose = vi.fn();
+    render(
+      <SettingsView
+        workspaceGroups={[]}
+        groupedWorkspaces={[]}
+        ungroupedLabel="Ungrouped"
+        onClose={onClose}
+        onMoveWorkspace={vi.fn()}
+        onDeleteWorkspace={vi.fn()}
+        onCreateWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onRenameWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onMoveWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onDeleteWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onAssignWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        reduceTransparency={false}
+        onToggleTransparency={vi.fn()}
+        appSettings={baseSettings}
+        openAppIconById={{}}
+        onUpdateAppSettings={vi.fn().mockResolvedValue(undefined)}
+        onRunDoctor={vi.fn().mockResolvedValue(createDoctorResult())}
+        onUpdateWorkspaceCodexBin={vi.fn().mockResolvedValue(undefined)}
+        onUpdateWorkspaceSettings={vi.fn().mockResolvedValue(undefined)}
+        scaleShortcutTitle="Scale shortcut"
+        scaleShortcutText="Use Command +/-"
+        onTestNotificationSound={vi.fn()}
+        dictationModelStatus={null}
+        onDownloadDictationModel={vi.fn()}
+        onCancelDictationDownload={vi.fn()}
+        onRemoveDictationModel={vi.fn()}
+      />,
+    );
+
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "w", metaKey: true, bubbles: true }),
+    );
+
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("closes on Escape", () => {
+    const onClose = vi.fn();
+    render(
+      <SettingsView
+        workspaceGroups={[]}
+        groupedWorkspaces={[]}
+        ungroupedLabel="Ungrouped"
+        onClose={onClose}
+        onMoveWorkspace={vi.fn()}
+        onDeleteWorkspace={vi.fn()}
+        onCreateWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onRenameWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onMoveWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onDeleteWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        onAssignWorkspaceGroup={vi.fn().mockResolvedValue(null)}
+        reduceTransparency={false}
+        onToggleTransparency={vi.fn()}
+        appSettings={baseSettings}
+        openAppIconById={{}}
+        onUpdateAppSettings={vi.fn().mockResolvedValue(undefined)}
+        onRunDoctor={vi.fn().mockResolvedValue(createDoctorResult())}
+        onUpdateWorkspaceCodexBin={vi.fn().mockResolvedValue(undefined)}
+        onUpdateWorkspaceSettings={vi.fn().mockResolvedValue(undefined)}
+        scaleShortcutTitle="Scale shortcut"
+        scaleShortcutText="Use Command +/-"
+        onTestNotificationSound={vi.fn()}
+        dictationModelStatus={null}
+        onDownloadDictationModel={vi.fn()}
+        onCancelDictationDownload={vi.fn()}
+        onRemoveDictationModel={vi.fn()}
+      />,
+    );
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+
+    expect(onClose).toHaveBeenCalled();
   });
 });

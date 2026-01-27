@@ -12,6 +12,18 @@ pub(crate) struct GitFileStatus {
 pub(crate) struct GitFileDiff {
     pub(crate) path: String,
     pub(crate) diff: String,
+    #[serde(default, rename = "isBinary")]
+    pub(crate) is_binary: bool,
+    #[serde(default, rename = "isImage")]
+    pub(crate) is_image: bool,
+    #[serde(rename = "oldImageData")]
+    pub(crate) old_image_data: Option<String>,
+    #[serde(rename = "newImageData")]
+    pub(crate) new_image_data: Option<String>,
+    #[serde(rename = "oldImageMime")]
+    pub(crate) old_image_mime: Option<String>,
+    #[serde(rename = "newImageMime")]
+    pub(crate) new_image_mime: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -19,6 +31,18 @@ pub(crate) struct GitCommitDiff {
     pub(crate) path: String,
     pub(crate) status: String,
     pub(crate) diff: String,
+    #[serde(default, rename = "isBinary")]
+    pub(crate) is_binary: bool,
+    #[serde(default, rename = "isImage")]
+    pub(crate) is_image: bool,
+    #[serde(rename = "oldImageData")]
+    pub(crate) old_image_data: Option<String>,
+    #[serde(rename = "newImageData")]
+    pub(crate) new_image_data: Option<String>,
+    #[serde(rename = "oldImageMime")]
+    pub(crate) old_image_mime: Option<String>,
+    #[serde(rename = "newImageMime")]
+    pub(crate) new_image_mime: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -238,12 +262,33 @@ pub(crate) struct WorkspaceSettings {
     pub(crate) group_id: Option<String>,
     #[serde(default, rename = "gitRoot")]
     pub(crate) git_root: Option<String>,
+    #[serde(default, rename = "codexHome")]
+    pub(crate) codex_home: Option<String>,
+    #[serde(default, rename = "codexArgs")]
+    pub(crate) codex_args: Option<String>,
+    #[serde(default, rename = "launchScript")]
+    pub(crate) launch_script: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) struct OpenAppTarget {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) kind: String,
+    #[serde(default, rename = "appName")]
+    pub(crate) app_name: Option<String>,
+    #[serde(default)]
+    pub(crate) command: Option<String>,
+    #[serde(default)]
+    pub(crate) args: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct AppSettings {
     #[serde(default, rename = "codexBin")]
     pub(crate) codex_bin: Option<String>,
+    #[serde(default, rename = "codexArgs")]
+    pub(crate) codex_args: Option<String>,
     #[serde(default, rename = "backendMode")]
     pub(crate) backend_mode: BackendMode,
     #[serde(default = "default_remote_backend_host", rename = "remoteBackendHost")]
@@ -267,6 +312,13 @@ pub(crate) struct AppSettings {
         rename = "composerReasoningShortcut"
     )]
     pub(crate) composer_reasoning_shortcut: Option<String>,
+    #[serde(default = "default_interrupt_shortcut", rename = "interruptShortcut")]
+    pub(crate) interrupt_shortcut: Option<String>,
+    #[serde(
+        default = "default_composer_collaboration_shortcut",
+        rename = "composerCollaborationShortcut"
+    )]
+    pub(crate) composer_collaboration_shortcut: Option<String>,
     #[serde(default = "default_new_agent_shortcut", rename = "newAgentShortcut")]
     pub(crate) new_agent_shortcut: Option<String>,
     #[serde(
@@ -344,6 +396,11 @@ pub(crate) struct AppSettings {
     )]
     pub(crate) experimental_collab_enabled: bool,
     #[serde(
+        default = "default_experimental_collaboration_modes_enabled",
+        rename = "experimentalCollaborationModesEnabled"
+    )]
+    pub(crate) experimental_collaboration_modes_enabled: bool,
+    #[serde(
         default = "default_experimental_steer_enabled",
         rename = "experimentalSteerEnabled"
     )]
@@ -367,8 +424,33 @@ pub(crate) struct AppSettings {
         rename = "dictationHoldKey"
     )]
     pub(crate) dictation_hold_key: String,
+    #[serde(default = "default_composer_editor_preset", rename = "composerEditorPreset")]
+    pub(crate) composer_editor_preset: String,
+    #[serde(default = "default_composer_fence_expand_on_space", rename = "composerFenceExpandOnSpace")]
+    pub(crate) composer_fence_expand_on_space: bool,
+    #[serde(default = "default_composer_fence_expand_on_enter", rename = "composerFenceExpandOnEnter")]
+    pub(crate) composer_fence_expand_on_enter: bool,
+    #[serde(default = "default_composer_fence_language_tags", rename = "composerFenceLanguageTags")]
+    pub(crate) composer_fence_language_tags: bool,
+    #[serde(default = "default_composer_fence_wrap_selection", rename = "composerFenceWrapSelection")]
+    pub(crate) composer_fence_wrap_selection: bool,
+    #[serde(default = "default_composer_fence_auto_wrap_paste_multiline", rename = "composerFenceAutoWrapPasteMultiline")]
+    pub(crate) composer_fence_auto_wrap_paste_multiline: bool,
+    #[serde(default = "default_composer_fence_auto_wrap_paste_code_like", rename = "composerFenceAutoWrapPasteCodeLike")]
+    pub(crate) composer_fence_auto_wrap_paste_code_like: bool,
+    #[serde(default = "default_composer_list_continuation", rename = "composerListContinuation")]
+    pub(crate) composer_list_continuation: bool,
+    #[serde(
+        default = "default_composer_code_block_copy_use_modifier",
+        rename = "composerCodeBlockCopyUseModifier"
+    )]
+    pub(crate) composer_code_block_copy_use_modifier: bool,
     #[serde(default = "default_workspace_groups", rename = "workspaceGroups")]
     pub(crate) workspace_groups: Vec<WorkspaceGroup>,
+    #[serde(default = "default_open_app_targets", rename = "openAppTargets")]
+    pub(crate) open_app_targets: Vec<OpenAppTarget>,
+    #[serde(default = "default_selected_open_app_id", rename = "selectedOpenAppId")]
+    pub(crate) selected_open_app_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -425,6 +507,19 @@ fn default_composer_reasoning_shortcut() -> Option<String> {
     Some("cmd+shift+r".to_string())
 }
 
+fn default_interrupt_shortcut() -> Option<String> {
+    let value = if cfg!(target_os = "macos") {
+        "ctrl+c"
+    } else {
+        "ctrl+shift+c"
+    };
+    Some(value.to_string())
+}
+
+fn default_composer_collaboration_shortcut() -> Option<String> {
+    Some("shift+tab".to_string())
+}
+
 fn default_new_agent_shortcut() -> Option<String> {
     Some("cmd+n".to_string())
 }
@@ -477,6 +572,10 @@ fn default_experimental_collab_enabled() -> bool {
     false
 }
 
+fn default_experimental_collaboration_modes_enabled() -> bool {
+    false
+}
+
 fn default_experimental_steer_enabled() -> bool {
     false
 }
@@ -497,14 +596,108 @@ fn default_dictation_hold_key() -> String {
     "alt".to_string()
 }
 
+fn default_composer_editor_preset() -> String {
+    "default".to_string()
+}
+
+fn default_composer_fence_expand_on_space() -> bool {
+    false
+}
+
+fn default_composer_fence_expand_on_enter() -> bool {
+    false
+}
+
+fn default_composer_fence_language_tags() -> bool {
+    false
+}
+
+fn default_composer_fence_wrap_selection() -> bool {
+    false
+}
+
+fn default_composer_fence_auto_wrap_paste_multiline() -> bool {
+    false
+}
+
+fn default_composer_fence_auto_wrap_paste_code_like() -> bool {
+    false
+}
+
+fn default_composer_list_continuation() -> bool {
+    false
+}
+
+fn default_composer_code_block_copy_use_modifier() -> bool {
+    false
+}
+
 fn default_workspace_groups() -> Vec<WorkspaceGroup> {
     Vec::new()
+}
+
+fn default_open_app_targets() -> Vec<OpenAppTarget> {
+    vec![
+        OpenAppTarget {
+            id: "vscode".to_string(),
+            label: "VS Code".to_string(),
+            kind: "app".to_string(),
+            app_name: Some("Visual Studio Code".to_string()),
+            command: None,
+            args: Vec::new(),
+        },
+        OpenAppTarget {
+            id: "cursor".to_string(),
+            label: "Cursor".to_string(),
+            kind: "app".to_string(),
+            app_name: Some("Cursor".to_string()),
+            command: None,
+            args: Vec::new(),
+        },
+        OpenAppTarget {
+            id: "zed".to_string(),
+            label: "Zed".to_string(),
+            kind: "app".to_string(),
+            app_name: Some("Zed".to_string()),
+            command: None,
+            args: Vec::new(),
+        },
+        OpenAppTarget {
+            id: "ghostty".to_string(),
+            label: "Ghostty".to_string(),
+            kind: "app".to_string(),
+            app_name: Some("Ghostty".to_string()),
+            command: None,
+            args: Vec::new(),
+        },
+        OpenAppTarget {
+            id: "antigravity".to_string(),
+            label: "Antigravity".to_string(),
+            kind: "app".to_string(),
+            app_name: Some("Antigravity".to_string()),
+            command: None,
+            args: Vec::new(),
+        },
+        OpenAppTarget {
+            id: "finder".to_string(),
+            label: "Finder".to_string(),
+            kind: "finder".to_string(),
+            app_name: None,
+            command: None,
+            args: Vec::new(),
+        },
+    ]
+}
+
+fn default_selected_open_app_id() -> String {
+    "vscode".to_string()
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             codex_bin: None,
+            codex_args: None,
             backend_mode: BackendMode::Local,
             remote_backend_host: default_remote_backend_host(),
             remote_backend_token: None,
@@ -512,6 +705,8 @@ impl Default for AppSettings {
             composer_model_shortcut: default_composer_model_shortcut(),
             composer_access_shortcut: default_composer_access_shortcut(),
             composer_reasoning_shortcut: default_composer_reasoning_shortcut(),
+            interrupt_shortcut: default_interrupt_shortcut(),
+            composer_collaboration_shortcut: default_composer_collaboration_shortcut(),
             new_agent_shortcut: default_new_agent_shortcut(),
             new_worktree_agent_shortcut: default_new_worktree_agent_shortcut(),
             new_clone_agent_shortcut: default_new_clone_agent_shortcut(),
@@ -532,13 +727,25 @@ impl Default for AppSettings {
             code_font_size: default_code_font_size(),
             notification_sounds_enabled: true,
             experimental_collab_enabled: false,
+            experimental_collaboration_modes_enabled: false,
             experimental_steer_enabled: false,
             experimental_unified_exec_enabled: false,
             dictation_enabled: false,
             dictation_model_id: default_dictation_model_id(),
             dictation_preferred_language: None,
             dictation_hold_key: default_dictation_hold_key(),
+            composer_editor_preset: default_composer_editor_preset(),
+            composer_fence_expand_on_space: default_composer_fence_expand_on_space(),
+            composer_fence_expand_on_enter: default_composer_fence_expand_on_enter(),
+            composer_fence_language_tags: default_composer_fence_language_tags(),
+            composer_fence_wrap_selection: default_composer_fence_wrap_selection(),
+            composer_fence_auto_wrap_paste_multiline: default_composer_fence_auto_wrap_paste_multiline(),
+            composer_fence_auto_wrap_paste_code_like: default_composer_fence_auto_wrap_paste_code_like(),
+            composer_list_continuation: default_composer_list_continuation(),
+            composer_code_block_copy_use_modifier: default_composer_code_block_copy_use_modifier(),
             workspace_groups: default_workspace_groups(),
+            open_app_targets: default_open_app_targets(),
+            selected_open_app_id: default_selected_open_app_id(),
         }
     }
 }
@@ -569,6 +776,16 @@ mod tests {
             settings.composer_reasoning_shortcut.as_deref(),
             Some("cmd+shift+r")
         );
+        assert_eq!(
+            settings.composer_collaboration_shortcut.as_deref(),
+            Some("shift+tab")
+        );
+        let expected_interrupt = if cfg!(target_os = "macos") {
+            "ctrl+c"
+        } else {
+            "ctrl+shift+c"
+        };
+        assert_eq!(settings.interrupt_shortcut.as_deref(), Some(expected_interrupt));
         assert_eq!(
             settings.toggle_debug_panel_shortcut.as_deref(),
             Some("cmd+shift+d")
@@ -606,7 +823,19 @@ mod tests {
         assert_eq!(settings.dictation_model_id, "base");
         assert!(settings.dictation_preferred_language.is_none());
         assert_eq!(settings.dictation_hold_key, "alt");
+        assert_eq!(settings.composer_editor_preset, "default");
+        assert!(!settings.composer_fence_expand_on_space);
+        assert!(!settings.composer_fence_expand_on_enter);
+        assert!(!settings.composer_fence_language_tags);
+        assert!(!settings.composer_fence_wrap_selection);
+        assert!(!settings.composer_fence_auto_wrap_paste_multiline);
+        assert!(!settings.composer_fence_auto_wrap_paste_code_like);
+        assert!(!settings.composer_list_continuation);
+        assert!(!settings.composer_code_block_copy_use_modifier);
         assert!(settings.workspace_groups.is_empty());
+        assert_eq!(settings.selected_open_app_id, "vscode");
+        assert_eq!(settings.open_app_targets.len(), 6);
+        assert_eq!(settings.open_app_targets[0].id, "vscode");
     }
 
     #[test]

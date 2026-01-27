@@ -49,6 +49,9 @@ export function WorktreePrompt({
           ref={inputRef}
           className="worktree-modal-input"
           value={branch}
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Escape") {

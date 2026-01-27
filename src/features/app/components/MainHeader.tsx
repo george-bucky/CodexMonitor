@@ -1,20 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import Check from "lucide-react/dist/esm/icons/check";
-import ChevronDown from "lucide-react/dist/esm/icons/chevron-down";
 import Copy from "lucide-react/dist/esm/icons/copy";
 import Terminal from "lucide-react/dist/esm/icons/terminal";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { openWorkspaceIn } from "../../../services/tauri";
-import type { BranchInfo, WorkspaceInfo } from "../../../types";
+import type { BranchInfo, OpenAppTarget, WorkspaceInfo } from "../../../types";
 import type { ReactNode } from "react";
-import { OPEN_APP_STORAGE_KEY, type OpenAppId } from "../constants";
-import { getStoredOpenAppId } from "../utils/openApp";
-import cursorIcon from "../../../assets/app-icons/cursor.png";
-import finderIcon from "../../../assets/app-icons/finder.png";
-import antigravityIcon from "../../../assets/app-icons/antigravity.png";
-import ghosttyIcon from "../../../assets/app-icons/ghostty.png";
-import vscodeIcon from "../../../assets/app-icons/vscode.png";
-import zedIcon from "../../../assets/app-icons/zed.png";
+import { OpenAppMenu } from "./OpenAppMenu";
+import { LaunchScriptButton } from "./LaunchScriptButton";
 
 type MainHeaderProps = {
   workspace: WorkspaceInfo;
@@ -23,6 +15,10 @@ type MainHeaderProps = {
   disableBranchMenu?: boolean;
   parentPath?: string | null;
   worktreePath?: string | null;
+  openTargets: OpenAppTarget[];
+  openAppIconById: Record<string, string>;
+  selectedOpenAppId: string;
+  onSelectOpenAppId: (id: string) => void;
   branchName: string;
   branches: BranchInfo[];
   onCheckoutBranch: (name: string) => Promise<void> | void;
@@ -33,6 +29,16 @@ type MainHeaderProps = {
   isTerminalOpen: boolean;
   showTerminalButton?: boolean;
   extraActionsNode?: ReactNode;
+  launchScript?: string | null;
+  launchScriptEditorOpen?: boolean;
+  launchScriptDraft?: string;
+  launchScriptSaving?: boolean;
+  launchScriptError?: string | null;
+  onRunLaunchScript?: () => void;
+  onOpenLaunchScriptEditor?: () => void;
+  onCloseLaunchScriptEditor?: () => void;
+  onLaunchScriptDraftChange?: (value: string) => void;
+  onSaveLaunchScript?: () => void;
   worktreeRename?: {
     name: string;
     error: string | null;
@@ -53,13 +59,6 @@ type MainHeaderProps = {
   };
 };
 
-type OpenTarget = {
-  id: OpenAppId;
-  label: string;
-  icon: string;
-  open: (path: string) => Promise<void>;
-};
-
 export function MainHeader({
   workspace,
   parentName = null,
@@ -67,6 +66,10 @@ export function MainHeader({
   disableBranchMenu = false,
   parentPath = null,
   worktreePath = null,
+  openTargets,
+  openAppIconById,
+  selectedOpenAppId,
+  onSelectOpenAppId,
   branchName,
   branches,
   onCheckoutBranch,
@@ -77,89 +80,93 @@ export function MainHeader({
   isTerminalOpen,
   showTerminalButton = true,
   extraActionsNode,
+  launchScript = null,
+  launchScriptEditorOpen = false,
+  launchScriptDraft = "",
+  launchScriptSaving = false,
+  launchScriptError = null,
+  onRunLaunchScript,
+  onOpenLaunchScriptEditor,
+  onCloseLaunchScriptEditor,
+  onLaunchScriptDraftChange,
+  onSaveLaunchScript,
   worktreeRename,
 }: MainHeaderProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
-  const [isCreating, setIsCreating] = useState(false);
-  const [newBranch, setNewBranch] = useState("");
+  const [branchQuery, setBranchQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [copyFeedback, setCopyFeedback] = useState(false);
   const copyTimeoutRef = useRef<number | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const infoRef = useRef<HTMLDivElement | null>(null);
-  const openMenuRef = useRef<HTMLDivElement | null>(null);
   const renameInputRef = useRef<HTMLInputElement | null>(null);
   const renameConfirmRef = useRef<HTMLButtonElement | null>(null);
-  const [openMenuOpen, setOpenMenuOpen] = useState(false);
   const renameOnCancel = worktreeRename?.onCancel;
-  const [openAppId, setOpenAppId] = useState<OpenTarget["id"]>(() => (
-    getStoredOpenAppId()
-  ));
 
-  const recentBranches = branches.slice(0, 12);
+  const recentBranches = branches;
+  const trimmedQuery = branchQuery.trim();
+  const lowercaseQuery = trimmedQuery.toLowerCase();
+  const filteredBranches =
+    trimmedQuery.length > 0
+      ? recentBranches.filter((branch) =>
+          branch.name.toLowerCase().includes(lowercaseQuery),
+        )
+      : recentBranches.slice(0, 12);
+  const exactMatch = trimmedQuery
+    ? recentBranches.find((branch) => branch.name === trimmedQuery) ?? null
+    : null;
+  const canCreate = trimmedQuery.length > 0 && !exactMatch;
+  const branchValidationMessage = (() => {
+    if (trimmedQuery.length === 0) {
+      return null;
+    }
+    if (trimmedQuery === "." || trimmedQuery === "..") {
+      return "Branch name cannot be '.' or '..'.";
+    }
+    if (/\s/.test(trimmedQuery)) {
+      return "Branch name cannot contain spaces.";
+    }
+    if (trimmedQuery.startsWith("/") || trimmedQuery.endsWith("/")) {
+      return "Branch name cannot start or end with '/'.";
+    }
+    if (trimmedQuery.endsWith(".lock")) {
+      return "Branch name cannot end with '.lock'.";
+    }
+    if (trimmedQuery.includes("..")) {
+      return "Branch name cannot contain '..'.";
+    }
+    if (trimmedQuery.includes("@{")) {
+      return "Branch name cannot contain '@{'.";
+    }
+    const invalidChars = ["~", "^", ":", "?", "*", "[", "\\"];
+    if (invalidChars.some((char) => trimmedQuery.includes(char))) {
+      return "Branch name contains invalid characters.";
+    }
+    if (trimmedQuery.endsWith(".")) {
+      return "Branch name cannot end with '.'.";
+    }
+    return null;
+  })();
   const resolvedWorktreePath = worktreePath ?? workspace.path;
   const relativeWorktreePath =
     parentPath && resolvedWorktreePath.startsWith(`${parentPath}/`)
       ? resolvedWorktreePath.slice(parentPath.length + 1)
       : resolvedWorktreePath;
   const cdCommand = `cd "${relativeWorktreePath}"`;
-  const openTargets: OpenTarget[] = [
-    {
-      id: "vscode",
-      label: "VS Code",
-      icon: vscodeIcon,
-      open: async (path) => openWorkspaceIn(path, "Visual Studio Code"),
-    },
-    {
-      id: "cursor",
-      label: "Cursor",
-      icon: cursorIcon,
-      open: async (path) => openWorkspaceIn(path, "Cursor"),
-    },
-    {
-      id: "zed",
-      label: "Zed",
-      icon: zedIcon,
-      open: async (path) => openWorkspaceIn(path, "Zed"),
-    },
-    {
-      id: "ghostty",
-      label: "Ghostty",
-      icon: ghosttyIcon,
-      open: async (path) => openWorkspaceIn(path, "Ghostty"),
-    },
-    {
-      id: "antigravity",
-      label: "Antigravity",
-      icon: antigravityIcon,
-      open: async (path) => openWorkspaceIn(path, "Antigravity"),
-    },
-    {
-      id: "finder",
-      label: "Finder",
-      icon: finderIcon,
-      open: async (path) => revealItemInDir(path),
-    },
-  ];
-  const selectedOpenTarget =
-    openTargets.find((target) => target.id === openAppId) ?? openTargets[0];
 
   useEffect(() => {
-    if (!menuOpen && !infoOpen && !openMenuOpen) {
+    if (!menuOpen && !infoOpen) {
       return;
     }
     const handleClick = (event: MouseEvent) => {
       const target = event.target as Node;
       const menuContains = menuRef.current?.contains(target) ?? false;
       const infoContains = infoRef.current?.contains(target) ?? false;
-      const openContains = openMenuRef.current?.contains(target) ?? false;
-      if (!menuContains && !infoContains && !openContains) {
+      if (!menuContains && !infoContains) {
         setMenuOpen(false);
         setInfoOpen(false);
-        setOpenMenuOpen(false);
-        setIsCreating(false);
-        setNewBranch("");
+        setBranchQuery("");
         setError(null);
       }
     };
@@ -167,7 +174,7 @@ export function MainHeader({
     return () => {
       window.removeEventListener("mousedown", handleClick);
     };
-  }, [infoOpen, menuOpen, openMenuOpen]);
+  }, [infoOpen, menuOpen]);
 
   useEffect(() => {
     if (!infoOpen && renameOnCancel) {
@@ -199,17 +206,6 @@ export function MainHeader({
     } catch {
       // Errors are handled upstream in the copy handler.
     }
-  };
-
-  const handleOpenWorkspace = async () => {
-    await selectedOpenTarget.open(resolvedWorktreePath);
-  };
-
-  const handleSelectOpenTarget = async (target: OpenTarget) => {
-    setOpenAppId(target.id);
-    window.localStorage.setItem(OPEN_APP_STORAGE_KEY, target.id);
-    setOpenMenuOpen(false);
-    await target.open(resolvedWorktreePath);
   };
 
   return (
@@ -245,6 +241,9 @@ export function MainHeader({
                           ref={renameInputRef}
                           className="worktree-info-input"
                           value={worktreeRename.name}
+                          autoCapitalize="none"
+                          autoCorrect="off"
+                          spellCheck={false}
                           onFocus={() => {
                             worktreeRename.onFocus();
                             renameInputRef.current?.select();
@@ -387,55 +386,96 @@ export function MainHeader({
                   data-tauri-drag-region="false"
                 >
                   <div className="branch-actions">
-                    {!isCreating ? (
-                      <button
-                        type="button"
-                        className="branch-action"
-                        onClick={() => setIsCreating(true)}
-                        data-tauri-drag-region="false"
-                      >
-                        <span className="branch-action-icon">+</span>
-                        Create branch
-                      </button>
-                    ) : (
-                      <div className="branch-create">
-                        <input
-                          value={newBranch}
-                          onChange={(event) => setNewBranch(event.target.value)}
-                          placeholder="new-branch-name"
-                          className="branch-input"
-                          autoFocus
-                          data-tauri-drag-region="false"
-                        />
-                        <button
-                          type="button"
-                          className="branch-create-button"
-                          onClick={async () => {
-                            const name = newBranch.trim();
-                            if (!name) {
-                              return;
-                            }
+                    <div className="branch-search">
+                      <input
+                        value={branchQuery}
+                        autoCapitalize="none"
+                        autoCorrect="off"
+                        spellCheck={false}
+                        onChange={(event) => {
+                          setBranchQuery(event.target.value);
+                          setError(null);
+                        }}
+                        onKeyDown={async (event) => {
+                          if (event.key !== "Enter") {
+                            return;
+                          }
+                          event.preventDefault();
+                          if (branchValidationMessage) {
+                            setError(branchValidationMessage);
+                            return;
+                          }
+                          if (canCreate) {
                             try {
-                              await onCreateBranch(name);
+                              await onCreateBranch(trimmedQuery);
                               setMenuOpen(false);
-                              setIsCreating(false);
-                              setNewBranch("");
+                              setBranchQuery("");
                               setError(null);
                             } catch (err) {
                               setError(
                                 err instanceof Error ? err.message : String(err),
                               );
                             }
-                          }}
-                          data-tauri-drag-region="false"
-                        >
-                          Create + checkout
-                        </button>
+                            return;
+                          }
+                          if (exactMatch && exactMatch.name !== branchName) {
+                            try {
+                              await onCheckoutBranch(exactMatch.name);
+                              setMenuOpen(false);
+                              setBranchQuery("");
+                              setError(null);
+                            } catch (err) {
+                              setError(
+                                err instanceof Error ? err.message : String(err),
+                              );
+                            }
+                          }
+                        }}
+                        placeholder="Search or create branch"
+                        className="branch-input"
+                        autoFocus
+                        data-tauri-drag-region="false"
+                        aria-label="Search branches"
+                      />
+                      <button
+                        type="button"
+                        className="branch-create-button"
+                        disabled={!canCreate || Boolean(branchValidationMessage)}
+                        onClick={async () => {
+                          if (branchValidationMessage) {
+                            setError(branchValidationMessage);
+                            return;
+                          }
+                          if (!canCreate) {
+                            return;
+                          }
+                          try {
+                            await onCreateBranch(trimmedQuery);
+                            setMenuOpen(false);
+                            setBranchQuery("");
+                            setError(null);
+                          } catch (err) {
+                            setError(
+                              err instanceof Error ? err.message : String(err),
+                            );
+                          }
+                        }}
+                        data-tauri-drag-region="false"
+                      >
+                        Create
+                      </button>
+                    </div>
+                    {branchValidationMessage && (
+                      <div className="branch-error">{branchValidationMessage}</div>
+                    )}
+                    {canCreate && !branchValidationMessage && (
+                      <div className="branch-create-hint">
+                        Create branch “{trimmedQuery}”
                       </div>
                     )}
                   </div>
                   <div className="branch-list" role="none">
-                    {recentBranches.map((branch) => (
+                    {filteredBranches.map((branch) => (
                       <button
                         key={branch.name}
                         type="button"
@@ -449,8 +489,7 @@ export function MainHeader({
                           try {
                             await onCheckoutBranch(branch.name);
                             setMenuOpen(false);
-                            setIsCreating(false);
-                            setNewBranch("");
+                            setBranchQuery("");
                             setError(null);
                           } catch (err) {
                             setError(
@@ -464,7 +503,7 @@ export function MainHeader({
                         {branch.name}
                       </button>
                     ))}
-                    {recentBranches.length === 0 && (
+                    {filteredBranches.length === 0 && (
                       <div className="branch-empty">No branches found</div>
                     )}
                   </div>
@@ -476,59 +515,31 @@ export function MainHeader({
         </div>
       </div>
       <div className="main-header-actions">
-        <div className="open-app-menu" ref={openMenuRef}>
-          <div className="open-app-button">
-            <button
-              type="button"
-              className="ghost main-header-action open-app-action"
-              onClick={handleOpenWorkspace}
-              data-tauri-drag-region="false"
-              aria-label={`Open in ${selectedOpenTarget.label}`}
-              title={`Open in ${selectedOpenTarget.label}`}
-            >
-              <span className="open-app-label">
-                <img
-                  className="open-app-icon"
-                  src={selectedOpenTarget.icon}
-                  alt=""
-                  aria-hidden
-                />
-                {selectedOpenTarget.label}
-              </span>
-            </button>
-            <button
-              type="button"
-              className="ghost main-header-action open-app-toggle"
-              onClick={() => setOpenMenuOpen((prev) => !prev)}
-              data-tauri-drag-region="false"
-              aria-haspopup="menu"
-              aria-expanded={openMenuOpen}
-              aria-label="Select editor"
-              title="Select editor"
-            >
-              <ChevronDown size={14} aria-hidden />
-            </button>
-          </div>
-          {openMenuOpen && (
-            <div className="open-app-dropdown" role="menu">
-              {openTargets.map((target) => (
-                <button
-                  key={target.id}
-                  type="button"
-                  className={`open-app-option${
-                    target.id === openAppId ? " is-active" : ""
-                  }`}
-                  onClick={() => handleSelectOpenTarget(target)}
-                  role="menuitem"
-                  data-tauri-drag-region="false"
-                >
-                  <img className="open-app-icon" src={target.icon} alt="" aria-hidden />
-                  {target.label}
-                </button>
-              ))}
-            </div>
+        {onRunLaunchScript &&
+          onOpenLaunchScriptEditor &&
+          onCloseLaunchScriptEditor &&
+          onLaunchScriptDraftChange &&
+          onSaveLaunchScript && (
+            <LaunchScriptButton
+              launchScript={launchScript}
+              editorOpen={launchScriptEditorOpen}
+              draftScript={launchScriptDraft}
+              isSaving={launchScriptSaving}
+              error={launchScriptError}
+              onRun={onRunLaunchScript}
+              onOpenEditor={onOpenLaunchScriptEditor}
+              onCloseEditor={onCloseLaunchScriptEditor}
+              onDraftChange={onLaunchScriptDraftChange}
+              onSave={onSaveLaunchScript}
+            />
           )}
-        </div>
+        <OpenAppMenu
+          path={resolvedWorktreePath}
+          openTargets={openTargets}
+          selectedOpenAppId={selectedOpenAppId}
+          onSelectOpenAppId={onSelectOpenAppId}
+          iconById={openAppIconById}
+        />
         {showTerminalButton && (
           <button
             type="button"

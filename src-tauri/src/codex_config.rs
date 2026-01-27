@@ -1,6 +1,7 @@
-use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use toml::Value as TomlValue;
 
 const FEATURES_TABLE: &str = "[features]";
 
@@ -10,6 +11,10 @@ pub(crate) fn read_steer_enabled() -> Result<Option<bool>, String> {
 
 pub(crate) fn read_collab_enabled() -> Result<Option<bool>, String> {
     read_feature_flag("collab")
+}
+
+pub(crate) fn read_collaboration_modes_enabled() -> Result<Option<bool>, String> {
+    read_feature_flag("collaboration_modes")
 }
 
 pub(crate) fn read_unified_exec_enabled() -> Result<Option<bool>, String> {
@@ -22,6 +27,10 @@ pub(crate) fn write_steer_enabled(enabled: bool) -> Result<(), String> {
 
 pub(crate) fn write_collab_enabled(enabled: bool) -> Result<(), String> {
     write_feature_flag("collab", enabled)
+}
+
+pub(crate) fn write_collaboration_modes_enabled(enabled: bool) -> Result<(), String> {
+    write_feature_flag("collaboration_modes", enabled)
 }
 
 pub(crate) fn write_unified_exec_enabled(enabled: bool) -> Result<(), String> {
@@ -49,31 +58,37 @@ fn write_feature_flag(key: &str, enabled: bool) -> Result<(), String> {
     fs::write(&path, updated).map_err(|err| err.to_string())
 }
 
-fn config_toml_path() -> Option<PathBuf> {
-    resolve_codex_home().map(|home| home.join("config.toml"))
+pub(crate) fn config_toml_path() -> Option<PathBuf> {
+    crate::codex_home::resolve_default_codex_home().map(|home| home.join("config.toml"))
 }
 
-fn resolve_codex_home() -> Option<PathBuf> {
-    if let Ok(value) = env::var("CODEX_HOME") {
-        if !value.trim().is_empty() {
-            return Some(PathBuf::from(value.trim()));
-        }
-    }
-    resolve_home_dir().map(|home| home.join(".codex"))
+pub(crate) fn read_config_model(codex_home: Option<PathBuf>) -> Result<Option<String>, String> {
+    let path = codex_home
+        .or_else(crate::codex_home::resolve_default_codex_home)
+        .map(|home| home.join("config.toml"));
+    let Some(path) = path else {
+        return Err("Unable to resolve CODEX_HOME".to_string());
+    };
+    read_config_model_from_path(&path)
 }
 
-fn resolve_home_dir() -> Option<PathBuf> {
-    if let Ok(value) = env::var("HOME") {
-        if !value.trim().is_empty() {
-            return Some(PathBuf::from(value));
-        }
+fn read_config_model_from_path(path: &Path) -> Result<Option<String>, String> {
+    if !path.exists() {
+        return Ok(None);
     }
-    if let Ok(value) = env::var("USERPROFILE") {
-        if !value.trim().is_empty() {
-            return Some(PathBuf::from(value));
-        }
+    let contents = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    Ok(parse_model_from_toml(&contents))
+}
+
+fn parse_model_from_toml(contents: &str) -> Option<String> {
+    let parsed: TomlValue = toml::from_str(contents).ok()?;
+    let model = parsed.get("model")?.as_str()?;
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
-    None
 }
 
 fn find_feature_flag(contents: &str, key: &str) -> Option<bool> {

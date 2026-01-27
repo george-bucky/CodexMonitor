@@ -1,9 +1,12 @@
 use tauri::Manager;
+#[cfg(target_os = "macos")]
+use tauri::{RunEvent, WindowEvent};
 
 mod backend;
 mod codex;
-mod codex_home;
+mod codex_args;
 mod codex_config;
+mod codex_home;
 #[cfg(not(target_os = "windows"))]
 #[path = "dictation.rs"]
 mod dictation;
@@ -20,20 +23,20 @@ mod remote_backend;
 mod rules;
 mod settings;
 mod state;
-mod terminal;
-mod window;
 mod storage;
+mod terminal;
 mod types;
 mod utils;
+mod window;
 mod workspaces;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
     {
-        // Avoid WebKit compositing issues on some Linux setups (GBM buffer errors).
-        if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
-            std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        // Avoid WebKit compositing issues on NVIDIA Linux setups (GBM buffer errors).
+        if std::env::var_os("__NV_PRIME_RENDER_OFFLOAD").is_none() {
+            std::env::set_var("__NV_PRIME_RENDER_OFFLOAD", "1");
         }
     }
 
@@ -42,6 +45,16 @@ pub fn run() {
         .manage(menu::MenuItemRegistry::<tauri::Wry>::default())
         .menu(menu::build_menu)
         .on_menu_event(menu::handle_menu_event)
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            #[cfg(target_os = "macos")]
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             let state = state::AppState::load(&app.handle());
             app.manage(state);
@@ -56,13 +69,16 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_window_state::Builder::default().build());
 
-    builder
+    let app = builder
+        .plugin(tauri_plugin_liquid_glass::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             settings::get_app_settings,
             settings::update_app_settings,
+            settings::get_codex_config_path,
+            codex::get_config_model,
             menu::menu_set_accelerators,
             codex::codex_doctor,
             workspaces::list_workspaces,
@@ -85,6 +101,7 @@ pub fn run() {
             codex::remember_approval_rule,
             codex::get_commit_message_prompt,
             codex::generate_commit_message,
+            codex::generate_run_metadata,
             codex::resume_thread,
             codex::list_threads,
             codex::archive_thread,
@@ -110,7 +127,9 @@ pub fn run() {
             git::get_github_pull_request_diff,
             git::get_github_pull_request_comments,
             workspaces::list_workspace_files,
+            workspaces::read_workspace_file,
             workspaces::open_workspace_in,
+            workspaces::get_open_app_icon,
             git::list_git_branches,
             git::checkout_git_branch,
             git::create_git_branch,
@@ -133,10 +152,21 @@ pub fn run() {
             dictation::dictation_cancel_download,
             dictation::dictation_remove_model,
             dictation::dictation_start,
+            dictation::dictation_request_permission,
             dictation::dictation_stop,
             dictation::dictation_cancel,
             local_usage::local_usage_snapshot
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running tauri application");
+
+    app.run(|app_handle, event| {
+        #[cfg(target_os = "macos")]
+        if let RunEvent::Reopen { .. } = event {
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+    });
 }

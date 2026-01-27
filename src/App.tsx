@@ -3,9 +3,11 @@ import "./styles/base.css";
 import "./styles/buttons.css";
 import "./styles/sidebar.css";
 import "./styles/home.css";
+import "./styles/workspace-home.css";
 import "./styles/main.css";
 import "./styles/messages.css";
 import "./styles/approval-toasts.css";
+import "./styles/request-user-input.css";
 import "./styles/update-toasts.css";
 import "./styles/composer.css";
 import "./styles/diff.css";
@@ -41,6 +43,7 @@ import { useGitActions } from "./features/git/hooks/useGitActions";
 import { useAutoExitEmptyDiff } from "./features/git/hooks/useAutoExitEmptyDiff";
 import { useModels } from "./features/models/hooks/useModels";
 import { useCollaborationModes } from "./features/collaboration/hooks/useCollaborationModes";
+import { useCollaborationModeSelection } from "./features/collaboration/hooks/useCollaborationModeSelection";
 import { useSkills } from "./features/skills/hooks/useSkills";
 import { useCustomPrompts } from "./features/prompts/hooks/useCustomPrompts";
 import { useWorkspaceFiles } from "./features/workspaces/hooks/useWorkspaceFiles";
@@ -60,8 +63,10 @@ import { useAppSettingsController } from "./features/app/hooks/useAppSettingsCon
 import { useUpdaterController } from "./features/app/hooks/useUpdaterController";
 import { useComposerShortcuts } from "./features/composer/hooks/useComposerShortcuts";
 import { useComposerMenuActions } from "./features/composer/hooks/useComposerMenuActions";
+import { useComposerEditorState } from "./features/composer/hooks/useComposerEditorState";
 import { useDictationController } from "./features/app/hooks/useDictationController";
 import { useComposerController } from "./features/app/hooks/useComposerController";
+import { useComposerInsert } from "./features/app/hooks/useComposerInsert";
 import { useRenameThreadPrompt } from "./features/threads/hooks/useRenameThreadPrompt";
 import { useWorktreePrompt } from "./features/workspaces/hooks/useWorktreePrompt";
 import { useClonePrompt } from "./features/workspaces/hooks/useClonePrompt";
@@ -78,14 +83,22 @@ import { useWorkspaceActions } from "./features/app/hooks/useWorkspaceActions";
 import { useWorkspaceCycling } from "./features/app/hooks/useWorkspaceCycling";
 import { useThreadRows } from "./features/app/hooks/useThreadRows";
 import { useStopTurnShortcut } from "./features/app/hooks/useStopTurnShortcut";
+import { useInterruptShortcut } from "./features/app/hooks/useInterruptShortcut";
+import { useLiquidGlassEffect } from "./features/app/hooks/useLiquidGlassEffect";
 import { useCopyThread } from "./features/threads/hooks/useCopyThread";
 import { useTerminalController } from "./features/terminal/hooks/useTerminalController";
+import { useWorkspaceLaunchScript } from "./features/app/hooks/useWorkspaceLaunchScript";
 import { useGitCommitController } from "./features/app/hooks/useGitCommitController";
+import { WorkspaceHome } from "./features/workspaces/components/WorkspaceHome";
+import { useWorkspaceHome } from "./features/workspaces/hooks/useWorkspaceHome";
 import { pickWorkspacePath } from "./services/tauri";
 import type {
   AccessMode,
+  ComposerEditorSettings,
   WorkspaceInfo,
 } from "./types";
+import { OPEN_APP_STORAGE_KEY } from "./features/app/constants";
+import { useOpenAppIcons } from "./features/app/hooks/useOpenAppIcons";
 
 const AboutView = lazy(() =>
   import("./features/about/components/AboutView").then((module) => ({
@@ -114,7 +127,6 @@ function MainApp() {
     appSettingsLoading,
     reduceTransparency,
     setReduceTransparency,
-    uiScale,
     scaleShortcutTitle,
     scaleShortcutText,
     queueSaveSettings,
@@ -141,6 +153,7 @@ function MainApp() {
     handleCopyDebug,
     clearDebugEntries,
   } = useDebugLog();
+  useLiquidGlassEffect({ reduceTransparency, onDebug: addDebugEntry });
   const [accessMode, setAccessMode] = useState<AccessMode>("current");
   const [activeTab, setActiveTab] = useState<
     "projects" | "codex" | "git" | "log"
@@ -207,8 +220,9 @@ function MainApp() {
     terminalOpen,
     handleDebugClick,
     handleToggleTerminal,
+    openTerminal,
+    closeTerminal: closeTerminalPanel,
   } = useLayoutController({
-    uiScale,
     activeWorkspaceId,
     setActiveTab,
     setDebugOpen,
@@ -351,6 +365,7 @@ function MainApp() {
     selectedModel,
     selectedModelId,
     setSelectedModelId,
+    reasoningSupported,
     reasoningOptions,
     selectedEffort,
     setSelectedEffort
@@ -361,33 +376,6 @@ function MainApp() {
     preferredEffort: appSettings.lastComposerReasoningEffort,
   });
 
-  useComposerShortcuts({
-    textareaRef: composerInputRef,
-    modelShortcut: appSettings.composerModelShortcut,
-    accessShortcut: appSettings.composerAccessShortcut,
-    reasoningShortcut: appSettings.composerReasoningShortcut,
-    models,
-    selectedModelId,
-    onSelectModel: setSelectedModelId,
-    accessMode,
-    onSelectAccessMode: setAccessMode,
-    reasoningOptions,
-    selectedEffort,
-    onSelectEffort: setSelectedEffort,
-  });
-
-  useComposerMenuActions({
-    models,
-    selectedModelId,
-    onSelectModel: setSelectedModelId,
-    accessMode,
-    onSelectAccessMode: setAccessMode,
-    reasoningOptions,
-    selectedEffort,
-    onSelectEffort: setSelectedEffort,
-    onFocusComposer: () => composerInputRef.current?.focus(),
-  });
-
   const {
     collaborationModes,
     selectedCollaborationMode,
@@ -395,8 +383,46 @@ function MainApp() {
     setSelectedCollaborationModeId,
   } = useCollaborationModes({
     activeWorkspace,
-    enabled: appSettings.experimentalCollabEnabled,
+    enabled: appSettings.experimentalCollaborationModesEnabled,
     onDebug: addDebugEntry,
+  });
+
+  useComposerShortcuts({
+    textareaRef: composerInputRef,
+    modelShortcut: appSettings.composerModelShortcut,
+    accessShortcut: appSettings.composerAccessShortcut,
+    reasoningShortcut: appSettings.composerReasoningShortcut,
+    collaborationShortcut: appSettings.experimentalCollaborationModesEnabled
+      ? appSettings.composerCollaborationShortcut
+      : null,
+    models,
+    collaborationModes,
+    selectedModelId,
+    onSelectModel: setSelectedModelId,
+    selectedCollaborationModeId,
+    onSelectCollaborationMode: setSelectedCollaborationModeId,
+    accessMode,
+    onSelectAccessMode: setAccessMode,
+    reasoningOptions,
+    selectedEffort,
+    onSelectEffort: setSelectedEffort,
+    reasoningSupported,
+  });
+
+  useComposerMenuActions({
+    models,
+    selectedModelId,
+    onSelectModel: setSelectedModelId,
+    collaborationModes,
+    selectedCollaborationModeId,
+    onSelectCollaborationMode: setSelectedCollaborationModeId,
+    accessMode,
+    onSelectAccessMode: setAccessMode,
+    reasoningOptions,
+    selectedEffort,
+    onSelectEffort: setSelectedEffort,
+    reasoningSupported,
+    onFocusComposer: () => composerInputRef.current?.focus(),
   });
   const { skills } = useSkills({ activeWorkspace, onDebug: addDebugEntry });
   const {
@@ -445,6 +471,7 @@ function MainApp() {
   });
 
   const resolvedModel = selectedModel?.model ?? null;
+  const resolvedEffort = reasoningSupported ? selectedEffort : null;
   const activeGitRoot = activeWorkspace?.settings.gitRoot ?? null;
   const normalizePath = useCallback((value: string) => {
     return value.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -455,7 +482,6 @@ function MainApp() {
         return;
       }
       await updateWorkspaceSettings(activeWorkspace.id, {
-        ...activeWorkspace.settings,
         gitRoot: path,
       });
       clearGitRootCandidates();
@@ -505,6 +531,33 @@ function MainApp() {
     queueSaveSettings,
   });
 
+  const { isExpanded: composerEditorExpanded, toggleExpanded: toggleComposerEditorExpanded } =
+    useComposerEditorState();
+
+  const composerEditorSettings = useMemo<ComposerEditorSettings>(
+    () => ({
+      preset: appSettings.composerEditorPreset,
+      expandFenceOnSpace: appSettings.composerFenceExpandOnSpace,
+      expandFenceOnEnter: appSettings.composerFenceExpandOnEnter,
+      fenceLanguageTags: appSettings.composerFenceLanguageTags,
+      fenceWrapSelection: appSettings.composerFenceWrapSelection,
+      autoWrapPasteMultiline: appSettings.composerFenceAutoWrapPasteMultiline,
+      autoWrapPasteCodeLike: appSettings.composerFenceAutoWrapPasteCodeLike,
+      continueListOnShiftEnter: appSettings.composerListContinuation,
+    }),
+    [
+      appSettings.composerEditorPreset,
+      appSettings.composerFenceExpandOnSpace,
+      appSettings.composerFenceExpandOnEnter,
+      appSettings.composerFenceLanguageTags,
+      appSettings.composerFenceWrapSelection,
+      appSettings.composerFenceAutoWrapPasteMultiline,
+      appSettings.composerFenceAutoWrapPasteCodeLike,
+      appSettings.composerListContinuation,
+    ],
+  );
+
+
   useSyncSelectedDiffPath({
     diffSource,
     centerMode,
@@ -514,11 +567,19 @@ function MainApp() {
     setSelectedDiffPath,
   });
 
+  const { collaborationModePayload } = useCollaborationModeSelection({
+    selectedCollaborationMode,
+    selectedCollaborationModeId,
+    selectedEffort: resolvedEffort,
+    resolvedModel,
+  });
+
   const {
     setActiveThreadId,
     activeThreadId,
     activeItems,
     approvals,
+    userInputRequests,
     threadsByWorkspace,
     threadParentById,
     threadStatusById,
@@ -545,15 +606,17 @@ function MainApp() {
     sendUserMessageToThread,
     startReview,
     handleApprovalDecision,
-    handleApprovalRemember
+    handleApprovalRemember,
+    handleUserInputSubmit,
   } = useThreads({
     activeWorkspace,
     onWorkspaceConnected: markWorkspaceConnected,
     onDebug: addDebugEntry,
     model: resolvedModel,
-    effort: selectedEffort,
-    collaborationMode: selectedCollaborationMode?.value ?? null,
+    effort: resolvedEffort,
+    collaborationMode: collaborationModePayload,
     accessMode,
+    steerEnabled: appSettings.experimentalSteerEnabled,
     customPrompts: prompts,
     onMessageActivity: queueGitStatusRefresh
   });
@@ -631,6 +694,7 @@ function MainApp() {
   const { exitDiffView, selectWorkspace, selectHome } = useWorkspaceSelection({
     workspaces,
     isCompact,
+    activeWorkspaceId,
     setActiveTab,
     setActiveWorkspaceId,
     updateWorkspaceSettings,
@@ -672,6 +736,28 @@ function MainApp() {
     },
     [appSettings.workspaceGroups],
   );
+
+  const handleSelectOpenAppId = useCallback(
+    (id: string) => {
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(OPEN_APP_STORAGE_KEY, id);
+      }
+      setAppSettings((current) => {
+        if (current.selectedOpenAppId === id) {
+          return current;
+        }
+        const nextSettings = {
+          ...current,
+          selectedOpenAppId: id,
+        };
+        void queueSaveSettings(nextSettings);
+        return nextSettings;
+      });
+    },
+    [queueSaveSettings, setAppSettings],
+  );
+
+  const openAppIconById = useOpenAppIcons(appSettings.openAppTargets);
 
   const persistProjectCopiesFolder = useCallback(
     async (groupId: string, copiesFolder: string) => {
@@ -770,6 +856,7 @@ function MainApp() {
     activePlan && (activePlan.steps.length > 0 || activePlan.explanation)
   );
   const showHome = !activeWorkspace;
+  const showWorkspaceHome = Boolean(activeWorkspace && !activeThreadId);
   const [usageMetric, setUsageMetric] = useState<"tokens" | "time">("tokens");
   const [usageWorkspaceId, setUsageWorkspaceId] = useState<string | null>(null);
   const usageWorkspaceOptions = useMemo(
@@ -844,6 +931,35 @@ function MainApp() {
     connectWorkspace,
     sendUserMessage,
     startReview,
+  });
+
+  const handleInsertComposerText = useComposerInsert({
+    activeThreadId,
+    draftText: activeDraft,
+    onDraftChange: handleDraftChange,
+    textareaRef: composerInputRef,
+  });
+
+  const {
+    runs: workspaceRuns,
+    draft: workspacePrompt,
+    runMode: workspaceRunMode,
+    modelSelections: workspaceModelSelections,
+    error: workspaceRunError,
+    isSubmitting: workspaceRunSubmitting,
+    setDraft: setWorkspacePrompt,
+    setRunMode: setWorkspaceRunMode,
+    toggleModelSelection: toggleWorkspaceModelSelection,
+    setModelCount: setWorkspaceModelCount,
+    startRun: startWorkspaceRun,
+  } = useWorkspaceHome({
+    activeWorkspace,
+    models,
+    selectedModelId,
+    addWorktreeAgent,
+    connectWorkspace,
+    startThreadForWorkspace,
+    sendUserMessageToThread,
   });
 
   const {
@@ -961,6 +1077,9 @@ function MainApp() {
   const handleRevealGeneralPrompts = useCallback(async () => {
     try {
       const path = await getGlobalPromptsDir();
+      if (!path) {
+        return;
+      }
       await revealItemInDir(path);
     } catch (error) {
       alertError(error);
@@ -1091,6 +1210,14 @@ function MainApp() {
     onDropPaths: handleDropWorkspacePaths,
   });
 
+  useInterruptShortcut({
+    isEnabled: canInterrupt,
+    shortcut: appSettings.interruptShortcut,
+    onTrigger: () => {
+      void interruptTurn();
+    },
+  });
+
   const {
     handleSelectPullRequest,
     resetPullRequestSelection,
@@ -1119,6 +1246,26 @@ function MainApp() {
     handleSend,
     queueMessage,
   });
+
+  const handleSelectWorkspaceInstance = useCallback(
+    (workspaceId: string, threadId: string) => {
+      exitDiffView();
+      resetPullRequestSelection();
+      selectWorkspace(workspaceId);
+      setActiveThreadId(threadId, workspaceId);
+      if (isCompact) {
+        setActiveTab("codex");
+      }
+    },
+    [
+      exitDiffView,
+      isCompact,
+      resetPullRequestSelection,
+      selectWorkspace,
+      setActiveTab,
+      setActiveThreadId,
+    ],
+  );
 
   const orderValue = (entry: WorkspaceInfo) =>
     typeof entry.settings.sortOrder === "number"
@@ -1163,16 +1310,15 @@ function MainApp() {
     await Promise.all(
       next.map((entry, idx) =>
         updateWorkspaceSettings(entry.id, {
-          ...entry.settings,
           sortOrder: idx
         })
       )
     );
   };
 
-  const showComposer = !isCompact
+  const showComposer = (!isCompact
     ? centerMode === "chat" || centerMode === "diff"
-    : (isTablet ? tabletTab : activeTab) === "codex";
+    : (isTablet ? tabletTab : activeTab) === "codex") && !showWorkspaceHome;
   const showGitDetail = Boolean(selectedDiffPath) && isPhone;
   const {
     terminalTabs,
@@ -1181,11 +1327,29 @@ function MainApp() {
     onNewTerminal,
     onCloseTerminal,
     terminalState,
+    ensureTerminalWithTitle,
+    restartTerminalSession,
   } = useTerminalController({
     activeWorkspaceId,
     activeWorkspace,
     terminalOpen,
+    onCloseTerminalPanel: closeTerminalPanel,
     onDebug: addDebugEntry,
+  });
+
+  const ensureLaunchTerminal = useCallback(
+    (workspaceId: string) => ensureTerminalWithTitle(workspaceId, "launch", "Launch"),
+    [ensureTerminalWithTitle],
+  );
+
+  const launchScriptState = useWorkspaceLaunchScript({
+    activeWorkspace,
+    updateWorkspaceSettings,
+    openTerminal,
+    ensureLaunchTerminal,
+    restartLaunchSession: restartTerminalSession,
+    terminalState,
+    activeTerminalId,
   });
 
   const { handleCycleAgent, handleCycleWorkspace } = useWorkspaceCycling({
@@ -1231,8 +1395,6 @@ function MainApp() {
   });
 
   useMenuAcceleratorController({ appSettings, onDebug: addDebugEntry });
-
-  const isDefaultScale = Math.abs(uiScale - 1) < 0.001;
   const dropOverlayActive = isWorkspaceDropActive;
   const dropOverlayText = "Drop Project Here";
   const appClassName = `app ${isCompact ? "layout-compact" : "layout-desktop"}${
@@ -1241,7 +1403,7 @@ function MainApp() {
     reduceTransparency ? " reduced-transparency" : ""
   }${!isCompact && sidebarCollapsed ? " sidebar-collapsed" : ""}${
     !isCompact && rightPanelCollapsed ? " right-panel-collapsed" : ""
-  }${isDefaultScale ? " ui-scale-default" : ""}`;
+  }`;
   const {
     sidebarNode,
     messagesNode,
@@ -1273,14 +1435,20 @@ function MainApp() {
     threadListLoadingByWorkspace,
     threadListPagingByWorkspace,
     threadListCursorByWorkspace,
-    lastAgentMessageByThread,
     activeWorkspaceId,
     activeThreadId,
     activeItems,
     activeRateLimits,
+    codeBlockCopyUseModifier: appSettings.composerCodeBlockCopyUseModifier,
+    openAppTargets: appSettings.openAppTargets,
+    openAppIconById,
+    selectedOpenAppId: appSettings.selectedOpenAppId,
+    onSelectOpenAppId: handleSelectOpenAppId,
     approvals,
+    userInputRequests,
     handleApprovalDecision,
     handleApprovalRemember,
+    handleUserInputSubmit,
     onOpenSettings: () => openSettings(),
     onOpenDictationSettings: () => openSettings("dictation"),
     onOpenDebug: handleDebugClick,
@@ -1294,6 +1462,7 @@ function MainApp() {
       exitDiffView();
       resetPullRequestSelection();
       selectWorkspace(workspaceId);
+      setActiveThreadId(null, workspaceId);
     },
     onConnectWorkspace: async (workspace) => {
       await connectWorkspace(workspace);
@@ -1310,7 +1479,6 @@ function MainApp() {
         return;
       }
       void updateWorkspaceSettings(workspaceId, {
-        ...target.settings,
         sidebarCollapsed: collapsed,
       });
     },
@@ -1324,6 +1492,9 @@ function MainApp() {
       removeThread(workspaceId, threadId);
       clearDraftForThread(threadId);
       removeImagesForThread(threadId);
+    },
+    onSyncThread: (workspaceId, threadId) => {
+      void refreshThread(workspaceId, threadId);
     },
     pinThread,
     unpinThread,
@@ -1388,6 +1559,16 @@ function MainApp() {
     onCopyThread: handleCopyThread,
     onToggleTerminal: handleToggleTerminal,
     showTerminalButton: !isCompact,
+    launchScript: launchScriptState.launchScript,
+    launchScriptEditorOpen: launchScriptState.editorOpen,
+    launchScriptDraft: launchScriptState.draftScript,
+    launchScriptSaving: launchScriptState.isSaving,
+    launchScriptError: launchScriptState.error,
+    onRunLaunchScript: launchScriptState.onRunLaunchScript,
+    onOpenLaunchScriptEditor: launchScriptState.onOpenEditor,
+    onCloseLaunchScriptEditor: launchScriptState.onCloseEditor,
+    onLaunchScriptDraftChange: launchScriptState.onDraftScriptChange,
+    onSaveLaunchScript: launchScriptState.onSaveLaunchScript,
     mainHeaderActionsNode: (
       <MainHeaderActions
         centerMode={centerMode}
@@ -1507,6 +1688,7 @@ function MainApp() {
     onMovePrompt: handleMovePrompt,
     onRevealWorkspacePrompts: handleRevealWorkspacePrompts,
     onRevealGeneralPrompts: handleRevealGeneralPrompts,
+    canRevealGeneralPrompts: Boolean(activeWorkspace),
     onSend: handleComposerSend,
     onQueue: handleComposerQueue,
     onStop: interruptTurn,
@@ -1545,12 +1727,17 @@ function MainApp() {
     reasoningOptions,
     selectedEffort,
     onSelectEffort: setSelectedEffort,
+    reasoningSupported,
     accessMode,
     onSelectAccessMode: setAccessMode,
     skills,
     prompts,
     files,
+    onInsertComposerText: handleInsertComposerText,
     textareaRef: composerInputRef,
+    composerEditorSettings,
+    composerEditorExpanded,
+    onToggleComposerEditorExpanded: toggleComposerEditorExpanded,
     dictationEnabled: appSettings.dictationEnabled && dictationReady,
     dictationState,
     dictationLevel,
@@ -1593,6 +1780,46 @@ function MainApp() {
     onWorkspaceDrop: handleWorkspaceDrop,
   });
 
+  const workspaceHomeNode = activeWorkspace ? (
+    <WorkspaceHome
+      workspace={activeWorkspace}
+      runs={workspaceRuns}
+      prompt={workspacePrompt}
+      onPromptChange={setWorkspacePrompt}
+      onStartRun={startWorkspaceRun}
+      runMode={workspaceRunMode}
+      onRunModeChange={setWorkspaceRunMode}
+      models={models}
+      selectedModelId={selectedModelId}
+      onSelectModel={setSelectedModelId}
+      modelSelections={workspaceModelSelections}
+      onToggleModel={toggleWorkspaceModelSelection}
+      onModelCountChange={setWorkspaceModelCount}
+      error={workspaceRunError}
+      isSubmitting={workspaceRunSubmitting}
+      activeWorkspaceId={activeWorkspaceId}
+      activeThreadId={activeThreadId}
+      threadStatusById={threadStatusById}
+      onSelectInstance={handleSelectWorkspaceInstance}
+      skills={skills}
+      prompts={prompts}
+      files={files}
+      dictationEnabled={appSettings.dictationEnabled && dictationReady}
+      dictationState={dictationState}
+      dictationLevel={dictationLevel}
+      onToggleDictation={handleToggleDictation}
+      onOpenDictationSettings={() => openSettings("dictation")}
+      dictationError={dictationError}
+      onDismissDictationError={clearDictationError}
+      dictationHint={dictationHint}
+      onDismissDictationHint={clearDictationHint}
+      dictationTranscript={dictationTranscript}
+      onDictationTranscriptHandled={clearDictationTranscript}
+    />
+  ) : null;
+
+  const mainMessagesNode = showWorkspaceHome ? workspaceHomeNode : messagesNode;
+
   const desktopTopbarLeftNodeWithToggle = !isCompact ? (
     <div className="topbar-leading">
       <SidebarCollapseButton {...sidebarToggleProps} />
@@ -1616,7 +1843,6 @@ function MainApp() {
           "--plan-panel-height": `${planPanelHeight}px`,
           "--terminal-panel-height": `${terminalPanelHeight}px`,
           "--debug-panel-height": `${debugPanelHeight}px`,
-          "--ui-scale": String(uiScale),
           "--ui-font-family": appSettings.uiFontFamily,
           "--code-font-family": appSettings.codeFontFamily,
           "--code-font-size": `${appSettings.codeFontSize}px`
@@ -1651,7 +1877,7 @@ function MainApp() {
         hasActivePlan={hasActivePlan}
         activeWorkspace={Boolean(activeWorkspace)}
         sidebarNode={sidebarNode}
-        messagesNode={messagesNode}
+        messagesNode={mainMessagesNode}
         composerNode={composerNode}
         approvalToastsNode={approvalToastsNode}
         updateToastNode={updateToastNode}
@@ -1709,12 +1935,16 @@ function MainApp() {
           reduceTransparency,
           onToggleTransparency: setReduceTransparency,
           appSettings,
+          openAppIconById,
           onUpdateAppSettings: async (next) => {
             await queueSaveSettings(next);
           },
           onRunDoctor: doctor,
           onUpdateWorkspaceCodexBin: async (id, codexBin) => {
             await updateWorkspaceCodexBin(id, codexBin);
+          },
+          onUpdateWorkspaceSettings: async (id, settings) => {
+            await updateWorkspaceSettings(id, settings);
           },
           scaleShortcutTitle,
           scaleShortcutText,

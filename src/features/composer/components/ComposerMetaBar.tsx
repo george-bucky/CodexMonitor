@@ -1,5 +1,6 @@
 import type { CSSProperties } from "react";
 import type { AccessMode, ThreadTokenUsage } from "../../../types";
+import { formatCollaborationModeLabel } from "../../../utils/collaborationModes";
 
 type ComposerMetaBarProps = {
   disabled: boolean;
@@ -12,6 +13,7 @@ type ComposerMetaBarProps = {
   reasoningOptions: string[];
   selectedEffort: string | null;
   onSelectEffort: (effort: string) => void;
+  reasoningSupported: boolean;
   accessMode: AccessMode;
   onSelectAccessMode: (mode: AccessMode) => void;
   contextUsage?: ThreadTokenUsage | null;
@@ -28,6 +30,7 @@ export function ComposerMetaBar({
   reasoningOptions,
   selectedEffort,
   onSelectEffort,
+  reasoningSupported,
   accessMode,
   onSelectAccessMode,
   contextUsage = null,
@@ -61,7 +64,7 @@ export function ComposerMetaBar({
               </svg>
             </span>
             <select
-              className="composer-select composer-select--model"
+              className="composer-select composer-select--model composer-select--collab"
               aria-label="Collaboration mode"
               value={selectedCollaborationModeId ?? ""}
               onChange={(event) =>
@@ -69,10 +72,9 @@ export function ComposerMetaBar({
               }
               disabled={disabled}
             >
-              <option value="">Default mode</option>
               {collaborationModes.map((mode) => (
                 <option key={mode.id} value={mode.id}>
-                  {mode.label}
+                  {formatCollaborationModeLabel(mode.label || mode.id)}
                 </option>
               ))}
             </select>
@@ -155,7 +157,7 @@ export function ComposerMetaBar({
             aria-label="Thinking mode"
             value={selectedEffort ?? ""}
             onChange={(event) => onSelectEffort(event.target.value)}
-            disabled={disabled}
+            disabled={disabled || !reasoningSupported}
           >
             {reasoningOptions.length === 0 && <option value="">Default</option>}
             {reasoningOptions.map((effort) => (

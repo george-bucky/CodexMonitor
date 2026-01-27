@@ -14,6 +14,8 @@ use crate::backend::app_server::{
     build_codex_command_with_bin, build_codex_path_env, check_codex_installation,
     spawn_workspace_session as spawn_workspace_session_inner,
 };
+use crate::codex_args::apply_codex_args;
+use crate::codex_config;
 use crate::codex_home::{resolve_default_codex_home, resolve_workspace_codex_home};
 use crate::event_sink::TauriEventSink;
 use crate::remote_backend;
@@ -24,6 +26,7 @@ use crate::types::WorkspaceEntry;
 pub(crate) async fn spawn_workspace_session(
     entry: WorkspaceEntry,
     default_codex_bin: Option<String>,
+    codex_args: Option<String>,
     app_handle: AppHandle,
     codex_home: Option<PathBuf>,
 ) -> Result<Arc<WorkspaceSession>, String> {
@@ -32,9 +35,10 @@ pub(crate) async fn spawn_workspace_session(
     spawn_workspace_session_inner(
         entry,
         default_codex_bin,
+        codex_args,
+        codex_home,
         client_version,
         event_sink,
-        codex_home,
     )
     .await
 }
@@ -42,19 +46,25 @@ pub(crate) async fn spawn_workspace_session(
 #[tauri::command]
 pub(crate) async fn codex_doctor(
     codex_bin: Option<String>,
+    codex_args: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
-    let default_bin = {
+    let (default_bin, default_args) = {
         let settings = state.app_settings.lock().await;
-        settings.codex_bin.clone()
+        (settings.codex_bin.clone(), settings.codex_args.clone())
     };
     let resolved = codex_bin
         .clone()
         .filter(|value| !value.trim().is_empty())
         .or(default_bin);
+    let resolved_args = codex_args
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or(default_args);
     let path_env = build_codex_path_env(resolved.as_deref());
     let version = check_codex_installation(resolved.clone()).await?;
     let mut command = build_codex_command_with_bin(resolved.clone());
+    apply_codex_args(&mut command, resolved_args.as_deref())?;
     command.arg("app-server");
     command.arg("--help");
     command.stdout(std::process::Stdio::piped());
@@ -255,20 +265,30 @@ pub(crate) async fn send_user_message(
     app: AppHandle,
 ) -> Result<Value, String> {
     if remote_backend::is_remote_mode(&*state).await {
+        let images = images.map(|paths| {
+            paths
+                .into_iter()
+                .map(remote_backend::normalize_path_for_remote)
+                .collect::<Vec<_>>()
+        });
+        let mut payload = Map::new();
+        payload.insert("workspaceId".to_string(), json!(workspace_id));
+        payload.insert("threadId".to_string(), json!(thread_id));
+        payload.insert("text".to_string(), json!(text));
+        payload.insert("model".to_string(), json!(model));
+        payload.insert("effort".to_string(), json!(effort));
+        payload.insert("accessMode".to_string(), json!(access_mode));
+        payload.insert("images".to_string(), json!(images));
+        if let Some(mode) = collaboration_mode {
+            if !mode.is_null() {
+                payload.insert("collaborationMode".to_string(), mode);
+            }
+        }
         return remote_backend::call_remote(
             &*state,
             app,
             "send_user_message",
-            json!({
-                "workspaceId": workspace_id,
-                "threadId": thread_id,
-                "text": text,
-                "model": model,
-                "effort": effort,
-                "accessMode": access_mode,
-                "images": images,
-                "collaborationMode": collaboration_mode,
-            }),
+            Value::Object(payload),
         )
         .await;
     }
@@ -323,17 +343,22 @@ pub(crate) async fn send_user_message(
         return Err("empty user message".to_string());
     }
 
-    let params = json!({
-        "threadId": thread_id,
-        "input": input,
-        "cwd": session.entry.path,
-        "approvalPolicy": approval_policy,
-        "sandboxPolicy": sandbox_policy,
-        "model": model,
-        "effort": effort,
-        "collaborationMode": collaboration_mode,
-    });
-    session.send_request("turn/start", params).await
+    let mut params = Map::new();
+    params.insert("threadId".to_string(), json!(thread_id));
+    params.insert("input".to_string(), json!(input));
+    params.insert("cwd".to_string(), json!(session.entry.path));
+    params.insert("approvalPolicy".to_string(), json!(approval_policy));
+    params.insert("sandboxPolicy".to_string(), json!(sandbox_policy));
+    params.insert("model".to_string(), json!(model));
+    params.insert("effort".to_string(), json!(effort));
+    if let Some(mode) = collaboration_mode {
+        if !mode.is_null() {
+            params.insert("collaborationMode".to_string(), mode);
+        }
+    }
+    session
+        .send_request("turn/start", Value::Object(params))
+        .await
 }
 
 #[tauri::command]
@@ -507,7 +532,7 @@ pub(crate) async fn skills_list(
 #[tauri::command]
 pub(crate) async fn respond_to_server_request(
     workspace_id: String,
-    request_id: u64,
+    request_id: Value,
     result: Value,
     state: State<'_, AppState>,
     app: AppHandle,
@@ -569,23 +594,7 @@ pub(crate) async fn remember_approval_rule(
         return Err("empty command".to_string());
     }
 
-    let (entry, parent_path) = {
-        let workspaces = state.workspaces.lock().await;
-        let entry = workspaces
-            .get(&workspace_id)
-            .ok_or("workspace not found")?
-            .clone();
-        let parent_path = entry
-            .parent_id
-            .as_ref()
-            .and_then(|parent_id| workspaces.get(parent_id))
-            .map(|parent| parent.path.clone());
-        (entry, parent_path)
-    };
-
-    let codex_home = resolve_workspace_codex_home(&entry, parent_path.as_deref())
-        .or_else(resolve_default_codex_home)
-        .ok_or("Unable to resolve CODEX_HOME".to_string())?;
+    let codex_home = resolve_codex_home_for_workspace(&workspace_id, &state).await?;
     let rules_path = rules::default_rules_path(&codex_home);
     rules::append_prefix_rule(&rules_path, &command)?;
 
@@ -593,6 +602,50 @@ pub(crate) async fn remember_approval_rule(
         "ok": true,
         "rulesPath": rules_path,
     }))
+}
+
+#[tauri::command]
+pub(crate) async fn get_config_model(
+    workspace_id: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "get_config_model",
+            json!({ "workspaceId": workspace_id }),
+        )
+        .await;
+    }
+
+    let codex_home = resolve_codex_home_for_workspace(&workspace_id, &state).await?;
+    let model = codex_config::read_config_model(Some(codex_home))?;
+    Ok(json!({ "model": model }))
+}
+
+async fn resolve_codex_home_for_workspace(
+    workspace_id: &str,
+    state: &State<'_, AppState>,
+) -> Result<PathBuf, String> {
+    let (entry, parent_entry) = {
+        let workspaces = state.workspaces.lock().await;
+        let entry = workspaces
+            .get(workspace_id)
+            .ok_or("workspace not found")?
+            .clone();
+        let parent_entry = entry
+            .parent_id
+            .as_ref()
+            .and_then(|parent_id| workspaces.get(parent_id))
+            .cloned();
+        (entry, parent_entry)
+    };
+
+    resolve_workspace_codex_home(&entry, parent_entry.as_ref())
+        .or_else(resolve_default_codex_home)
+        .ok_or("Unable to resolve CODEX_HOME".to_string())
 }
 
 /// Generates a commit message in the background without showing in the main chat
@@ -759,4 +812,239 @@ Changes:\n{diff}"
     }
 
     Ok(trimmed)
+}
+
+#[tauri::command]
+pub(crate) async fn generate_run_metadata(
+    workspace_id: String,
+    prompt: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "generate_run_metadata",
+            json!({ "workspaceId": workspace_id, "prompt": prompt }),
+        )
+        .await;
+    }
+
+    let cleaned_prompt = prompt.trim();
+    if cleaned_prompt.is_empty() {
+        return Err("Prompt is required.".to_string());
+    }
+
+    let session = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&workspace_id)
+            .ok_or("workspace not connected")?
+            .clone()
+    };
+
+    let title_prompt = format!(
+        "You create concise run metadata for a coding task.\n\
+Return ONLY a JSON object with keys:\n\
+- title: short, clear, 3-7 words, Title Case\n\
+- worktreeName: lower-case, kebab-case slug prefixed with one of: \
+feat/, fix/, chore/, test/, docs/, refactor/, perf/, build/, ci/, style/.\n\
+\n\
+Choose fix/ when the task is a bug fix, error, regression, crash, or cleanup. \
+Use the closest match for chores/tests/docs/refactors/perf/build/ci/style. \
+Otherwise use feat/.\n\
+\n\
+Examples:\n\
+{{\"title\":\"Fix Login Redirect Loop\",\"worktreeName\":\"fix/login-redirect-loop\"}}\n\
+{{\"title\":\"Add Workspace Home View\",\"worktreeName\":\"feat/workspace-home\"}}\n\
+{{\"title\":\"Update Lint Config\",\"worktreeName\":\"chore/update-lint-config\"}}\n\
+{{\"title\":\"Add Coverage Tests\",\"worktreeName\":\"test/add-coverage-tests\"}}\n\
+\n\
+Task:\n{cleaned_prompt}"
+    );
+
+    let thread_params = json!({
+        "cwd": session.entry.path,
+        "approvalPolicy": "never"
+    });
+    let thread_result = session.send_request("thread/start", thread_params).await?;
+
+    if let Some(error) = thread_result.get("error") {
+        let error_msg = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("Unknown error starting thread");
+        return Err(error_msg.to_string());
+    }
+
+    let thread_id = thread_result
+        .get("result")
+        .and_then(|r| r.get("threadId"))
+        .or_else(|| thread_result.get("result").and_then(|r| r.get("thread")).and_then(|t| t.get("id")))
+        .or_else(|| thread_result.get("threadId"))
+        .or_else(|| thread_result.get("thread").and_then(|t| t.get("id")))
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| format!("Failed to get threadId from thread/start response: {:?}", thread_result))?
+        .to_string();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+    {
+        let mut callbacks = session.background_thread_callbacks.lock().await;
+        callbacks.insert(thread_id.clone(), tx);
+    }
+
+    let turn_params = json!({
+        "threadId": thread_id,
+        "input": [{ "type": "text", "text": title_prompt }],
+        "cwd": session.entry.path,
+        "approvalPolicy": "never",
+        "sandboxPolicy": { "type": "readOnly" },
+    });
+    let turn_result = session.send_request("turn/start", turn_params).await;
+    let turn_result = match turn_result {
+        Ok(result) => result,
+        Err(error) => {
+            {
+                let mut callbacks = session.background_thread_callbacks.lock().await;
+                callbacks.remove(&thread_id);
+            }
+            let archive_params = json!({ "threadId": thread_id.as_str() });
+            let _ = session.send_request("thread/archive", archive_params).await;
+            return Err(error);
+        }
+    };
+
+    if let Some(error) = turn_result.get("error") {
+        let error_msg = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("Unknown error starting turn");
+        {
+            let mut callbacks = session.background_thread_callbacks.lock().await;
+            callbacks.remove(&thread_id);
+        }
+        let archive_params = json!({ "threadId": thread_id.as_str() });
+        let _ = session.send_request("thread/archive", archive_params).await;
+        return Err(error_msg.to_string());
+    }
+
+    let mut response_text = String::new();
+    let timeout_duration = Duration::from_secs(60);
+    let collect_result = timeout(timeout_duration, async {
+        while let Some(event) = rx.recv().await {
+            let method = event.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            match method {
+                "item/agentMessage/delta" => {
+                    if let Some(params) = event.get("params") {
+                        if let Some(delta) = params.get("delta").and_then(|d| d.as_str()) {
+                            response_text.push_str(delta);
+                        }
+                    }
+                }
+                "turn/completed" => break,
+                "turn/error" => {
+                    let error_msg = event
+                        .get("params")
+                        .and_then(|p| p.get("error"))
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("Unknown error during metadata generation");
+                    return Err(error_msg.to_string());
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })
+    .await;
+
+    {
+        let mut callbacks = session.background_thread_callbacks.lock().await;
+        callbacks.remove(&thread_id);
+    }
+
+    let archive_params = json!({ "threadId": thread_id });
+    let _ = session.send_request("thread/archive", archive_params).await;
+
+    match collect_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err("Timeout waiting for metadata generation".to_string()),
+    }
+
+    let trimmed = response_text.trim();
+    if trimmed.is_empty() {
+        return Err("No metadata was generated".to_string());
+    }
+
+    let json_value = extract_json_value(trimmed)
+        .ok_or_else(|| "Failed to parse metadata JSON".to_string())?;
+    let title = json_value
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "Missing title in metadata".to_string())?;
+    let worktree_name = json_value
+        .get("worktreeName")
+        .or_else(|| json_value.get("worktree_name"))
+        .and_then(|v| v.as_str())
+        .map(|v| sanitize_run_worktree_name(v))
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "Missing worktree name in metadata".to_string())?;
+
+    Ok(json!({
+        "title": title,
+        "worktreeName": worktree_name
+    }))
+}
+
+fn extract_json_value(raw: &str) -> Option<Value> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<Value>(&raw[start..=end]).ok()
+}
+
+fn sanitize_run_worktree_name(value: &str) -> String {
+    let trimmed = value.trim().to_lowercase();
+    let mut cleaned = String::new();
+    let mut last_dash = false;
+    for ch in trimmed.chars() {
+        let next = if ch.is_ascii_alphanumeric() || ch == '/' {
+            last_dash = false;
+            Some(ch)
+        } else if ch == '-' || ch.is_whitespace() || ch == '_' {
+            if last_dash {
+                None
+            } else {
+                last_dash = true;
+                Some('-')
+            }
+        } else {
+            None
+        };
+        if let Some(ch) = next {
+            cleaned.push(ch);
+        }
+    }
+    while cleaned.ends_with('-') || cleaned.ends_with('/') {
+        cleaned.pop();
+    }
+    let allowed_prefixes = [
+        "feat/", "fix/", "chore/", "test/", "docs/", "refactor/", "perf/",
+        "build/", "ci/", "style/",
+    ];
+    if allowed_prefixes.iter().any(|prefix| cleaned.starts_with(prefix)) {
+        return cleaned;
+    }
+    for prefix in allowed_prefixes.iter() {
+        let dash_prefix = prefix.replace('/', "-");
+        if cleaned.starts_with(&dash_prefix) {
+            return cleaned.replacen(&dash_prefix, prefix, 1);
+        }
+    }
+    format!("feat/{}", cleaned.trim_start_matches('/'))
 }

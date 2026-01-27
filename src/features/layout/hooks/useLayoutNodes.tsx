@@ -23,6 +23,7 @@ import type {
   BranchInfo,
   CollaborationModeOption,
   ConversationItem,
+  ComposerEditorSettings,
   CustomPromptOption,
   DebugEntry,
   DictationSessionState,
@@ -34,8 +35,11 @@ import type {
   GitLogEntry,
   LocalUsageSnapshot,
   ModelOption,
+  OpenAppTarget,
   QueuedMessage,
   RateLimitSnapshot,
+  RequestUserInputRequest,
+  RequestUserInputResponse,
   SkillOption,
   ThreadSummary,
   ThreadTokenUsage,
@@ -58,6 +62,11 @@ type GitDiffViewerItem = {
   path: string;
   status: string;
   diff: string;
+  isImage?: boolean;
+  oldImageData?: string | null;
+  newImageData?: string | null;
+  oldImageMime?: string | null;
+  newImageMime?: string | null;
 };
 
 type WorktreeRenameState = {
@@ -94,12 +103,17 @@ type LayoutNodesOptions = {
   threadListLoadingByWorkspace: Record<string, boolean>;
   threadListPagingByWorkspace: Record<string, boolean>;
   threadListCursorByWorkspace: Record<string, string | null>;
-  lastAgentMessageByThread: Record<string, { text: string; timestamp: number }>;
   activeWorkspaceId: string | null;
   activeThreadId: string | null;
   activeItems: ConversationItem[];
   activeRateLimits: RateLimitSnapshot | null;
+  codeBlockCopyUseModifier: boolean;
+  openAppTargets: OpenAppTarget[];
+  openAppIconById: Record<string, string>;
+  selectedOpenAppId: string;
+  onSelectOpenAppId: (id: string) => void;
   approvals: ApprovalRequest[];
+  userInputRequests: RequestUserInputRequest[];
   handleApprovalDecision: (
     request: ApprovalRequest,
     decision: "accept" | "decline",
@@ -107,6 +121,10 @@ type LayoutNodesOptions = {
   handleApprovalRemember: (
     request: ApprovalRequest,
     command: string[],
+  ) => void;
+  handleUserInputSubmit: (
+    request: RequestUserInputRequest,
+    response: RequestUserInputResponse,
   ) => void;
   onOpenSettings: () => void;
   onOpenDictationSettings?: () => void;
@@ -122,6 +140,7 @@ type LayoutNodesOptions = {
   onToggleWorkspaceCollapse: (workspaceId: string, collapsed: boolean) => void;
   onSelectThread: (workspaceId: string, threadId: string) => void;
   onDeleteThread: (workspaceId: string, threadId: string) => void;
+  onSyncThread: (workspaceId: string, threadId: string) => void;
   pinThread: (workspaceId: string, threadId: string) => boolean;
   unpinThread: (workspaceId: string, threadId: string) => void;
   isThreadPinned: (workspaceId: string, threadId: string) => boolean;
@@ -173,6 +192,16 @@ type LayoutNodesOptions = {
   onCopyThread: () => void | Promise<void>;
   onToggleTerminal: () => void;
   showTerminalButton: boolean;
+  launchScript: string | null;
+  launchScriptEditorOpen: boolean;
+  launchScriptDraft: string;
+  launchScriptSaving: boolean;
+  launchScriptError: string | null;
+  onRunLaunchScript: () => void;
+  onOpenLaunchScriptEditor: () => void;
+  onCloseLaunchScriptEditor: () => void;
+  onLaunchScriptDraftChange: (value: string) => void;
+  onSaveLaunchScript: () => void;
   mainHeaderActionsNode?: ReactNode;
   centerMode: "chat" | "diff";
   onExitDiff: () => void;
@@ -287,6 +316,7 @@ type LayoutNodesOptions = {
   onMovePrompt: (data: { path: string; scope: "workspace" | "global" }) => void | Promise<void>;
   onRevealWorkspacePrompts: () => void | Promise<void>;
   onRevealGeneralPrompts: () => void | Promise<void>;
+  canRevealGeneralPrompts: boolean;
   onSend: (text: string, images: string[]) => void | Promise<void>;
   onQueue: (text: string, images: string[]) => void | Promise<void>;
   onStop: () => void;
@@ -317,12 +347,17 @@ type LayoutNodesOptions = {
   reasoningOptions: string[];
   selectedEffort: string | null;
   onSelectEffort: (effort: string | null) => void;
+  reasoningSupported: boolean;
   accessMode: AccessMode;
   onSelectAccessMode: (mode: AccessMode) => void;
   skills: SkillOption[];
   prompts: CustomPromptOption[];
   files: string[];
+  onInsertComposerText: (text: string) => void;
   textareaRef: RefObject<HTMLTextAreaElement | null>;
+  composerEditorSettings: ComposerEditorSettings;
+  composerEditorExpanded: boolean;
+  onToggleComposerEditorExpanded: () => void;
   dictationEnabled: boolean;
   dictationState: DictationSessionState;
   dictationLevel: number;
@@ -392,7 +427,6 @@ export function useLayoutNodes(options: LayoutNodesOptions): LayoutNodesResult {
       threadListLoadingByWorkspace={options.threadListLoadingByWorkspace}
       threadListPagingByWorkspace={options.threadListPagingByWorkspace}
       threadListCursorByWorkspace={options.threadListCursorByWorkspace}
-      lastAgentMessageByThread={options.lastAgentMessageByThread}
       activeWorkspaceId={options.activeWorkspaceId}
       activeThreadId={options.activeThreadId}
       accountRateLimits={options.activeRateLimits}
@@ -409,6 +443,7 @@ export function useLayoutNodes(options: LayoutNodesOptions): LayoutNodesResult {
       onToggleWorkspaceCollapse={options.onToggleWorkspaceCollapse}
       onSelectThread={options.onSelectThread}
       onDeleteThread={options.onDeleteThread}
+      onSyncThread={options.onSyncThread}
       pinThread={options.pinThread}
       unpinThread={options.unpinThread}
       isThreadPinned={options.isThreadPinned}
@@ -432,7 +467,13 @@ export function useLayoutNodes(options: LayoutNodesOptions): LayoutNodesResult {
     <Messages
       items={options.activeItems}
       threadId={options.activeThreadId ?? null}
+      workspaceId={options.activeWorkspace?.id ?? null}
       workspacePath={options.activeWorkspace?.path ?? null}
+      openTargets={options.openAppTargets}
+      selectedOpenAppId={options.selectedOpenAppId}
+      codeBlockCopyUseModifier={options.codeBlockCopyUseModifier}
+      userInputRequests={options.userInputRequests}
+      onUserInputSubmit={options.handleUserInputSubmit}
       isThinking={
         options.activeThreadId
           ? options.threadStatusById[options.activeThreadId]?.isProcessing ?? false
@@ -479,12 +520,16 @@ export function useLayoutNodes(options: LayoutNodesOptions): LayoutNodesResult {
       reasoningOptions={options.reasoningOptions}
       selectedEffort={options.selectedEffort}
       onSelectEffort={options.onSelectEffort}
+      reasoningSupported={options.reasoningSupported}
       accessMode={options.accessMode}
       onSelectAccessMode={options.onSelectAccessMode}
       skills={options.skills}
       prompts={options.prompts}
       files={options.files}
       textareaRef={options.textareaRef}
+      editorSettings={options.composerEditorSettings}
+      editorExpanded={options.composerEditorExpanded}
+      onToggleEditorExpanded={options.onToggleComposerEditorExpanded}
       dictationEnabled={options.dictationEnabled}
       dictationState={options.dictationState}
       dictationLevel={options.dictationLevel}
@@ -544,6 +589,10 @@ export function useLayoutNodes(options: LayoutNodesOptions): LayoutNodesResult {
       disableBranchMenu={options.isWorktreeWorkspace}
       parentPath={options.activeParentWorkspace?.path ?? null}
       worktreePath={options.isWorktreeWorkspace ? options.activeWorkspace.path : null}
+      openTargets={options.openAppTargets}
+      openAppIconById={options.openAppIconById}
+      selectedOpenAppId={options.selectedOpenAppId}
+      onSelectOpenAppId={options.onSelectOpenAppId}
       branchName={options.branchName}
       branches={options.branches}
       onCheckoutBranch={options.onCheckoutBranch}
@@ -553,6 +602,16 @@ export function useLayoutNodes(options: LayoutNodesOptions): LayoutNodesResult {
       onToggleTerminal={options.onToggleTerminal}
       isTerminalOpen={options.terminalOpen}
       showTerminalButton={options.showTerminalButton}
+      launchScript={options.launchScript}
+      launchScriptEditorOpen={options.launchScriptEditorOpen}
+      launchScriptDraft={options.launchScriptDraft}
+      launchScriptSaving={options.launchScriptSaving}
+      launchScriptError={options.launchScriptError}
+      onRunLaunchScript={options.onRunLaunchScript}
+      onOpenLaunchScriptEditor={options.onOpenLaunchScriptEditor}
+      onCloseLaunchScriptEditor={options.onCloseLaunchScriptEditor}
+      onLaunchScriptDraftChange={options.onLaunchScriptDraftChange}
+      onSaveLaunchScript={options.onSaveLaunchScript}
       extraActionsNode={options.mainHeaderActionsNode}
     />
   ) : null;
@@ -587,11 +646,17 @@ export function useLayoutNodes(options: LayoutNodesOptions): LayoutNodesResult {
   if (options.filePanelMode === "files" && options.activeWorkspace) {
     gitDiffPanelNode = (
       <FileTreePanel
+        workspaceId={options.activeWorkspace.id}
         workspacePath={options.activeWorkspace.path}
         files={options.files}
         isLoading={options.fileTreeLoading}
         filePanelMode={options.filePanelMode}
         onFilePanelModeChange={options.onFilePanelModeChange}
+        onInsertText={options.onInsertComposerText}
+        openTargets={options.openAppTargets}
+        openAppIconById={options.openAppIconById}
+        selectedOpenAppId={options.selectedOpenAppId}
+        onSelectOpenAppId={options.onSelectOpenAppId}
       />
     );
   } else if (options.filePanelMode === "prompts") {
@@ -609,6 +674,7 @@ export function useLayoutNodes(options: LayoutNodesOptions): LayoutNodesResult {
         onMovePrompt={options.onMovePrompt}
         onRevealWorkspacePrompts={options.onRevealWorkspacePrompts}
         onRevealGeneralPrompts={options.onRevealGeneralPrompts}
+        canRevealGeneralPrompts={options.canRevealGeneralPrompts}
       />
     );
   } else {

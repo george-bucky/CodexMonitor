@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 #[path = "../backend/mod.rs"]
 mod backend;
+#[path = "../codex_args.rs"]
+mod codex_args;
 #[path = "../codex_home.rs"]
 mod codex_home;
 #[path = "../codex_config.rs"]
@@ -13,9 +15,12 @@ mod storage;
 #[path = "../types.rs"]
 mod types;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::env;
+use std::fs::File;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -72,6 +77,12 @@ struct DaemonState {
     settings_path: PathBuf,
     app_settings: Mutex<AppSettings>,
     event_sink: DaemonEventSink,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WorkspaceFileResponse {
+    content: String,
+    truncated: bool,
 }
 
 impl DaemonState {
@@ -157,18 +168,22 @@ impl DaemonState {
             settings: WorkspaceSettings::default(),
         };
 
-        let default_bin = {
+        let (default_bin, codex_args) = {
             let settings = self.app_settings.lock().await;
-            settings.codex_bin.clone()
+            (
+                settings.codex_bin.clone(),
+                codex_args::resolve_workspace_codex_args(&entry, None, Some(&settings)),
+            )
         };
 
         let codex_home = codex_home::resolve_workspace_codex_home(&entry, None);
         let session = spawn_workspace_session(
             entry.clone(),
             default_bin,
+            codex_args,
+            codex_home,
             client_version,
             self.event_sink.clone(),
-            codex_home,
         )
         .await?;
 
@@ -260,18 +275,26 @@ impl DaemonState {
             settings: WorkspaceSettings::default(),
         };
 
-        let default_bin = {
+        let (default_bin, codex_args) = {
             let settings = self.app_settings.lock().await;
-            settings.codex_bin.clone()
+            (
+                settings.codex_bin.clone(),
+                codex_args::resolve_workspace_codex_args(
+                    &entry,
+                    Some(&parent_entry),
+                    Some(&settings),
+                ),
+            )
         };
 
-        let codex_home = codex_home::resolve_workspace_codex_home(&entry, Some(&parent_entry.path));
+        let codex_home = codex_home::resolve_workspace_codex_home(&entry, Some(&parent_entry));
         let session = spawn_workspace_session(
             entry.clone(),
             default_bin,
+            codex_args,
+            codex_home,
             client_version,
             self.event_sink.clone(),
-            codex_home,
         )
         .await?;
 
@@ -524,18 +547,26 @@ impl DaemonState {
         let was_connected = self.sessions.lock().await.contains_key(&entry_snapshot.id);
         if was_connected {
             self.kill_session(&entry_snapshot.id).await;
-            let default_bin = {
+            let (default_bin, codex_args) = {
                 let settings = self.app_settings.lock().await;
-                settings.codex_bin.clone()
+                (
+                    settings.codex_bin.clone(),
+                    codex_args::resolve_workspace_codex_args(
+                        &entry_snapshot,
+                        Some(&parent),
+                        Some(&settings),
+                    ),
+                )
             };
             let codex_home =
-                codex_home::resolve_workspace_codex_home(&entry_snapshot, Some(&parent.path));
+                codex_home::resolve_workspace_codex_home(&entry_snapshot, Some(&parent));
             match spawn_workspace_session(
                 entry_snapshot.clone(),
                 default_bin,
+                codex_args,
+                codex_home,
                 client_version,
                 self.event_sink.clone(),
-                codex_home,
             )
             .await
             {
@@ -655,9 +686,23 @@ impl DaemonState {
         &self,
         id: String,
         settings: WorkspaceSettings,
+        client_version: String,
     ) -> Result<WorkspaceInfo, String> {
-        let (entry_snapshot, list) = {
+        let (
+            previous_entry,
+            entry_snapshot,
+            parent_entry,
+            previous_codex_home,
+            previous_codex_args,
+            child_entries,
+        ) = {
             let mut workspaces = self.workspaces.lock().await;
+            let previous_entry = workspaces
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| "workspace not found".to_string())?;
+            let previous_codex_home = previous_entry.settings.codex_home.clone();
+            let previous_codex_args = previous_entry.settings.codex_args.clone();
             let entry_snapshot = match workspaces.get_mut(&id) {
                 Some(entry) => {
                     entry.settings = settings.clone();
@@ -665,17 +710,140 @@ impl DaemonState {
                 }
                 None => return Err("workspace not found".to_string()),
             };
-            let list: Vec<_> = workspaces.values().cloned().collect();
-            (entry_snapshot, list)
+            let parent_entry = entry_snapshot
+                .parent_id
+                .as_ref()
+                .and_then(|parent_id| workspaces.get(parent_id))
+                .cloned();
+            let child_entries = workspaces
+                .values()
+                .filter(|entry| entry.parent_id.as_deref() == Some(&id))
+                .cloned()
+                .collect::<Vec<_>>();
+            (
+                previous_entry,
+                entry_snapshot,
+                parent_entry,
+                previous_codex_home,
+                previous_codex_args,
+                child_entries,
+            )
+        };
+
+        let codex_home_changed = previous_codex_home != entry_snapshot.settings.codex_home;
+        let codex_args_changed = previous_codex_args != entry_snapshot.settings.codex_args;
+        let connected = self.sessions.lock().await.contains_key(&id);
+        if connected && (codex_home_changed || codex_args_changed) {
+            let rollback_entry = previous_entry.clone();
+            let (default_bin, codex_args) = {
+                let settings = self.app_settings.lock().await;
+                (
+                    settings.codex_bin.clone(),
+                    codex_args::resolve_workspace_codex_args(
+                        &entry_snapshot,
+                        parent_entry.as_ref(),
+                        Some(&settings),
+                    ),
+                )
+            };
+            let codex_home =
+                codex_home::resolve_workspace_codex_home(&entry_snapshot, parent_entry.as_ref());
+            let new_session = match spawn_workspace_session(
+                entry_snapshot.clone(),
+                default_bin,
+                codex_args,
+                codex_home,
+                client_version.clone(),
+                self.event_sink.clone(),
+            )
+            .await
+            {
+                Ok(session) => session,
+                Err(error) => {
+                    let mut workspaces = self.workspaces.lock().await;
+                    workspaces.insert(rollback_entry.id.clone(), rollback_entry);
+                    return Err(error);
+                }
+            };
+            if let Some(old_session) = self
+                .sessions
+                .lock()
+                .await
+                .insert(entry_snapshot.id.clone(), new_session)
+            {
+                let mut child = old_session.child.lock().await;
+                let _ = child.kill().await;
+            }
+        }
+        if codex_home_changed || codex_args_changed {
+            let app_settings = self.app_settings.lock().await.clone();
+            let default_bin = app_settings.codex_bin.clone();
+            for child in child_entries {
+                let connected = self.sessions.lock().await.contains_key(&child.id);
+                if !connected {
+                    continue;
+                }
+                let previous_child_home =
+                    codex_home::resolve_workspace_codex_home(&child, Some(&previous_entry));
+                let next_child_home =
+                    codex_home::resolve_workspace_codex_home(&child, Some(&entry_snapshot));
+                let previous_child_args = codex_args::resolve_workspace_codex_args(
+                    &child,
+                    Some(&previous_entry),
+                    Some(&app_settings),
+                );
+                let next_child_args = codex_args::resolve_workspace_codex_args(
+                    &child,
+                    Some(&entry_snapshot),
+                    Some(&app_settings),
+                );
+                if previous_child_home == next_child_home
+                    && previous_child_args == next_child_args
+                {
+                    continue;
+                }
+                let new_session = match spawn_workspace_session(
+                    child.clone(),
+                    default_bin.clone(),
+                    next_child_args,
+                    next_child_home,
+                    client_version.clone(),
+                    self.event_sink.clone(),
+                )
+                .await
+                {
+                    Ok(session) => session,
+                    Err(error) => {
+                        eprintln!(
+                            "update_workspace_settings: respawn failed for worktree {} after parent override change: {error}",
+                            child.id
+                        );
+                        continue;
+                    }
+                };
+                if let Some(old_session) = self
+                    .sessions
+                    .lock()
+                    .await
+                    .insert(child.id.clone(), new_session)
+                {
+                    let mut child = old_session.child.lock().await;
+                    let _ = child.kill().await;
+                }
+            }
+        }
+
+        let list: Vec<_> = {
+            let workspaces = self.workspaces.lock().await;
+            workspaces.values().cloned().collect()
         };
         write_workspaces(&self.storage_path, &list)?;
 
-        let connected = self.sessions.lock().await.contains_key(&id);
         Ok(WorkspaceInfo {
             id: entry_snapshot.id,
             name: entry_snapshot.name,
             path: entry_snapshot.path,
-            connected,
+            connected: self.sessions.lock().await.contains_key(&id),
             codex_bin: entry_snapshot.codex_bin,
             kind: entry_snapshot.kind,
             parent_id: entry_snapshot.parent_id,
@@ -733,28 +901,35 @@ impl DaemonState {
                 .ok_or("workspace not found")?
         };
 
-        let default_bin = {
-            let settings = self.app_settings.lock().await;
-            settings.codex_bin.clone()
-        };
-
-        let parent_path = if entry.kind.is_worktree() {
+        let parent_entry = if entry.kind.is_worktree() {
             let workspaces = self.workspaces.lock().await;
             entry
                 .parent_id
                 .as_deref()
                 .and_then(|parent_id| workspaces.get(parent_id))
-                .map(|parent| parent.path.clone())
+                .cloned()
         } else {
             None
         };
-        let codex_home = codex_home::resolve_workspace_codex_home(&entry, parent_path.as_deref());
+        let (default_bin, codex_args) = {
+            let settings = self.app_settings.lock().await;
+            (
+                settings.codex_bin.clone(),
+                codex_args::resolve_workspace_codex_args(
+                    &entry,
+                    parent_entry.as_ref(),
+                    Some(&settings),
+                ),
+            )
+        };
+        let codex_home = codex_home::resolve_workspace_codex_home(&entry, parent_entry.as_ref());
         let session = spawn_workspace_session(
             entry,
             default_bin,
+            codex_args,
+            codex_home,
             client_version,
             self.event_sink.clone(),
-            codex_home,
         )
         .await?;
 
@@ -764,6 +939,9 @@ impl DaemonState {
 
     async fn update_app_settings(&self, settings: AppSettings) -> Result<AppSettings, String> {
         let _ = codex_config::write_collab_enabled(settings.experimental_collab_enabled);
+        let _ = codex_config::write_collaboration_modes_enabled(
+            settings.experimental_collaboration_modes_enabled,
+        );
         let _ = codex_config::write_steer_enabled(settings.experimental_steer_enabled);
         let _ = codex_config::write_unified_exec_enabled(settings.experimental_unified_exec_enabled);
         write_settings(&self.settings_path, &settings)?;
@@ -791,6 +969,23 @@ impl DaemonState {
 
         let root = PathBuf::from(entry.path);
         Ok(list_workspace_files_inner(&root, 20000))
+    }
+
+    async fn read_workspace_file(
+        &self,
+        workspace_id: String,
+        path: String,
+    ) -> Result<WorkspaceFileResponse, String> {
+        let entry = {
+            let workspaces = self.workspaces.lock().await;
+            workspaces
+                .get(&workspace_id)
+                .cloned()
+                .ok_or("workspace not found")?
+        };
+
+        let root = PathBuf::from(entry.path);
+        read_workspace_file_inner(&root, &path)
     }
 
     async fn start_thread(&self, workspace_id: String) -> Result<Value, String> {
@@ -964,7 +1159,7 @@ impl DaemonState {
     async fn respond_to_server_request(
         &self,
         workspace_id: String,
-        request_id: u64,
+        request_id: Value,
         result: Value,
     ) -> Result<Value, String> {
         let session = self.get_session(&workspace_id).await?;
@@ -986,23 +1181,7 @@ impl DaemonState {
             return Err("empty command".to_string());
         }
 
-        let (entry, parent_path) = {
-            let workspaces = self.workspaces.lock().await;
-            let entry = workspaces
-                .get(&workspace_id)
-                .ok_or("workspace not found")?
-                .clone();
-            let parent_path = entry
-                .parent_id
-                .as_ref()
-                .and_then(|parent_id| workspaces.get(parent_id))
-                .map(|parent| parent.path.clone());
-            (entry, parent_path)
-        };
-
-        let codex_home = codex_home::resolve_workspace_codex_home(&entry, parent_path.as_deref())
-            .or_else(codex_home::resolve_default_codex_home)
-            .ok_or("Unable to resolve CODEX_HOME".to_string())?;
+        let codex_home = self.resolve_codex_home_for_workspace(&workspace_id).await?;
         let rules_path = rules::default_rules_path(&codex_home);
         rules::append_prefix_rule(&rules_path, &command)?;
 
@@ -1010,6 +1189,32 @@ impl DaemonState {
             "ok": true,
             "rulesPath": rules_path,
         }))
+    }
+
+    async fn get_config_model(&self, workspace_id: String) -> Result<Value, String> {
+        let codex_home = self.resolve_codex_home_for_workspace(&workspace_id).await?;
+        let model = codex_config::read_config_model(Some(codex_home))?;
+        Ok(json!({ "model": model }))
+    }
+
+    async fn resolve_codex_home_for_workspace(&self, workspace_id: &str) -> Result<PathBuf, String> {
+        let (entry, parent_entry) = {
+            let workspaces = self.workspaces.lock().await;
+            let entry = workspaces
+                .get(workspace_id)
+                .ok_or("workspace not found")?
+                .clone();
+            let parent_entry = entry
+                .parent_id
+                .as_ref()
+                .and_then(|parent_id| workspaces.get(parent_id))
+                .cloned();
+            (entry, parent_entry)
+        };
+
+        codex_home::resolve_workspace_codex_home(&entry, parent_entry.as_ref())
+            .or_else(codex_home::resolve_default_codex_home)
+            .ok_or("Unable to resolve CODEX_HOME".to_string())
     }
 }
 
@@ -1074,6 +1279,45 @@ fn list_workspace_files_inner(root: &PathBuf, max_files: usize) -> Vec<String> {
 
     results.sort();
     results
+}
+
+const MAX_WORKSPACE_FILE_BYTES: u64 = 400_000;
+
+fn read_workspace_file_inner(
+    root: &PathBuf,
+    relative_path: &str,
+) -> Result<WorkspaceFileResponse, String> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|err| format!("Failed to resolve workspace root: {err}"))?;
+    let candidate = canonical_root.join(relative_path);
+    let canonical_path = candidate
+        .canonicalize()
+        .map_err(|err| format!("Failed to open file: {err}"))?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err("Invalid file path".to_string());
+    }
+    let metadata = std::fs::metadata(&canonical_path)
+        .map_err(|err| format!("Failed to read file metadata: {err}"))?;
+    if !metadata.is_file() {
+        return Err("Path is not a file".to_string());
+    }
+
+    let mut file =
+        File::open(&canonical_path).map_err(|err| format!("Failed to open file: {err}"))?;
+    let mut buffer = Vec::new();
+    file.take(MAX_WORKSPACE_FILE_BYTES + 1)
+        .read_to_end(&mut buffer)
+        .map_err(|err| format!("Failed to read file: {err}"))?;
+
+    let truncated = buffer.len() > MAX_WORKSPACE_FILE_BYTES as usize;
+    if truncated {
+        buffer.truncate(MAX_WORKSPACE_FILE_BYTES as usize);
+    }
+
+    let content =
+        String::from_utf8(buffer).map_err(|_| "File is not valid UTF-8".to_string())?;
+    Ok(WorkspaceFileResponse { content, truncated })
 }
 
 async fn run_git_command(repo_path: &PathBuf, args: &[&str]) -> Result<String, String> {
@@ -1564,7 +1808,9 @@ async fn handle_rpc_request(
             };
             let settings: WorkspaceSettings =
                 serde_json::from_value(settings_value).map_err(|err| err.to_string())?;
-            let workspace = state.update_workspace_settings(id, settings).await?;
+            let workspace = state
+                .update_workspace_settings(id, settings, client_version)
+                .await?;
             serde_json::to_value(workspace).map_err(|err| err.to_string())
         }
         "update_workspace_codex_bin" => {
@@ -1578,10 +1824,21 @@ async fn handle_rpc_request(
             let files = state.list_workspace_files(workspace_id).await?;
             serde_json::to_value(files).map_err(|err| err.to_string())
         }
+        "read_workspace_file" => {
+            let workspace_id = parse_string(&params, "workspaceId")?;
+            let path = parse_string(&params, "path")?;
+            let response = state.read_workspace_file(workspace_id, path).await?;
+            serde_json::to_value(response).map_err(|err| err.to_string())
+        }
         "get_app_settings" => {
             let mut settings = state.app_settings.lock().await.clone();
             if let Ok(Some(collab_enabled)) = codex_config::read_collab_enabled() {
                 settings.experimental_collab_enabled = collab_enabled;
+            }
+            if let Ok(Some(collaboration_modes_enabled)) =
+                codex_config::read_collaboration_modes_enabled()
+            {
+                settings.experimental_collaboration_modes_enabled = collaboration_modes_enabled;
             }
             if let Ok(Some(steer_enabled)) = codex_config::read_steer_enabled() {
                 settings.experimental_steer_enabled = steer_enabled;
@@ -1600,6 +1857,18 @@ async fn handle_rpc_request(
                 serde_json::from_value(settings_value).map_err(|err| err.to_string())?;
             let updated = state.update_app_settings(settings).await?;
             serde_json::to_value(updated).map_err(|err| err.to_string())
+        }
+        "get_codex_config_path" => {
+            let path = codex_config::config_toml_path()
+                .ok_or("Unable to resolve CODEX_HOME".to_string())?;
+            let path = path
+                .to_str()
+                .ok_or("Unable to resolve CODEX_HOME".to_string())?;
+            Ok(Value::String(path.to_string()))
+        }
+        "get_config_model" => {
+            let workspace_id = parse_string(&params, "workspaceId")?;
+            state.get_config_model(workspace_id).await
         }
         "start_thread" => {
             let workspace_id = parse_string(&params, "workspaceId")?;
@@ -1681,7 +1950,8 @@ async fn handle_rpc_request(
             let map = params.as_object().ok_or("missing requestId")?;
             let request_id = map
                 .get("requestId")
-                .and_then(|value| value.as_u64())
+                .cloned()
+                .filter(|value| value.is_number() || value.is_string())
                 .ok_or("missing requestId")?;
             let result = map.get("result").cloned().ok_or("missing `result`")?;
             state

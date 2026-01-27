@@ -9,6 +9,7 @@ type UseTerminalControllerOptions = {
   activeWorkspaceId: string | null;
   activeWorkspace: WorkspaceInfo | null;
   terminalOpen: boolean;
+  onCloseTerminalPanel?: () => void;
   onDebug: (entry: DebugEntry) => void;
 };
 
@@ -16,6 +17,7 @@ export function useTerminalController({
   activeWorkspaceId,
   activeWorkspace,
   terminalOpen,
+  onCloseTerminalPanel,
   onDebug,
 }: UseTerminalControllerOptions) {
   const cleanupTerminalRef = useRef<((workspaceId: string, terminalId: string) => void) | null>(
@@ -38,6 +40,7 @@ export function useTerminalController({
     terminals: terminalTabs,
     activeTerminalId,
     createTerminal,
+    ensureTerminalWithTitle,
     closeTerminal,
     setActiveTerminal,
     ensureTerminal,
@@ -85,9 +88,30 @@ export function useTerminalController({
       if (!activeWorkspaceId) {
         return;
       }
+      const shouldClosePanel =
+        terminalTabs.length === 1 && terminalTabs[0]?.id === terminalId;
       closeTerminal(activeWorkspaceId, terminalId);
+      if (shouldClosePanel) {
+        onCloseTerminalPanel?.();
+      }
     },
-    [activeWorkspaceId, closeTerminal],
+    [activeWorkspaceId, closeTerminal, onCloseTerminalPanel, terminalTabs],
+  );
+
+  const restartTerminalSession = useCallback(
+    async (workspaceId: string, terminalId: string) => {
+      cleanupTerminalRef.current?.(workspaceId, terminalId);
+      try {
+        await closeTerminalSession(workspaceId, terminalId);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("Terminal session not found")) {
+          onDebug(buildErrorDebugEntry("terminal close error", error));
+          throw error;
+        }
+      }
+    },
+    [onDebug],
   );
 
   return {
@@ -97,5 +121,7 @@ export function useTerminalController({
     onNewTerminal,
     onCloseTerminal,
     terminalState,
+    ensureTerminalWithTitle,
+    restartTerminalSession,
   };
 }

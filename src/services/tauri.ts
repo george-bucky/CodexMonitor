@@ -49,6 +49,22 @@ export async function listWorkspaces(): Promise<WorkspaceInfo[]> {
   return invoke<WorkspaceInfo[]>("list_workspaces");
 }
 
+export async function getCodexConfigPath(): Promise<string> {
+  return invoke<string>("get_codex_config_path");
+}
+
+export async function getConfigModel(workspaceId: string): Promise<string | null> {
+  const response = await invoke<{ model?: string | null }>("get_config_model", {
+    workspaceId,
+  });
+  const model = response?.model;
+  if (typeof model !== "string") {
+    return null;
+  }
+  const trimmed = model.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 export async function addWorkspace(
   path: string,
   codex_bin: string | null,
@@ -120,8 +136,24 @@ export async function applyWorktreeChanges(workspaceId: string): Promise<void> {
   return invoke("apply_worktree_changes", { workspaceId });
 }
 
-export async function openWorkspaceIn(path: string, app: string): Promise<void> {
-  return invoke("open_workspace_in", { path, app });
+export async function openWorkspaceIn(
+  path: string,
+  options: {
+    appName?: string | null;
+    command?: string | null;
+    args?: string[];
+  },
+): Promise<void> {
+  return invoke("open_workspace_in", {
+    path,
+    app: options.appName ?? null,
+    command: options.command ?? null,
+    args: options.args ?? [],
+  });
+}
+
+export async function getOpenAppIcon(appName: string): Promise<string | null> {
+  return invoke<string | null>("get_open_app_icon", { appName });
 }
 
 export async function connectWorkspace(id: string): Promise<void> {
@@ -144,7 +176,7 @@ export async function sendUserMessage(
     collaborationMode?: Record<string, unknown> | null;
   },
 ) {
-  return invoke("send_user_message", {
+  const payload: Record<string, unknown> = {
     workspaceId,
     threadId,
     text,
@@ -152,8 +184,11 @@ export async function sendUserMessage(
     effort: options?.effort ?? null,
     accessMode: options?.accessMode ?? null,
     images: options?.images ?? null,
-    collaborationMode: options?.collaborationMode ?? null,
-  });
+  };
+  if (options?.collaborationMode) {
+    payload.collaborationMode = options.collaborationMode;
+  }
+  return invoke("send_user_message", payload);
 }
 
 export async function interruptTurn(
@@ -179,13 +214,25 @@ export async function startReview(
 
 export async function respondToServerRequest(
   workspaceId: string,
-  requestId: number,
+  requestId: number | string,
   decision: "accept" | "decline",
 ) {
   return invoke("respond_to_server_request", {
     workspaceId,
     requestId,
     result: { decision },
+  });
+}
+
+export async function respondToUserInputRequest(
+  workspaceId: string,
+  requestId: number | string,
+  answers: Record<string, { answers: string[] }>,
+) {
+  return invoke("respond_to_server_request", {
+    workspaceId,
+    requestId,
+    result: { answers },
   });
 }
 
@@ -324,6 +371,13 @@ export async function getModelList(workspaceId: string) {
   return invoke<any>("model_list", { workspaceId });
 }
 
+export async function generateRunMetadata(workspaceId: string, prompt: string) {
+  return invoke<{ title: string; worktreeName: string }>("generate_run_metadata", {
+    workspaceId,
+    prompt,
+  });
+}
+
 export async function getCollaborationModes(workspaceId: string) {
   return invoke<any>("collaboration_mode_list", { workspaceId });
 }
@@ -344,8 +398,8 @@ export async function getWorkspacePromptsDir(workspaceId: string) {
   return invoke<string>("prompts_workspace_dir", { workspaceId });
 }
 
-export async function getGlobalPromptsDir() {
-  return invoke<string>("prompts_global_dir");
+export async function getGlobalPromptsDir(workspaceId: string) {
+  return invoke<string>("prompts_global_dir", { workspaceId });
 }
 
 export async function createPrompt(
@@ -424,12 +478,23 @@ export async function setMenuAccelerators(
 
 export async function runCodexDoctor(
   codexBin: string | null,
+  codexArgs: string | null,
 ): Promise<CodexDoctorResult> {
-  return invoke<CodexDoctorResult>("codex_doctor", { codexBin });
+  return invoke<CodexDoctorResult>("codex_doctor", { codexBin, codexArgs });
 }
 
 export async function getWorkspaceFiles(workspaceId: string) {
   return invoke<string[]>("list_workspace_files", { workspaceId });
+}
+
+export async function readWorkspaceFile(
+  workspaceId: string,
+  path: string,
+): Promise<{ content: string; truncated: boolean }> {
+  return invoke<{ content: string; truncated: boolean }>("read_workspace_file", {
+    workspaceId,
+    path,
+  });
 }
 
 export async function listGitBranches(workspaceId: string) {
@@ -488,6 +553,10 @@ export async function startDictation(
   preferredLanguage: string | null,
 ): Promise<DictationSessionState> {
   return invoke("dictation_start", { preferredLanguage });
+}
+
+export async function requestDictationPermission(): Promise<boolean> {
+  return invoke("dictation_request_permission");
 }
 
 export async function stopDictation(): Promise<DictationSessionState> {
