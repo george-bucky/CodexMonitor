@@ -4,6 +4,7 @@ import type { WorkspaceInfo } from "../../../types";
 
 type WorkspaceCardProps = {
   workspace: WorkspaceInfo;
+  workspaceName?: React.ReactNode;
   isActive: boolean;
   isCollapsed: boolean;
   addMenuOpen: boolean;
@@ -23,6 +24,7 @@ type WorkspaceCardProps = {
 
 export function WorkspaceCard({
   workspace,
+  workspaceName,
   isActive,
   isCollapsed,
   addMenuOpen,
@@ -34,6 +36,8 @@ export function WorkspaceCard({
   onToggleAddMenu,
   children,
 }: WorkspaceCardProps) {
+  const contentCollapsedClass = isCollapsed ? " collapsed" : "";
+
   return (
     <div className="workspace-card">
       <div
@@ -52,7 +56,7 @@ export function WorkspaceCard({
         <div>
           <div className="workspace-name-row">
             <div className="workspace-title">
-              <span className="workspace-name">{workspace.name}</span>
+              <span className="workspace-name">{workspaceName ?? workspace.name}</span>
               <button
                 className={`workspace-toggle ${isCollapsed ? "" : "expanded"}`}
                 onClick={(event) => {
@@ -107,7 +111,13 @@ export function WorkspaceCard({
           </span>
         )}
       </div>
-      {children}
+      <div
+        className={`workspace-card-content${contentCollapsedClass}`}
+        aria-hidden={isCollapsed}
+        inert={isCollapsed ? true : undefined}
+      >
+        <div className="workspace-card-content-inner">{children}</div>
+      </div>
     </div>
   );
 }

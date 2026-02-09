@@ -1,26 +1,66 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
+import * as notification from "@tauri-apps/plugin-notification";
 import {
   addWorkspace,
+  compactThread,
+  fetchGit,
+  forkThread,
   getGitHubIssues,
   getGitLog,
   getGitStatus,
   getOpenAppIcon,
+  listMcpServerStatus,
+  readGlobalAgentsMd,
+  readGlobalCodexConfigToml,
+  listWorkspaces,
+  orbitConnectTest,
+  orbitRunnerStart,
+  orbitRunnerStatus,
+  orbitRunnerStop,
+  orbitSignInPoll,
+  orbitSignInStart,
+  orbitSignOut,
   openWorkspaceIn,
+  readAgentMd,
   stageGitAll,
   respondToServerRequest,
   respondToUserInputRequest,
   sendUserMessage,
+  steerTurn,
+  sendNotification,
   startReview,
+  setThreadName,
+  tailscaleDaemonStart,
+  tailscaleDaemonCommandPreview,
+  tailscaleDaemonStatus,
+  tailscaleDaemonStop,
+  tailscaleStatus,
+  writeGlobalAgentsMd,
+  writeGlobalCodexConfigToml,
+  writeAgentMd,
 } from "./tauri";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
+vi.mock("@tauri-apps/plugin-notification", () => ({
+  isPermissionGranted: vi.fn(),
+  requestPermission: vi.fn(),
+  sendNotification: vi.fn(),
+}));
+
 describe("tauri invoke wrappers", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "is_macos_debug_build") {
+        return false;
+      }
+      return undefined;
+    });
   });
 
   it("uses codex_bin for addWorkspace", async () => {
@@ -64,6 +104,16 @@ describe("tauri invoke wrappers", () => {
     });
   });
 
+  it("returns an empty list when the Tauri invoke bridge is missing", async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockRejectedValueOnce(
+      new TypeError("Cannot read properties of undefined (reading 'invoke')"),
+    );
+
+    await expect(listWorkspaces()).resolves.toEqual([]);
+    expect(invokeMock).toHaveBeenCalledWith("list_workspaces");
+  });
+
   it("applies default limit for git log", async () => {
     const invokeMock = vi.mocked(invoke);
     invokeMock.mockResolvedValueOnce({
@@ -84,6 +134,56 @@ describe("tauri invoke wrappers", () => {
     });
   });
 
+  it("maps workspaceId and threadId for fork_thread", async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockResolvedValueOnce({});
+
+    await forkThread("ws-9", "thread-9");
+
+    expect(invokeMock).toHaveBeenCalledWith("fork_thread", {
+      workspaceId: "ws-9",
+      threadId: "thread-9",
+    });
+  });
+
+  it("maps workspaceId and threadId for compact_thread", async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockResolvedValueOnce({});
+
+    await compactThread("ws-10", "thread-10");
+
+    expect(invokeMock).toHaveBeenCalledWith("compact_thread", {
+      workspaceId: "ws-10",
+      threadId: "thread-10",
+    });
+  });
+
+  it("maps workspaceId/threadId/name for set_thread_name", async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockResolvedValueOnce({});
+
+    await setThreadName("ws-9", "thread-9", "New Name");
+
+    expect(invokeMock).toHaveBeenCalledWith("set_thread_name", {
+      workspaceId: "ws-9",
+      threadId: "thread-9",
+      name: "New Name",
+    });
+  });
+
+  it("maps workspaceId/cursor/limit for list_mcp_server_status", async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockResolvedValueOnce({});
+
+    await listMcpServerStatus("ws-10", "cursor-1", 25);
+
+    expect(invokeMock).toHaveBeenCalledWith("list_mcp_server_status", {
+      workspaceId: "ws-10",
+      cursor: "cursor-1",
+      limit: 25,
+    });
+  });
+
   it("invokes stage_git_all", async () => {
     const invokeMock = vi.mocked(invoke);
     invokeMock.mockResolvedValueOnce({});
@@ -92,6 +192,17 @@ describe("tauri invoke wrappers", () => {
 
     expect(invokeMock).toHaveBeenCalledWith("stage_git_all", {
       workspaceId: "ws-6",
+    });
+  });
+
+  it("invokes fetch_git", async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockResolvedValueOnce({});
+
+    await fetchGit("ws-7");
+
+    expect(invokeMock).toHaveBeenCalledWith("fetch_git", {
+      workspaceId: "ws-7",
     });
   });
 
@@ -123,6 +234,127 @@ describe("tauri invoke wrappers", () => {
     });
   });
 
+  it("invokes orbit remote auth/runner wrappers", async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockResolvedValue(undefined);
+
+    await orbitConnectTest();
+    await orbitSignInStart();
+    await orbitSignInPoll("device-code");
+    await orbitSignOut();
+    await orbitRunnerStart();
+    await orbitRunnerStop();
+    await orbitRunnerStatus();
+
+    expect(invokeMock).toHaveBeenCalledWith("orbit_connect_test");
+    expect(invokeMock).toHaveBeenCalledWith("orbit_sign_in_start");
+    expect(invokeMock).toHaveBeenCalledWith("orbit_sign_in_poll", {
+      deviceCode: "device-code",
+    });
+    expect(invokeMock).toHaveBeenCalledWith("orbit_sign_out");
+    expect(invokeMock).toHaveBeenCalledWith("orbit_runner_start");
+    expect(invokeMock).toHaveBeenCalledWith("orbit_runner_stop");
+    expect(invokeMock).toHaveBeenCalledWith("orbit_runner_status");
+  });
+
+  it("invokes tailscale wrappers", async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockResolvedValue(undefined);
+
+    await tailscaleStatus();
+    await tailscaleDaemonCommandPreview();
+    await tailscaleDaemonStart();
+    await tailscaleDaemonStop();
+    await tailscaleDaemonStatus();
+
+    expect(invokeMock).toHaveBeenCalledWith("tailscale_status");
+    expect(invokeMock).toHaveBeenCalledWith("tailscale_daemon_command_preview");
+    expect(invokeMock).toHaveBeenCalledWith("tailscale_daemon_start");
+    expect(invokeMock).toHaveBeenCalledWith("tailscale_daemon_stop");
+    expect(invokeMock).toHaveBeenCalledWith("tailscale_daemon_status");
+  });
+
+  it("reads agent.md for a workspace", async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockResolvedValueOnce({ exists: true, content: "# Agent", truncated: false });
+
+    await readAgentMd("ws-agent");
+
+    expect(invokeMock).toHaveBeenCalledWith("file_read", {
+      scope: "workspace",
+      kind: "agents",
+      workspaceId: "ws-agent",
+    });
+  });
+
+  it("writes agent.md for a workspace", async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockResolvedValueOnce({});
+
+    await writeAgentMd("ws-agent", "# Agent");
+
+    expect(invokeMock).toHaveBeenCalledWith("file_write", {
+      scope: "workspace",
+      kind: "agents",
+      workspaceId: "ws-agent",
+      content: "# Agent",
+    });
+  });
+
+  it("reads global AGENTS.md", async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockResolvedValueOnce({ exists: true, content: "# Global", truncated: false });
+
+    await readGlobalAgentsMd();
+
+    expect(invokeMock).toHaveBeenCalledWith("file_read", {
+      scope: "global",
+      kind: "agents",
+      workspaceId: undefined,
+    });
+  });
+
+  it("writes global AGENTS.md", async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockResolvedValueOnce({});
+
+    await writeGlobalAgentsMd("# Global");
+
+    expect(invokeMock).toHaveBeenCalledWith("file_write", {
+      scope: "global",
+      kind: "agents",
+      workspaceId: undefined,
+      content: "# Global",
+    });
+  });
+
+  it("reads global config.toml", async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockResolvedValueOnce({ exists: true, content: "model = \"gpt-5\"", truncated: false });
+
+    await readGlobalCodexConfigToml();
+
+    expect(invokeMock).toHaveBeenCalledWith("file_read", {
+      scope: "global",
+      kind: "config",
+      workspaceId: undefined,
+    });
+  });
+
+  it("writes global config.toml", async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockResolvedValueOnce({});
+
+    await writeGlobalCodexConfigToml("model = \"gpt-5\"");
+
+    expect(invokeMock).toHaveBeenCalledWith("file_write", {
+      scope: "global",
+      kind: "config",
+      workspaceId: undefined,
+      content: "model = \"gpt-5\"",
+    });
+  });
+
   it("fills sendUserMessage defaults in payload", async () => {
     const invokeMock = vi.mocked(invoke);
     invokeMock.mockResolvedValueOnce({});
@@ -139,6 +371,21 @@ describe("tauri invoke wrappers", () => {
       model: null,
       effort: null,
       accessMode: "full-access",
+      images: ["image.png"],
+    });
+  });
+
+  it("invokes turn_steer for steer payloads", async () => {
+    const invokeMock = vi.mocked(invoke);
+    invokeMock.mockResolvedValueOnce({});
+
+    await steerTurn("ws-4", "thread-1", "turn-2", "continue", ["image.png"]);
+
+    expect(invokeMock).toHaveBeenCalledWith("turn_steer", {
+      workspaceId: "ws-4",
+      threadId: "thread-1",
+      turnId: "turn-2",
+      text: "continue",
       images: ["image.png"],
     });
   });
@@ -206,5 +453,118 @@ describe("tauri invoke wrappers", () => {
         answers,
       },
     });
+  });
+
+  it("sends a notification without re-requesting permission when already granted", async () => {
+    const isPermissionGrantedMock = vi.mocked(notification.isPermissionGranted);
+    const requestPermissionMock = vi.mocked(notification.requestPermission);
+    const sendNotificationMock = vi.mocked(notification.sendNotification);
+    isPermissionGrantedMock.mockResolvedValueOnce(true);
+
+    await sendNotification("Hello", "World");
+
+    expect(isPermissionGrantedMock).toHaveBeenCalledTimes(1);
+    expect(requestPermissionMock).not.toHaveBeenCalled();
+    expect(sendNotificationMock).toHaveBeenCalledWith({
+      title: "Hello",
+      body: "World",
+    });
+  });
+
+  it("passes extra metadata when provided", async () => {
+    const isPermissionGrantedMock = vi.mocked(notification.isPermissionGranted);
+    const sendNotificationMock = vi.mocked(notification.sendNotification);
+    isPermissionGrantedMock.mockResolvedValueOnce(true);
+
+    await sendNotification("Hello", "World", {
+      extra: { kind: "thread", workspaceId: "ws-1", threadId: "t-1" },
+    });
+
+    expect(sendNotificationMock).toHaveBeenCalledWith({
+      title: "Hello",
+      body: "World",
+      extra: { kind: "thread", workspaceId: "ws-1", threadId: "t-1" },
+    });
+  });
+
+  it("requests permission once when needed and sends on grant", async () => {
+    const isPermissionGrantedMock = vi.mocked(notification.isPermissionGranted);
+    const requestPermissionMock = vi.mocked(notification.requestPermission);
+    const sendNotificationMock = vi.mocked(notification.sendNotification);
+    isPermissionGrantedMock.mockResolvedValueOnce(false);
+    requestPermissionMock.mockResolvedValueOnce("granted");
+
+    await sendNotification("Grant", "Please");
+
+    expect(isPermissionGrantedMock).toHaveBeenCalledTimes(1);
+    expect(requestPermissionMock).toHaveBeenCalledTimes(1);
+    expect(sendNotificationMock).toHaveBeenCalledWith({
+      title: "Grant",
+      body: "Please",
+    });
+  });
+
+  it("does not send and warns when permission is denied", async () => {
+    const isPermissionGrantedMock = vi.mocked(notification.isPermissionGranted);
+    const requestPermissionMock = vi.mocked(notification.requestPermission);
+    const sendNotificationMock = vi.mocked(notification.sendNotification);
+    const invokeMock = vi.mocked(invoke);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    isPermissionGrantedMock.mockResolvedValueOnce(false);
+    requestPermissionMock.mockResolvedValueOnce("denied");
+
+    await sendNotification("Denied", "Nope");
+
+    expect(isPermissionGrantedMock).toHaveBeenCalledTimes(1);
+    expect(requestPermissionMock).toHaveBeenCalledTimes(1);
+    expect(sendNotificationMock).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      "Notification permission not granted.",
+      { permission: "denied" },
+    );
+    expect(invokeMock).toHaveBeenCalledWith("send_notification_fallback", {
+      title: "Denied",
+      body: "Nope",
+    });
+    warnSpy.mockRestore();
+  });
+
+  it("falls back when the notification plugin throws", async () => {
+    const isPermissionGrantedMock = vi.mocked(notification.isPermissionGranted);
+    const invokeMock = vi.mocked(invoke);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    isPermissionGrantedMock.mockRejectedValueOnce(new Error("boom"));
+
+    await sendNotification("Plugin", "Failed");
+
+    expect(invokeMock).toHaveBeenCalledWith("send_notification_fallback", {
+      title: "Plugin",
+      body: "Failed",
+    });
+    warnSpy.mockRestore();
+  });
+
+  it("prefers the fallback on macOS debug builds", async () => {
+    const isPermissionGrantedMock = vi.mocked(notification.isPermissionGranted);
+    const invokeMock = vi.mocked(invoke);
+
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "is_macos_debug_build") {
+        return true;
+      }
+      if (command === "send_notification_fallback") {
+        return undefined;
+      }
+      return undefined;
+    });
+
+    await sendNotification("Dev", "Fallback");
+
+    expect(invokeMock).toHaveBeenCalledWith("is_macos_debug_build");
+    expect(invokeMock).toHaveBeenCalledWith("send_notification_fallback", {
+      title: "Dev",
+      body: "Fallback",
+    });
+    expect(isPermissionGrantedMock).not.toHaveBeenCalled();
   });
 });

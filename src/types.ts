@@ -6,6 +6,32 @@ export type WorkspaceSettings = {
   codexHome?: string | null;
   codexArgs?: string | null;
   launchScript?: string | null;
+  launchScripts?: LaunchScriptEntry[] | null;
+  worktreeSetupScript?: string | null;
+};
+
+export type LaunchScriptIconId =
+  | "play"
+  | "build"
+  | "debug"
+  | "wrench"
+  | "terminal"
+  | "code"
+  | "server"
+  | "database"
+  | "package"
+  | "test"
+  | "lint"
+  | "dev"
+  | "git"
+  | "config"
+  | "logs";
+
+export type LaunchScriptEntry = {
+  id: string;
+  script: string;
+  icon: LaunchScriptIconId;
+  label?: string | null;
 };
 
 export type WorkspaceGroup = {
@@ -45,7 +71,13 @@ export type Message = {
 };
 
 export type ConversationItem =
-  | { id: string; kind: "message"; role: "user" | "assistant"; text: string }
+  | {
+      id: string;
+      kind: "message";
+      role: "user" | "assistant";
+      text: string;
+      images?: string[];
+    }
   | { id: string; kind: "reasoning"; summary: string; content: string }
   | { id: string; kind: "diff"; title: string; diff: string; status?: string }
   | { id: string; kind: "review"; state: "started" | "completed"; text: string }
@@ -73,6 +105,8 @@ export type ThreadSummary = {
   updatedAt: number;
 };
 
+export type ThreadListSortKey = "created_at" | "updated_at";
+
 export type ReviewTarget =
   | { type: "uncommittedChanges" }
   | { type: "baseBranch"; branch: string }
@@ -81,7 +115,9 @@ export type ReviewTarget =
 
 export type AccessMode = "read-only" | "current" | "full-access";
 export type BackendMode = "local" | "remote";
-export type ThemePreference = "system" | "light" | "dark";
+export type RemoteBackendProvider = "tcp" | "orbit";
+export type ThemePreference = "system" | "light" | "dark" | "dim";
+export type PersonalityPreference = "friendly" | "pragmatic";
 
 
 export type ComposerEditorPreset = "default" | "helpful" | "smart";
@@ -110,9 +146,19 @@ export type AppSettings = {
   codexBin: string | null;
   codexArgs: string | null;
   backendMode: BackendMode;
+  remoteBackendProvider: RemoteBackendProvider;
   remoteBackendHost: string;
   remoteBackendToken: string | null;
+  orbitWsUrl: string | null;
+  orbitAuthUrl: string | null;
+  orbitRunnerName: string | null;
+  orbitAutoStartRunner: boolean;
+  keepDaemonRunningAfterAppClose: boolean;
+  orbitUseAccess: boolean;
+  orbitAccessClientId: string | null;
+  orbitAccessClientSecretRef: string | null;
   defaultAccessMode: AccessMode;
+  reviewDeliveryMode: "inline" | "detached";
   composerModelShortcut: string | null;
   composerAccessShortcut: string | null;
   composerReasoningShortcut: string | null;
@@ -121,8 +167,10 @@ export type AppSettings = {
   newAgentShortcut: string | null;
   newWorktreeAgentShortcut: string | null;
   newCloneAgentShortcut: string | null;
+  archiveThreadShortcut: string | null;
   toggleProjectsSidebarShortcut: string | null;
   toggleGitSidebarShortcut: string | null;
+  branchSwitcherShortcut: string | null;
   toggleDebugPanelShortcut: string | null;
   toggleTerminalShortcut: string | null;
   cycleAgentNextShortcut: string | null;
@@ -133,14 +181,21 @@ export type AppSettings = {
   lastComposerReasoningEffort: string | null;
   uiScale: number;
   theme: ThemePreference;
+  usageShowRemaining: boolean;
+  showMessageFilePath: boolean;
   uiFontFamily: string;
   codeFontFamily: string;
   codeFontSize: number;
   notificationSoundsEnabled: boolean;
+  systemNotificationsEnabled: boolean;
+  preloadGitDiffs: boolean;
+  gitDiffIgnoreWhitespaceChanges: boolean;
   experimentalCollabEnabled: boolean;
-  experimentalCollaborationModesEnabled: boolean;
-  experimentalSteerEnabled: boolean;
-  experimentalUnifiedExecEnabled: boolean;
+  collaborationModesEnabled: boolean;
+  steerEnabled: boolean;
+  unifiedExecEnabled: boolean;
+  experimentalAppsEnabled: boolean;
+  personality: PersonalityPreference;
   dictationEnabled: boolean;
   dictationModelId: string;
   dictationPreferredLanguage: string | null;
@@ -159,6 +214,81 @@ export type AppSettings = {
   selectedOpenAppId: string;
 };
 
+export type OrbitConnectTestResult = {
+  ok: boolean;
+  latencyMs: number | null;
+  message: string;
+  details?: string | null;
+};
+
+export type OrbitDeviceCodeStart = {
+  deviceCode: string;
+  userCode: string | null;
+  verificationUri: string;
+  verificationUriComplete: string | null;
+  intervalSeconds: number;
+  expiresInSeconds: number;
+};
+
+export type OrbitSignInStatus =
+  | "pending"
+  | "authorized"
+  | "denied"
+  | "expired"
+  | "error";
+
+export type OrbitSignInPollResult = {
+  status: OrbitSignInStatus;
+  token: string | null;
+  message: string | null;
+  intervalSeconds: number | null;
+};
+
+export type OrbitSignOutResult = {
+  success: boolean;
+  message: string | null;
+};
+
+export type OrbitRunnerState = "stopped" | "running" | "error";
+
+export type OrbitRunnerStatus = {
+  state: OrbitRunnerState;
+  pid: number | null;
+  startedAtMs: number | null;
+  lastError: string | null;
+  orbitUrl: string | null;
+};
+
+export type TcpDaemonState = "stopped" | "running" | "error";
+
+export type TcpDaemonStatus = {
+  state: TcpDaemonState;
+  pid: number | null;
+  startedAtMs: number | null;
+  lastError: string | null;
+  listenAddr: string | null;
+};
+
+export type TailscaleStatus = {
+  installed: boolean;
+  running: boolean;
+  version: string | null;
+  dnsName: string | null;
+  hostName: string | null;
+  tailnetName: string | null;
+  ipv4: string[];
+  ipv6: string[];
+  suggestedRemoteHost: string | null;
+  message: string;
+};
+
+export type TailscaleDaemonCommandPreview = {
+  command: string;
+  daemonPath: string;
+  args: string[];
+  tokenConfigured: boolean;
+};
+
 export type CodexDoctorResult = {
   ok: boolean;
   codexBin: string | null;
@@ -169,6 +299,19 @@ export type CodexDoctorResult = {
   nodeOk: boolean;
   nodeVersion: string | null;
   nodeDetails: string | null;
+};
+
+export type CodexUpdateMethod = "brew_formula" | "brew_cask" | "npm" | "unknown";
+
+export type CodexUpdateResult = {
+  ok: boolean;
+  method: CodexUpdateMethod;
+  package: string | null;
+  beforeVersion: string | null;
+  afterVersion: string | null;
+  upgraded: boolean;
+  output: string | null;
+  details: string | null;
 };
 
 export type ApprovalRequest = {
@@ -187,6 +330,7 @@ export type RequestUserInputQuestion = {
   id: string;
   header: string;
   question: string;
+  isOther?: boolean;
   options?: RequestUserInputOption[];
 };
 
@@ -221,6 +365,8 @@ export type GitFileStatus = {
 export type GitFileDiff = {
   path: string;
   diff: string;
+  oldLines?: string[];
+  newLines?: string[];
   isBinary?: boolean;
   isImage?: boolean;
   oldImageData?: string | null;
@@ -233,6 +379,8 @@ export type GitCommitDiff = {
   path: string;
   status: string;
   diff: string;
+  oldLines?: string[];
+  newLines?: string[];
   isBinary?: boolean;
   isImage?: boolean;
   oldImageData?: string | null;
@@ -384,6 +532,13 @@ export type RateLimitSnapshot = {
   planType: string | null;
 };
 
+export type AccountSnapshot = {
+  type: "chatgpt" | "apikey" | "unknown";
+  email: string | null;
+  planType: string | null;
+  requiresOpenaiAuth: boolean | null;
+};
+
 export type QueuedMessage = {
   id: string;
   text: string;
@@ -415,6 +570,15 @@ export type SkillOption = {
   name: string;
   path: string;
   description?: string;
+};
+
+export type AppOption = {
+  id: string;
+  name: string;
+  description?: string;
+  isAccessible: boolean;
+  installUrl?: string | null;
+  distributionChannel?: string | null;
 };
 
 export type CustomPromptOption = {

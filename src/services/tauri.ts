@@ -1,11 +1,21 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import type { Options as NotificationOptions } from "@tauri-apps/plugin-notification";
 import type {
   AppSettings,
+  CodexUpdateResult,
   CodexDoctorResult,
   DictationModelStatus,
   DictationSessionState,
   LocalUsageSnapshot,
+  OrbitConnectTestResult,
+  OrbitDeviceCodeStart,
+  OrbitRunnerStatus,
+  OrbitSignInPollResult,
+  OrbitSignOutResult,
+  TcpDaemonStatus,
+  TailscaleDaemonCommandPreview,
+  TailscaleStatus,
   WorkspaceInfo,
   WorkspaceSettings,
 } from "../types";
@@ -20,6 +30,14 @@ import type {
   GitLogResponse,
   ReviewTarget,
 } from "../types";
+
+function isMissingTauriInvokeError(error: unknown) {
+  return (
+    error instanceof TypeError &&
+    (error.message.includes("reading 'invoke'") ||
+      error.message.includes("reading \"invoke\""))
+  );
+}
 
 export async function pickWorkspacePath(): Promise<string | null> {
   const selection = await open({ directory: true, multiple: false });
@@ -46,11 +64,67 @@ export async function pickImageFiles(): Promise<string[]> {
 }
 
 export async function listWorkspaces(): Promise<WorkspaceInfo[]> {
-  return invoke<WorkspaceInfo[]>("list_workspaces");
+  try {
+    return await invoke<WorkspaceInfo[]>("list_workspaces");
+  } catch (error) {
+    if (isMissingTauriInvokeError(error)) {
+      // In non-Tauri environments (e.g., Electron/web previews), the invoke
+      // bridge may be missing. Treat this as "no workspaces" instead of crashing.
+      console.warn("Tauri invoke bridge unavailable; returning empty workspaces list.");
+      return [];
+    }
+    throw error;
+  }
 }
 
 export async function getCodexConfigPath(): Promise<string> {
   return invoke<string>("get_codex_config_path");
+}
+
+export type TextFileResponse = {
+  exists: boolean;
+  content: string;
+  truncated: boolean;
+};
+
+export type GlobalAgentsResponse = TextFileResponse;
+export type GlobalCodexConfigResponse = TextFileResponse;
+export type AgentMdResponse = TextFileResponse;
+
+type FileScope = "workspace" | "global";
+type FileKind = "agents" | "config";
+
+async function fileRead(
+  scope: FileScope,
+  kind: FileKind,
+  workspaceId?: string,
+): Promise<TextFileResponse> {
+  return invoke<TextFileResponse>("file_read", { scope, kind, workspaceId });
+}
+
+async function fileWrite(
+  scope: FileScope,
+  kind: FileKind,
+  content: string,
+  workspaceId?: string,
+): Promise<void> {
+  return invoke("file_write", { scope, kind, workspaceId, content });
+}
+
+export async function readGlobalAgentsMd(): Promise<GlobalAgentsResponse> {
+  return fileRead("global", "agents");
+}
+
+export async function writeGlobalAgentsMd(content: string): Promise<void> {
+  return fileWrite("global", "agents", content);
+}
+
+export async function readGlobalCodexConfigToml(): Promise<GlobalCodexConfigResponse> {
+  return fileRead("global", "config");
+}
+
+export async function writeGlobalCodexConfigToml(content: string): Promise<void> {
+  return fileWrite("global", "config", content);
 }
 
 export async function getConfigModel(workspaceId: string): Promise<string | null> {
@@ -91,8 +165,25 @@ export async function addClone(
 export async function addWorktree(
   parentId: string,
   branch: string,
+  name: string | null,
+  copyAgentsMd = true,
 ): Promise<WorkspaceInfo> {
-  return invoke<WorkspaceInfo>("add_worktree", { parentId, branch });
+  return invoke<WorkspaceInfo>("add_worktree", { parentId, branch, name, copyAgentsMd });
+}
+
+export type WorktreeSetupStatus = {
+  shouldRun: boolean;
+  script: string | null;
+};
+
+export async function getWorktreeSetupStatus(
+  workspaceId: string,
+): Promise<WorktreeSetupStatus> {
+  return invoke<WorktreeSetupStatus>("worktree_setup_status", { workspaceId });
+}
+
+export async function markWorktreeSetupRan(workspaceId: string): Promise<void> {
+  return invoke("worktree_setup_mark_ran", { workspaceId });
 }
 
 export async function updateWorkspaceSettings(
@@ -164,6 +255,14 @@ export async function startThread(workspaceId: string) {
   return invoke<any>("start_thread", { workspaceId });
 }
 
+export async function forkThread(workspaceId: string, threadId: string) {
+  return invoke<any>("fork_thread", { workspaceId, threadId });
+}
+
+export async function compactThread(workspaceId: string, threadId: string) {
+  return invoke<any>("compact_thread", { workspaceId, threadId });
+}
+
 export async function sendUserMessage(
   workspaceId: string,
   threadId: string,
@@ -197,6 +296,22 @@ export async function interruptTurn(
   turnId: string,
 ) {
   return invoke("turn_interrupt", { workspaceId, threadId, turnId });
+}
+
+export async function steerTurn(
+  workspaceId: string,
+  threadId: string,
+  turnId: string,
+  text: string,
+  images?: string[],
+) {
+  return invoke("turn_steer", {
+    workspaceId,
+    threadId,
+    turnId,
+    text,
+    images: images ?? null,
+  });
 }
 
 export async function startReview(
@@ -320,6 +435,10 @@ export async function pullGit(workspaceId: string): Promise<void> {
   return invoke("pull_git", { workspaceId });
 }
 
+export async function fetchGit(workspaceId: string): Promise<void> {
+  return invoke("fetch_git", { workspaceId });
+}
+
 export async function syncGit(workspaceId: string): Promise<void> {
   return invoke("sync_git", { workspaceId });
 }
@@ -386,8 +505,33 @@ export async function getAccountRateLimits(workspaceId: string) {
   return invoke<any>("account_rate_limits", { workspaceId });
 }
 
+export async function getAccountInfo(workspaceId: string) {
+  return invoke<any>("account_read", { workspaceId });
+}
+
+export async function runCodexLogin(workspaceId: string) {
+  return invoke<{ loginId: string; authUrl: string; raw?: unknown }>("codex_login", {
+    workspaceId,
+  });
+}
+
+export async function cancelCodexLogin(workspaceId: string) {
+  return invoke<{ canceled: boolean; status?: string; raw?: unknown }>(
+    "codex_login_cancel",
+    { workspaceId },
+  );
+}
+
 export async function getSkillsList(workspaceId: string) {
   return invoke<any>("skills_list", { workspaceId });
+}
+
+export async function getAppsList(
+  workspaceId: string,
+  cursor?: string | null,
+  limit?: number | null,
+) {
+  return invoke<any>("apps_list", { workspaceId, cursor, limit });
 }
 
 export async function getPromptsList(workspaceId: string) {
@@ -461,8 +605,60 @@ export async function getAppSettings(): Promise<AppSettings> {
   return invoke<AppSettings>("get_app_settings");
 }
 
+export async function isMobileRuntime(): Promise<boolean> {
+  return invoke<boolean>("is_mobile_runtime");
+}
+
 export async function updateAppSettings(settings: AppSettings): Promise<AppSettings> {
   return invoke<AppSettings>("update_app_settings", { settings });
+}
+
+export async function orbitConnectTest(): Promise<OrbitConnectTestResult> {
+  return invoke<OrbitConnectTestResult>("orbit_connect_test");
+}
+
+export async function orbitSignInStart(): Promise<OrbitDeviceCodeStart> {
+  return invoke<OrbitDeviceCodeStart>("orbit_sign_in_start");
+}
+
+export async function orbitSignInPoll(deviceCode: string): Promise<OrbitSignInPollResult> {
+  return invoke<OrbitSignInPollResult>("orbit_sign_in_poll", { deviceCode });
+}
+
+export async function orbitSignOut(): Promise<OrbitSignOutResult> {
+  return invoke<OrbitSignOutResult>("orbit_sign_out");
+}
+
+export async function orbitRunnerStart(): Promise<OrbitRunnerStatus> {
+  return invoke<OrbitRunnerStatus>("orbit_runner_start");
+}
+
+export async function orbitRunnerStop(): Promise<OrbitRunnerStatus> {
+  return invoke<OrbitRunnerStatus>("orbit_runner_stop");
+}
+
+export async function orbitRunnerStatus(): Promise<OrbitRunnerStatus> {
+  return invoke<OrbitRunnerStatus>("orbit_runner_status");
+}
+
+export async function tailscaleStatus(): Promise<TailscaleStatus> {
+  return invoke<TailscaleStatus>("tailscale_status");
+}
+
+export async function tailscaleDaemonCommandPreview(): Promise<TailscaleDaemonCommandPreview> {
+  return invoke<TailscaleDaemonCommandPreview>("tailscale_daemon_command_preview");
+}
+
+export async function tailscaleDaemonStart(): Promise<TcpDaemonStatus> {
+  return invoke<TcpDaemonStatus>("tailscale_daemon_start");
+}
+
+export async function tailscaleDaemonStop(): Promise<TcpDaemonStatus> {
+  return invoke<TcpDaemonStatus>("tailscale_daemon_stop");
+}
+
+export async function tailscaleDaemonStatus(): Promise<TcpDaemonStatus> {
+  return invoke<TcpDaemonStatus>("tailscale_daemon_status");
 }
 
 type MenuAcceleratorUpdate = {
@@ -483,6 +679,13 @@ export async function runCodexDoctor(
   return invoke<CodexDoctorResult>("codex_doctor", { codexBin, codexArgs });
 }
 
+export async function runCodexUpdate(
+  codexBin: string | null,
+  codexArgs: string | null,
+): Promise<CodexUpdateResult> {
+  return invoke<CodexUpdateResult>("codex_update", { codexBin, codexArgs });
+}
+
 export async function getWorkspaceFiles(workspaceId: string) {
   return invoke<string[]>("list_workspace_files", { workspaceId });
 }
@@ -495,6 +698,14 @@ export async function readWorkspaceFile(
     workspaceId,
     path,
   });
+}
+
+export async function readAgentMd(workspaceId: string): Promise<AgentMdResponse> {
+  return fileRead("workspace", "agents", workspaceId);
+}
+
+export async function writeAgentMd(workspaceId: string, content: string): Promise<void> {
+  return fileWrite("workspace", "agents", content, workspaceId);
 }
 
 export async function listGitBranches(workspaceId: string) {
@@ -604,8 +815,17 @@ export async function listThreads(
   workspaceId: string,
   cursor?: string | null,
   limit?: number | null,
+  sortKey?: "created_at" | "updated_at" | null,
 ) {
-  return invoke<any>("list_threads", { workspaceId, cursor, limit });
+  return invoke<any>("list_threads", { workspaceId, cursor, limit, sortKey });
+}
+
+export async function listMcpServerStatus(
+  workspaceId: string,
+  cursor?: string | null,
+  limit?: number | null,
+) {
+  return invoke<any>("list_mcp_server_status", { workspaceId, cursor, limit });
 }
 
 export async function resumeThread(workspaceId: string, threadId: string) {
@@ -614,6 +834,14 @@ export async function resumeThread(workspaceId: string, threadId: string) {
 
 export async function archiveThread(workspaceId: string, threadId: string) {
   return invoke<any>("archive_thread", { workspaceId, threadId });
+}
+
+export async function setThreadName(
+  workspaceId: string,
+  threadId: string,
+  name: string,
+) {
+  return invoke<any>("set_thread_name", { workspaceId, threadId, name });
 }
 
 export async function getCommitMessagePrompt(
@@ -626,4 +854,78 @@ export async function generateCommitMessage(
   workspaceId: string,
 ): Promise<string> {
   return invoke("generate_commit_message", { workspaceId });
+}
+
+export async function sendNotification(
+  title: string,
+  body: string,
+  options?: {
+    id?: number;
+    group?: string;
+    actionTypeId?: string;
+    sound?: string;
+    autoCancel?: boolean;
+    extra?: Record<string, unknown>;
+  },
+): Promise<void> {
+  const macosDebugBuild = await invoke<boolean>("is_macos_debug_build").catch(
+    () => false,
+  );
+  const attemptFallback = async () => {
+    try {
+      await invoke("send_notification_fallback", { title, body });
+      return true;
+    } catch (error) {
+      console.warn("Notification fallback failed.", { error });
+      return false;
+    }
+  };
+
+  // In dev builds on macOS, the notification plugin can silently fail because
+  // the process is not a bundled app. Prefer the native AppleScript fallback.
+  if (macosDebugBuild) {
+    await attemptFallback();
+    return;
+  }
+
+  try {
+    const notification = await import("@tauri-apps/plugin-notification");
+    let permissionGranted = await notification.isPermissionGranted();
+    if (!permissionGranted) {
+      const permission = await notification.requestPermission();
+      permissionGranted = permission === "granted";
+      if (!permissionGranted) {
+        console.warn("Notification permission not granted.", { permission });
+        await attemptFallback();
+        return;
+      }
+    }
+    if (permissionGranted) {
+      const payload: NotificationOptions = { title, body };
+      if (options?.id !== undefined) {
+        payload.id = options.id;
+      }
+      if (options?.group !== undefined) {
+        payload.group = options.group;
+      }
+      if (options?.actionTypeId !== undefined) {
+        payload.actionTypeId = options.actionTypeId;
+      }
+      if (options?.sound !== undefined) {
+        payload.sound = options.sound;
+      }
+      if (options?.autoCancel !== undefined) {
+        payload.autoCancel = options.autoCancel;
+      }
+      if (options?.extra !== undefined) {
+        payload.extra = options.extra;
+      }
+      await notification.sendNotification(payload);
+      return;
+    }
+  } catch (error) {
+    console.warn("Notification plugin failed.", { error });
+  }
+
+  await attemptFallback();
 }

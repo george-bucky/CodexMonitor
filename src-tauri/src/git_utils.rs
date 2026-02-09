@@ -38,10 +38,12 @@ pub(crate) fn commit_to_entry(commit: git2::Commit) -> GitLogEntry {
 
 pub(crate) fn checkout_branch(repo: &Repository, name: &str) -> Result<(), git2::Error> {
     let refname = format!("refs/heads/{name}");
-    repo.set_head(&refname)?;
+    let target = repo.revparse_single(&refname)?;
+
     let mut options = git2::build::CheckoutBuilder::new();
     options.safe();
-    repo.checkout_head(Some(&mut options))?;
+    repo.checkout_tree(&target, Some(&mut options))?;
+    repo.set_head(&refname)?;
     Ok(())
 }
 
@@ -90,7 +92,10 @@ pub(crate) fn diff_patch_to_string(patch: &mut git2::Patch) -> Result<String, gi
 
 #[cfg(test)]
 mod tests {
-    use super::image_mime_type;
+    use super::{checkout_branch, image_mime_type};
+    use git2::Repository;
+    use std::fs;
+    use std::path::Path;
 
     #[test]
     fn image_mime_type_detects_known_extensions() {
@@ -101,6 +106,34 @@ mod tests {
         assert_eq!(image_mime_type("readme.txt"), None);
     }
 
+    #[test]
+    fn checkout_branch_missing_does_not_change_head() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-monitor-git-utils-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create temp repo root");
+        let repo = Repository::init(&root).expect("init repo");
+
+        fs::write(root.join("base.txt"), "base\n").expect("write file");
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new("base.txt")).expect("add path");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let sig = git2::Signature::now("Test", "test@example.com").expect("signature");
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .expect("commit");
+
+        let before = repo.head().expect("head").name().unwrap_or("").to_string();
+        assert!(checkout_branch(&repo, "does-not-exist").is_err());
+        let after = repo
+            .head()
+            .expect("head after")
+            .name()
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(after, before);
+    }
 }
 
 pub(crate) fn parse_github_repo(remote_url: &str) -> Option<String> {
@@ -111,13 +144,18 @@ pub(crate) fn parse_github_repo(remote_url: &str) -> Option<String> {
     let mut path = if trimmed.starts_with("git@github.com:") {
         trimmed.trim_start_matches("git@github.com:").to_string()
     } else if trimmed.starts_with("ssh://git@github.com/") {
-        trimmed.trim_start_matches("ssh://git@github.com/").to_string()
+        trimmed
+            .trim_start_matches("ssh://git@github.com/")
+            .to_string()
     } else if let Some(index) = trimmed.find("github.com/") {
         trimmed[index + "github.com/".len()..].to_string()
     } else {
         return None;
     };
-    path = path.trim_end_matches(".git").trim_end_matches('/').to_string();
+    path = path
+        .trim_end_matches(".git")
+        .trim_end_matches('/')
+        .to_string();
     if path.is_empty() {
         None
     } else {
@@ -155,11 +193,7 @@ fn should_skip_dir(name: &str) -> bool {
     )
 }
 
-pub(crate) fn list_git_roots(
-    root: &Path,
-    max_depth: usize,
-    max_results: usize,
-) -> Vec<String> {
+pub(crate) fn list_git_roots(root: &Path, max_depth: usize, max_results: usize) -> Vec<String> {
     if !root.is_dir() {
         return Vec::new();
     }

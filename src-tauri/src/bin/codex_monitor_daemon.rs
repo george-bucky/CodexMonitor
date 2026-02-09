@@ -1,22 +1,67 @@
 #[allow(dead_code)]
 #[path = "../backend/mod.rs"]
 mod backend;
-#[path = "../codex_args.rs"]
+#[path = "../codex/args.rs"]
 mod codex_args;
-#[path = "../codex_home.rs"]
-mod codex_home;
-#[path = "../codex_config.rs"]
+#[path = "../codex/config.rs"]
 mod codex_config;
+#[path = "../codex/home.rs"]
+mod codex_home;
+#[path = "../files/io.rs"]
+mod file_io;
+#[path = "../files/ops.rs"]
+mod file_ops;
+#[path = "../files/policy.rs"]
+mod file_policy;
+#[path = "../git_utils.rs"]
+mod git_utils;
+#[path = "codex_monitor_daemon/rpc.rs"]
+mod rpc;
 #[path = "../rules.rs"]
 mod rules;
+#[path = "../shared/mod.rs"]
+mod shared;
 #[path = "../storage.rs"]
 mod storage;
+#[path = "codex_monitor_daemon/transport.rs"]
+mod transport;
 #[allow(dead_code)]
 #[path = "../types.rs"]
 mod types;
+#[path = "../utils.rs"]
+mod utils;
+#[path = "../workspaces/macos.rs"]
+mod workspace_macos;
+#[path = "../workspaces/settings.rs"]
+mod workspace_settings;
+
+// Provide feature-style module paths for shared cores when compiled in the daemon.
+mod codex {
+    pub(crate) mod args {
+        pub(crate) use crate::codex_args::*;
+    }
+    pub(crate) mod config {
+        pub(crate) use crate::codex_config::*;
+    }
+    pub(crate) mod home {
+        pub(crate) use crate::codex_home::*;
+    }
+}
+
+mod files {
+    pub(crate) mod io {
+        pub(crate) use crate::file_io::*;
+    }
+    pub(crate) mod ops {
+        pub(crate) use crate::file_ops::*;
+    }
+    pub(crate) mod policy {
+        pub(crate) use crate::file_policy::*;
+    }
+}
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
@@ -24,22 +69,55 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
 use ignore::WalkBuilder;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::Command;
-use tokio::sync::{broadcast, mpsc, Mutex};
-use uuid::Uuid;
+use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
+use tokio::time::sleep;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
 
 use backend::app_server::{spawn_workspace_session, WorkspaceSession};
-use backend::events::{AppServerEvent, EventSink, TerminalOutput};
-use storage::{read_settings, read_workspaces, write_settings, write_workspaces};
-use types::{
-    AppSettings, WorkspaceEntry, WorkspaceInfo, WorkspaceKind, WorkspaceSettings, WorktreeInfo,
+use backend::events::{AppServerEvent, EventSink, TerminalExit, TerminalOutput};
+use shared::codex_core::CodexLoginCancelState;
+use shared::prompts_core::{self, CustomPromptEntry};
+use shared::{
+    codex_aux_core, codex_core, files_core, git_core, git_ui_core, local_usage_core, settings_core,
+    workspaces_core, worktree_core,
 };
+use storage::{read_settings, read_workspaces};
+use types::{
+    AppSettings, GitCommitDiff, GitFileDiff, GitHubIssuesResponse, GitHubPullRequestComment,
+    GitHubPullRequestDiff, GitHubPullRequestsResponse, GitLogResponse, LocalUsageSnapshot,
+    OrbitConnectTestResult, OrbitDeviceCodeStart, OrbitSignInPollResult, OrbitSignInStatus,
+    OrbitSignOutResult, WorkspaceEntry, WorkspaceInfo, WorkspaceSettings, WorktreeSetupStatus,
+};
+use workspace_settings::apply_workspace_settings_update;
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:4732";
+const MAX_IN_FLIGHT_RPC_PER_CONNECTION: usize = 32;
+const DAEMON_NAME: &str = "codex-monitor-daemon";
+
+fn spawn_with_client(
+    event_sink: DaemonEventSink,
+    client_version: String,
+    entry: WorkspaceEntry,
+    default_bin: Option<String>,
+    codex_args: Option<String>,
+    codex_home: Option<PathBuf>,
+) -> impl std::future::Future<Output = Result<Arc<WorkspaceSession>, String>> {
+    spawn_workspace_session(
+        entry,
+        default_bin,
+        codex_args,
+        codex_home,
+        client_version,
+        event_sink,
+    )
+}
 
 #[derive(Clone)]
 struct DaemonEventSink {
@@ -51,6 +129,8 @@ enum DaemonEvent {
     AppServer(AppServerEvent),
     #[allow(dead_code)]
     TerminalOutput(TerminalOutput),
+    #[allow(dead_code)]
+    TerminalExit(TerminalExit),
 }
 
 impl EventSink for DaemonEventSink {
@@ -61,12 +141,20 @@ impl EventSink for DaemonEventSink {
     fn emit_terminal_output(&self, event: TerminalOutput) {
         let _ = self.tx.send(DaemonEvent::TerminalOutput(event));
     }
+
+    fn emit_terminal_exit(&self, event: TerminalExit) {
+        let _ = self.tx.send(DaemonEvent::TerminalExit(event));
+    }
 }
 
 struct DaemonConfig {
     listen: SocketAddr,
     token: Option<String>,
     data_dir: PathBuf,
+    orbit_url: Option<String>,
+    orbit_token: Option<String>,
+    orbit_auth_url: Option<String>,
+    orbit_runner_name: Option<String>,
 }
 
 struct DaemonState {
@@ -77,6 +165,9 @@ struct DaemonState {
     settings_path: PathBuf,
     app_settings: Mutex<AppSettings>,
     event_sink: DaemonEventSink,
+    codex_login_cancels: Mutex<HashMap<String, CodexLoginCancelState>>,
+    daemon_mode: String,
+    daemon_binary_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -91,6 +182,14 @@ impl DaemonState {
         let settings_path = config.data_dir.join("settings.json");
         let workspaces = read_workspaces(&storage_path).unwrap_or_default();
         let app_settings = read_settings(&settings_path).unwrap_or_default();
+        let daemon_mode = if config.orbit_url.is_some() {
+            "orbit".to_string()
+        } else {
+            "tcp".to_string()
+        };
+        let daemon_binary_path = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.to_str().map(str::to_string));
         Self {
             data_dir: config.data_dir.clone(),
             workspaces: Mutex::new(workspaces),
@@ -99,46 +198,28 @@ impl DaemonState {
             settings_path,
             app_settings: Mutex::new(app_settings),
             event_sink,
+            codex_login_cancels: Mutex::new(HashMap::new()),
+            daemon_mode,
+            daemon_binary_path,
         }
     }
 
-    async fn kill_session(&self, workspace_id: &str) {
-        let session = {
-            let mut sessions = self.sessions.lock().await;
-            sessions.remove(workspace_id)
-        };
-
-        let Some(session) = session else {
-            return;
-        };
-
-        let mut child = session.child.lock().await;
-        let _ = child.kill().await;
+    fn daemon_info(&self) -> Value {
+        json!({
+            "name": DAEMON_NAME,
+            "version": env!("CARGO_PKG_VERSION"),
+            "pid": std::process::id(),
+            "mode": self.daemon_mode,
+            "binaryPath": self.daemon_binary_path,
+        })
     }
 
     async fn list_workspaces(&self) -> Vec<WorkspaceInfo> {
-        let workspaces = self.workspaces.lock().await;
-        let sessions = self.sessions.lock().await;
-        let mut result = Vec::new();
-        for entry in workspaces.values() {
-            result.push(WorkspaceInfo {
-                id: entry.id.clone(),
-                name: entry.name.clone(),
-                path: entry.path.clone(),
-                connected: sessions.contains_key(&entry.id),
-                codex_bin: entry.codex_bin.clone(),
-                kind: entry.kind.clone(),
-                parent_id: entry.parent_id.clone(),
-                worktree: entry.worktree.clone(),
-                settings: entry.settings.clone(),
-            });
-        }
-        sort_workspaces(&mut result);
-        result
+        workspaces_core::list_workspaces_core(&self.workspaces, &self.sessions).await
     }
 
     async fn is_workspace_path_dir(&self, path: String) -> bool {
-        PathBuf::from(&path).is_dir()
+        workspaces_core::is_workspace_path_dir_core(&path)
     }
 
     async fn add_workspace(
@@ -147,304 +228,129 @@ impl DaemonState {
         codex_bin: Option<String>,
         client_version: String,
     ) -> Result<WorkspaceInfo, String> {
-        if !PathBuf::from(&path).is_dir() {
-            return Err("Workspace path must be a folder.".to_string());
-        }
-
-        let name = PathBuf::from(&path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("Workspace")
-            .to_string();
-
-        let entry = WorkspaceEntry {
-            id: Uuid::new_v4().to_string(),
-            name: name.clone(),
-            path: path.clone(),
+        let client_version = client_version.clone();
+        workspaces_core::add_workspace_core(
+            path,
             codex_bin,
-            kind: WorkspaceKind::Main,
-            parent_id: None,
-            worktree: None,
-            settings: WorkspaceSettings::default(),
-        };
-
-        let (default_bin, codex_args) = {
-            let settings = self.app_settings.lock().await;
-            (
-                settings.codex_bin.clone(),
-                codex_args::resolve_workspace_codex_args(&entry, None, Some(&settings)),
-            )
-        };
-
-        let codex_home = codex_home::resolve_workspace_codex_home(&entry, None);
-        let session = spawn_workspace_session(
-            entry.clone(),
-            default_bin,
-            codex_args,
-            codex_home,
-            client_version,
-            self.event_sink.clone(),
+            &self.workspaces,
+            &self.sessions,
+            &self.app_settings,
+            &self.storage_path,
+            move |entry, default_bin, codex_args, codex_home| {
+                spawn_with_client(
+                    self.event_sink.clone(),
+                    client_version.clone(),
+                    entry,
+                    default_bin,
+                    codex_args,
+                    codex_home,
+                )
+            },
         )
-        .await?;
-
-        let list = {
-            let mut workspaces = self.workspaces.lock().await;
-            workspaces.insert(entry.id.clone(), entry.clone());
-            workspaces.values().cloned().collect::<Vec<_>>()
-        };
-        write_workspaces(&self.storage_path, &list)?;
-
-        self.sessions.lock().await.insert(entry.id.clone(), session);
-
-        Ok(WorkspaceInfo {
-            id: entry.id,
-            name: entry.name,
-            path: entry.path,
-            connected: true,
-            codex_bin: entry.codex_bin,
-            kind: entry.kind,
-            parent_id: entry.parent_id,
-            worktree: entry.worktree,
-            settings: entry.settings,
-        })
+        .await
     }
 
     async fn add_worktree(
         &self,
         parent_id: String,
         branch: String,
+        name: Option<String>,
+        copy_agents_md: bool,
         client_version: String,
     ) -> Result<WorkspaceInfo, String> {
-        let branch = branch.trim().to_string();
-        if branch.trim().is_empty() {
-            return Err("Branch name is required.".to_string());
-        }
-
-        let parent_entry = {
-            let workspaces = self.workspaces.lock().await;
-            workspaces
-                .get(&parent_id)
-                .cloned()
-                .ok_or("parent workspace not found")?
-        };
-
-        if parent_entry.kind.is_worktree() {
-            return Err("Cannot create a worktree from another worktree.".to_string());
-        }
-
-        let worktree_root = self.data_dir.join("worktrees").join(&parent_entry.id);
-        std::fs::create_dir_all(&worktree_root)
-            .map_err(|e| format!("Failed to create worktree directory: {e}"))?;
-
-        let safe_name = sanitize_worktree_name(&branch);
-        let worktree_path = unique_worktree_path(&worktree_root, &safe_name)?;
-        let worktree_path_string = worktree_path.to_string_lossy().to_string();
-
-        let repo_path = PathBuf::from(&parent_entry.path);
-        let branch_exists = git_branch_exists(&repo_path, &branch).await?;
-        if branch_exists {
-            run_git_command(
-                &repo_path,
-                &["worktree", "add", &worktree_path_string, &branch],
-            )
-            .await?;
-        } else if let Some(remote_ref) = git_find_remote_tracking_branch(&repo_path, &branch).await? {
-            run_git_command(
-                &repo_path,
-                &["worktree", "add", "-b", &branch, &worktree_path_string, &remote_ref],
-            )
-            .await?;
-        } else {
-            run_git_command(
-                &repo_path,
-                &["worktree", "add", "-b", &branch, &worktree_path_string],
-            )
-            .await?;
-        }
-
-        let entry = WorkspaceEntry {
-            id: Uuid::new_v4().to_string(),
-            name: branch.to_string(),
-            path: worktree_path_string,
-            codex_bin: parent_entry.codex_bin.clone(),
-            kind: WorkspaceKind::Worktree,
-            parent_id: Some(parent_entry.id.clone()),
-            worktree: Some(WorktreeInfo {
-                branch: branch.to_string(),
+        let client_version = client_version.clone();
+        workspaces_core::add_worktree_core(
+            parent_id,
+            branch,
+            name,
+            copy_agents_md,
+            &self.data_dir,
+            &self.workspaces,
+            &self.sessions,
+            &self.app_settings,
+            &self.storage_path,
+            |value| worktree_core::sanitize_worktree_name(value),
+            |root, name| worktree_core::unique_worktree_path_strict(root, name),
+            |root, branch_name| {
+                let root = root.clone();
+                let branch_name = branch_name.to_string();
+                async move { git_core::git_branch_exists(&root, &branch_name).await }
+            },
+            Some(|root: &PathBuf, branch_name: &str| {
+                let root = root.clone();
+                let branch_name = branch_name.to_string();
+                async move { git_core::git_find_remote_tracking_branch_local(&root, &branch_name).await }
             }),
-            settings: WorkspaceSettings::default(),
-        };
-
-        let (default_bin, codex_args) = {
-            let settings = self.app_settings.lock().await;
-            (
-                settings.codex_bin.clone(),
-                codex_args::resolve_workspace_codex_args(
-                    &entry,
-                    Some(&parent_entry),
-                    Some(&settings),
-                ),
-            )
-        };
-
-        let codex_home = codex_home::resolve_workspace_codex_home(&entry, Some(&parent_entry));
-        let session = spawn_workspace_session(
-            entry.clone(),
-            default_bin,
-            codex_args,
-            codex_home,
-            client_version,
-            self.event_sink.clone(),
+            |root, args| {
+                workspaces_core::run_git_command_unit(root, args, git_core::run_git_command_owned)
+            },
+            move |entry, default_bin, codex_args, codex_home| {
+                spawn_with_client(
+                    self.event_sink.clone(),
+                    client_version.clone(),
+                    entry,
+                    default_bin,
+                    codex_args,
+                    codex_home,
+                )
+            },
         )
-        .await?;
+        .await
+    }
 
-        let list = {
-            let mut workspaces = self.workspaces.lock().await;
-            workspaces.insert(entry.id.clone(), entry.clone());
-            workspaces.values().cloned().collect::<Vec<_>>()
-        };
-        write_workspaces(&self.storage_path, &list)?;
+    async fn worktree_setup_status(
+        &self,
+        workspace_id: String,
+    ) -> Result<WorktreeSetupStatus, String> {
+        workspaces_core::worktree_setup_status_core(&self.workspaces, &workspace_id, &self.data_dir)
+            .await
+    }
 
-        self.sessions.lock().await.insert(entry.id.clone(), session);
-
-        Ok(WorkspaceInfo {
-            id: entry.id,
-            name: entry.name,
-            path: entry.path,
-            connected: true,
-            codex_bin: entry.codex_bin,
-            kind: entry.kind,
-            parent_id: entry.parent_id,
-            worktree: entry.worktree,
-            settings: entry.settings,
-        })
+    async fn worktree_setup_mark_ran(&self, workspace_id: String) -> Result<(), String> {
+        workspaces_core::worktree_setup_mark_ran_core(
+            &self.workspaces,
+            &workspace_id,
+            &self.data_dir,
+        )
+        .await
     }
 
     async fn remove_workspace(&self, id: String) -> Result<(), String> {
-        let (entry, child_worktrees) = {
-            let workspaces = self.workspaces.lock().await;
-            let entry = workspaces.get(&id).cloned().ok_or("workspace not found")?;
-            if entry.kind.is_worktree() {
-                return Err("Use remove_worktree for worktree agents.".to_string());
-            }
-            let children = workspaces
-                .values()
-                .filter(|workspace| workspace.parent_id.as_deref() == Some(&id))
-                .cloned()
-                .collect::<Vec<_>>();
-            (entry, children)
-        };
-
-        let repo_path = PathBuf::from(&entry.path);
-        let mut removed_child_ids = Vec::new();
-        let mut failures = Vec::new();
-
-        for child in &child_worktrees {
-            let child_path = PathBuf::from(&child.path);
-            if child_path.exists() {
-                if let Err(err) = run_git_command(
-                    &repo_path,
-                    &["worktree", "remove", "--force", &child.path],
-                )
-                .await
-                {
-                    if is_missing_worktree_error(&err) {
-                        if let Err(fs_err) = std::fs::remove_dir_all(&child_path) {
-                            failures.push((
-                                child.id.clone(),
-                                format!("Failed to remove worktree folder: {fs_err}"),
-                            ));
-                            continue;
-                        }
-                    } else {
-                        failures.push((child.id.clone(), err));
-                        continue;
-                    }
-                }
-            }
-
-            self.kill_session(&child.id).await;
-            removed_child_ids.push(child.id.clone());
-        }
-
-        let _ = run_git_command(&repo_path, &["worktree", "prune", "--expire", "now"]).await;
-
-        let mut ids_to_remove = removed_child_ids;
-        if failures.is_empty() {
-            self.kill_session(&id).await;
-            ids_to_remove.push(id.clone());
-        }
-
-        if !ids_to_remove.is_empty() {
-            let list = {
-                let mut workspaces = self.workspaces.lock().await;
-                for workspace_id in ids_to_remove {
-                    workspaces.remove(&workspace_id);
-                }
-                workspaces.values().cloned().collect::<Vec<_>>()
-            };
-            write_workspaces(&self.storage_path, &list)?;
-        }
-
-        if failures.is_empty() {
-            return Ok(());
-        }
-
-        let mut message =
-            "Failed to remove one or more worktrees; parent workspace was not removed.".to_string();
-        for (child_id, error) in failures {
-            message.push_str(&format!("\n- {child_id}: {error}"));
-        }
-        Err(message)
+        workspaces_core::remove_workspace_core(
+            id,
+            &self.workspaces,
+            &self.sessions,
+            &self.storage_path,
+            |root, args| {
+                workspaces_core::run_git_command_unit(root, args, git_core::run_git_command_owned)
+            },
+            |error| git_core::is_missing_worktree_error(error),
+            |path| {
+                std::fs::remove_dir_all(path)
+                    .map_err(|err| format!("Failed to remove worktree folder: {err}"))
+            },
+            true,
+            true,
+        )
+        .await
     }
 
     async fn remove_worktree(&self, id: String) -> Result<(), String> {
-        let (entry, parent) = {
-            let workspaces = self.workspaces.lock().await;
-            let entry = workspaces.get(&id).cloned().ok_or("workspace not found")?;
-            if !entry.kind.is_worktree() {
-                return Err("Not a worktree workspace.".to_string());
-            }
-            let parent_id = entry.parent_id.clone().ok_or("worktree parent not found")?;
-            let parent = workspaces
-                .get(&parent_id)
-                .cloned()
-                .ok_or("worktree parent not found")?;
-            (entry, parent)
-        };
-
-        let parent_path = PathBuf::from(&parent.path);
-        let entry_path = PathBuf::from(&entry.path);
-        if entry_path.exists() {
-            if let Err(err) = run_git_command(
-                &parent_path,
-                &["worktree", "remove", "--force", &entry.path],
-            )
-            .await
-            {
-                if is_missing_worktree_error(&err) {
-                    if entry_path.exists() {
-                        std::fs::remove_dir_all(&entry_path).map_err(|fs_err| {
-                            format!("Failed to remove worktree folder: {fs_err}")
-                        })?;
-                    }
-                } else {
-                    return Err(err);
-                }
-            }
-        }
-        let _ = run_git_command(&parent_path, &["worktree", "prune", "--expire", "now"]).await;
-
-        self.kill_session(&entry.id).await;
-
-        let list = {
-            let mut workspaces = self.workspaces.lock().await;
-            workspaces.remove(&entry.id);
-            workspaces.values().cloned().collect::<Vec<_>>()
-        };
-        write_workspaces(&self.storage_path, &list)?;
-
-        Ok(())
+        workspaces_core::remove_worktree_core(
+            id,
+            &self.workspaces,
+            &self.sessions,
+            &self.storage_path,
+            |root, args| {
+                workspaces_core::run_git_command_unit(root, args, git_core::run_git_command_owned)
+            },
+            |error| git_core::is_missing_worktree_error(error),
+            |path| {
+                std::fs::remove_dir_all(path)
+                    .map_err(|err| format!("Failed to remove worktree folder: {err}"))
+            },
+        )
+        .await
     }
 
     async fn rename_worktree(
@@ -453,150 +359,44 @@ impl DaemonState {
         branch: String,
         client_version: String,
     ) -> Result<WorkspaceInfo, String> {
-        let trimmed = branch.trim();
-        if trimmed.is_empty() {
-            return Err("Branch name is required.".to_string());
-        }
-
-        let (entry, parent) = {
-            let workspaces = self.workspaces.lock().await;
-            let entry = workspaces.get(&id).cloned().ok_or("workspace not found")?;
-            if !entry.kind.is_worktree() {
-                return Err("Not a worktree workspace.".to_string());
-            }
-            let parent_id = entry.parent_id.clone().ok_or("worktree parent not found")?;
-            let parent = workspaces
-                .get(&parent_id)
-                .cloned()
-                .ok_or("worktree parent not found")?;
-            (entry, parent)
-        };
-
-        let old_branch = entry
-            .worktree
-            .as_ref()
-            .map(|worktree| worktree.branch.clone())
-            .ok_or("worktree metadata missing")?;
-        if old_branch == trimmed {
-            return Err("Branch name is unchanged.".to_string());
-        }
-
-        let parent_root = PathBuf::from(&parent.path);
-
-        let (final_branch, _was_suffixed) =
-            unique_branch_name(&parent_root, trimmed, None).await?;
-        if final_branch == old_branch {
-            return Err("Branch name is unchanged.".to_string());
-        }
-
-        run_git_command(
-            &parent_root,
-            &["branch", "-m", &old_branch, &final_branch],
-        )
-        .await?;
-
-        let worktree_root = self.data_dir.join("worktrees").join(&parent.id);
-        std::fs::create_dir_all(&worktree_root)
-            .map_err(|e| format!("Failed to create worktree directory: {e}"))?;
-
-        let safe_name = sanitize_worktree_name(&final_branch);
-        let current_path = PathBuf::from(&entry.path);
-        let next_path =
-            unique_worktree_path_for_rename(&worktree_root, &safe_name, &current_path)?;
-        let next_path_string = next_path.to_string_lossy().to_string();
-        if next_path_string != entry.path {
-            if let Err(error) = run_git_command(
-                &parent_root,
-                &["worktree", "move", &entry.path, &next_path_string],
-            )
-            .await
-            {
-                let _ = run_git_command(
-                    &parent_root,
-                    &["branch", "-m", &final_branch, &old_branch],
-                )
-                .await;
-                return Err(error);
-            }
-        }
-
-        let (entry_snapshot, list) = {
-            let mut workspaces = self.workspaces.lock().await;
-            let entry = match workspaces.get_mut(&id) {
-                Some(entry) => entry,
-                None => return Err("workspace not found".to_string()),
-            };
-            entry.name = final_branch.clone();
-            entry.path = next_path_string.clone();
-            match entry.worktree.as_mut() {
-                Some(worktree) => {
-                    worktree.branch = final_branch.clone();
-                }
-                None => {
-                    entry.worktree = Some(WorktreeInfo {
-                        branch: final_branch.clone(),
-                    });
-                }
-            }
-            let snapshot = entry.clone();
-            let list: Vec<_> = workspaces.values().cloned().collect();
-            (snapshot, list)
-        };
-        write_workspaces(&self.storage_path, &list)?;
-
-        let was_connected = self.sessions.lock().await.contains_key(&entry_snapshot.id);
-        if was_connected {
-            self.kill_session(&entry_snapshot.id).await;
-            let (default_bin, codex_args) = {
-                let settings = self.app_settings.lock().await;
-                (
-                    settings.codex_bin.clone(),
-                    codex_args::resolve_workspace_codex_args(
-                        &entry_snapshot,
-                        Some(&parent),
-                        Some(&settings),
-                    ),
-                )
-            };
-            let codex_home =
-                codex_home::resolve_workspace_codex_home(&entry_snapshot, Some(&parent));
-            match spawn_workspace_session(
-                entry_snapshot.clone(),
-                default_bin,
-                codex_args,
-                codex_home,
-                client_version,
-                self.event_sink.clone(),
-            )
-            .await
-            {
-                Ok(session) => {
-                    self.sessions
-                        .lock()
+        let client_version = client_version.clone();
+        workspaces_core::rename_worktree_core(
+            id,
+            branch,
+            &self.data_dir,
+            &self.workspaces,
+            &self.sessions,
+            &self.app_settings,
+            &self.storage_path,
+            |entry| Ok(PathBuf::from(entry.path.clone())),
+            |root, name| {
+                let root = root.clone();
+                let name = name.to_string();
+                async move {
+                    git_core::unique_branch_name_live(&root, &name, None)
                         .await
-                        .insert(entry_snapshot.id.clone(), session);
+                        .map(|(branch_name, _was_suffixed)| branch_name)
                 }
-                Err(error) => {
-                    eprintln!(
-                        "rename_worktree: respawn failed for {} after rename: {error}",
-                        entry_snapshot.id
-                    );
-                }
-            }
-        }
-
-        let connected = self.sessions.lock().await.contains_key(&entry_snapshot.id);
-        Ok(WorkspaceInfo {
-            id: entry_snapshot.id,
-            name: entry_snapshot.name,
-            path: entry_snapshot.path,
-            connected,
-            codex_bin: entry_snapshot.codex_bin,
-            kind: entry_snapshot.kind,
-            parent_id: entry_snapshot.parent_id,
-            worktree: entry_snapshot.worktree,
-            settings: entry_snapshot.settings,
-        })
+            },
+            |value| worktree_core::sanitize_worktree_name(value),
+            |root, name, current| {
+                worktree_core::unique_worktree_path_for_rename(root, name, current)
+            },
+            |root, args| {
+                workspaces_core::run_git_command_unit(root, args, git_core::run_git_command_owned)
+            },
+            move |entry, default_bin, codex_args, codex_home| {
+                spawn_with_client(
+                    self.event_sink.clone(),
+                    client_version.clone(),
+                    entry,
+                    default_bin,
+                    codex_args,
+                    codex_home,
+                )
+            },
+        )
+        .await
     }
 
     async fn rename_worktree_upstream(
@@ -605,81 +405,40 @@ impl DaemonState {
         old_branch: String,
         new_branch: String,
     ) -> Result<(), String> {
-        let old_branch = old_branch.trim();
-        let new_branch = new_branch.trim();
-        if old_branch.is_empty() || new_branch.is_empty() {
-            return Err("Branch name is required.".to_string());
-        }
-        if old_branch == new_branch {
-            return Err("Branch name is unchanged.".to_string());
-        }
-
-        let (_entry, parent) = {
-            let workspaces = self.workspaces.lock().await;
-            let entry = workspaces.get(&id).cloned().ok_or("workspace not found")?;
-            if !entry.kind.is_worktree() {
-                return Err("Not a worktree workspace.".to_string());
-            }
-            let parent_id = entry.parent_id.clone().ok_or("worktree parent not found")?;
-            let parent = workspaces
-                .get(&parent_id)
-                .cloned()
-                .ok_or("worktree parent not found")?;
-            (entry, parent)
-        };
-
-        let parent_root = PathBuf::from(&parent.path);
-        if !git_branch_exists(&parent_root, new_branch).await? {
-            return Err("Local branch not found.".to_string());
-        }
-
-        let remote_for_old = git_find_remote_for_branch(&parent_root, old_branch).await?;
-        let remote_name = match remote_for_old.as_ref() {
-            Some(remote) => remote.clone(),
-            None => {
-                if git_remote_exists(&parent_root, "origin").await? {
-                    "origin".to_string()
-                } else {
-                    return Err("No git remote configured for this worktree.".to_string());
+        workspaces_core::rename_worktree_upstream_core(
+            id,
+            old_branch,
+            new_branch,
+            &self.workspaces,
+            |entry| Ok(PathBuf::from(entry.path.clone())),
+            |root, branch_name| {
+                let root = root.clone();
+                let branch_name = branch_name.to_string();
+                async move { git_core::git_branch_exists(&root, &branch_name).await }
+            },
+            |root, branch_name| {
+                let root = root.clone();
+                let branch_name = branch_name.to_string();
+                async move { git_core::git_find_remote_for_branch_live(&root, &branch_name).await }
+            },
+            |root, remote| {
+                let root = root.clone();
+                let remote = remote.to_string();
+                async move { git_core::git_remote_exists(&root, &remote).await }
+            },
+            |root, remote, branch_name| {
+                let root = root.clone();
+                let remote = remote.to_string();
+                let branch_name = branch_name.to_string();
+                async move {
+                    git_core::git_remote_branch_exists_live(&root, &remote, &branch_name).await
                 }
-            }
-        };
-
-        if git_remote_branch_exists_live(&parent_root, &remote_name, new_branch).await? {
-            return Err("Remote branch already exists.".to_string());
-        }
-
-        if remote_for_old.is_some() {
-            run_git_command(
-                &parent_root,
-                &[
-                    "push",
-                    &remote_name,
-                    &format!("{new_branch}:{new_branch}"),
-                ],
-            )
-            .await?;
-            run_git_command(
-                &parent_root,
-                &["push", &remote_name, &format!(":{old_branch}")],
-            )
-            .await?;
-        } else {
-            run_git_command(&parent_root, &["push", &remote_name, new_branch]).await?;
-        }
-
-        run_git_command(
-            &parent_root,
-            &[
-                "branch",
-                "--set-upstream-to",
-                &format!("{remote_name}/{new_branch}"),
-                new_branch,
-            ],
+            },
+            |root, args| {
+                workspaces_core::run_git_command_unit(root, args, git_core::run_git_command_owned)
+            },
         )
-        .await?;
-
-        Ok(())
+        .await
     }
 
     async fn update_workspace_settings(
@@ -688,168 +447,29 @@ impl DaemonState {
         settings: WorkspaceSettings,
         client_version: String,
     ) -> Result<WorkspaceInfo, String> {
-        let (
-            previous_entry,
-            entry_snapshot,
-            parent_entry,
-            previous_codex_home,
-            previous_codex_args,
-            child_entries,
-        ) = {
-            let mut workspaces = self.workspaces.lock().await;
-            let previous_entry = workspaces
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| "workspace not found".to_string())?;
-            let previous_codex_home = previous_entry.settings.codex_home.clone();
-            let previous_codex_args = previous_entry.settings.codex_args.clone();
-            let entry_snapshot = match workspaces.get_mut(&id) {
-                Some(entry) => {
-                    entry.settings = settings.clone();
-                    entry.clone()
-                }
-                None => return Err("workspace not found".to_string()),
-            };
-            let parent_entry = entry_snapshot
-                .parent_id
-                .as_ref()
-                .and_then(|parent_id| workspaces.get(parent_id))
-                .cloned();
-            let child_entries = workspaces
-                .values()
-                .filter(|entry| entry.parent_id.as_deref() == Some(&id))
-                .cloned()
-                .collect::<Vec<_>>();
-            (
-                previous_entry,
-                entry_snapshot,
-                parent_entry,
-                previous_codex_home,
-                previous_codex_args,
-                child_entries,
-            )
-        };
-
-        let codex_home_changed = previous_codex_home != entry_snapshot.settings.codex_home;
-        let codex_args_changed = previous_codex_args != entry_snapshot.settings.codex_args;
-        let connected = self.sessions.lock().await.contains_key(&id);
-        if connected && (codex_home_changed || codex_args_changed) {
-            let rollback_entry = previous_entry.clone();
-            let (default_bin, codex_args) = {
-                let settings = self.app_settings.lock().await;
-                (
-                    settings.codex_bin.clone(),
-                    codex_args::resolve_workspace_codex_args(
-                        &entry_snapshot,
-                        parent_entry.as_ref(),
-                        Some(&settings),
-                    ),
-                )
-            };
-            let codex_home =
-                codex_home::resolve_workspace_codex_home(&entry_snapshot, parent_entry.as_ref());
-            let new_session = match spawn_workspace_session(
-                entry_snapshot.clone(),
-                default_bin,
-                codex_args,
-                codex_home,
-                client_version.clone(),
-                self.event_sink.clone(),
-            )
-            .await
-            {
-                Ok(session) => session,
-                Err(error) => {
-                    let mut workspaces = self.workspaces.lock().await;
-                    workspaces.insert(rollback_entry.id.clone(), rollback_entry);
-                    return Err(error);
-                }
-            };
-            if let Some(old_session) = self
-                .sessions
-                .lock()
-                .await
-                .insert(entry_snapshot.id.clone(), new_session)
-            {
-                let mut child = old_session.child.lock().await;
-                let _ = child.kill().await;
-            }
-        }
-        if codex_home_changed || codex_args_changed {
-            let app_settings = self.app_settings.lock().await.clone();
-            let default_bin = app_settings.codex_bin.clone();
-            for child in child_entries {
-                let connected = self.sessions.lock().await.contains_key(&child.id);
-                if !connected {
-                    continue;
-                }
-                let previous_child_home =
-                    codex_home::resolve_workspace_codex_home(&child, Some(&previous_entry));
-                let next_child_home =
-                    codex_home::resolve_workspace_codex_home(&child, Some(&entry_snapshot));
-                let previous_child_args = codex_args::resolve_workspace_codex_args(
-                    &child,
-                    Some(&previous_entry),
-                    Some(&app_settings),
-                );
-                let next_child_args = codex_args::resolve_workspace_codex_args(
-                    &child,
-                    Some(&entry_snapshot),
-                    Some(&app_settings),
-                );
-                if previous_child_home == next_child_home
-                    && previous_child_args == next_child_args
-                {
-                    continue;
-                }
-                let new_session = match spawn_workspace_session(
-                    child.clone(),
-                    default_bin.clone(),
-                    next_child_args,
-                    next_child_home,
-                    client_version.clone(),
+        let client_version = client_version.clone();
+        workspaces_core::update_workspace_settings_core(
+            id,
+            settings,
+            &self.workspaces,
+            &self.sessions,
+            &self.app_settings,
+            &self.storage_path,
+            |workspaces, workspace_id, next_settings| {
+                apply_workspace_settings_update(workspaces, workspace_id, next_settings)
+            },
+            move |entry, default_bin, codex_args, codex_home| {
+                spawn_with_client(
                     self.event_sink.clone(),
+                    client_version.clone(),
+                    entry,
+                    default_bin,
+                    codex_args,
+                    codex_home,
                 )
-                .await
-                {
-                    Ok(session) => session,
-                    Err(error) => {
-                        eprintln!(
-                            "update_workspace_settings: respawn failed for worktree {} after parent override change: {error}",
-                            child.id
-                        );
-                        continue;
-                    }
-                };
-                if let Some(old_session) = self
-                    .sessions
-                    .lock()
-                    .await
-                    .insert(child.id.clone(), new_session)
-                {
-                    let mut child = old_session.child.lock().await;
-                    let _ = child.kill().await;
-                }
-            }
-        }
-
-        let list: Vec<_> = {
-            let workspaces = self.workspaces.lock().await;
-            workspaces.values().cloned().collect()
-        };
-        write_workspaces(&self.storage_path, &list)?;
-
-        Ok(WorkspaceInfo {
-            id: entry_snapshot.id,
-            name: entry_snapshot.name,
-            path: entry_snapshot.path,
-            connected: self.sessions.lock().await.contains_key(&id),
-            codex_bin: entry_snapshot.codex_bin,
-            kind: entry_snapshot.kind,
-            parent_id: entry_snapshot.parent_id,
-            worktree: entry_snapshot.worktree,
-            settings: entry_snapshot.settings,
-        })
+            },
+        )
+        .await
     }
 
     async fn update_workspace_codex_bin(
@@ -857,32 +477,14 @@ impl DaemonState {
         id: String,
         codex_bin: Option<String>,
     ) -> Result<WorkspaceInfo, String> {
-        let (entry_snapshot, list) = {
-            let mut workspaces = self.workspaces.lock().await;
-            let entry_snapshot = match workspaces.get_mut(&id) {
-                Some(entry) => {
-                    entry.codex_bin = codex_bin.clone();
-                    entry.clone()
-                }
-                None => return Err("workspace not found".to_string()),
-            };
-            let list: Vec<_> = workspaces.values().cloned().collect();
-            (entry_snapshot, list)
-        };
-        write_workspaces(&self.storage_path, &list)?;
-
-        let connected = self.sessions.lock().await.contains_key(&id);
-        Ok(WorkspaceInfo {
-            id: entry_snapshot.id,
-            name: entry_snapshot.name,
-            path: entry_snapshot.path,
-            connected,
-            codex_bin: entry_snapshot.codex_bin,
-            kind: entry_snapshot.kind,
-            parent_id: entry_snapshot.parent_id,
-            worktree: entry_snapshot.worktree,
-            settings: entry_snapshot.settings,
-        })
+        workspaces_core::update_workspace_codex_bin_core(
+            id,
+            codex_bin,
+            &self.workspaces,
+            &self.sessions,
+            &self.storage_path,
+        )
+        .await
     }
 
     async fn connect_workspace(&self, id: String, client_version: String) -> Result<(), String> {
@@ -893,82 +495,109 @@ impl DaemonState {
             }
         }
 
-        let entry = {
-            let workspaces = self.workspaces.lock().await;
-            workspaces
-                .get(&id)
-                .cloned()
-                .ok_or("workspace not found")?
-        };
-
-        let parent_entry = if entry.kind.is_worktree() {
-            let workspaces = self.workspaces.lock().await;
-            entry
-                .parent_id
-                .as_deref()
-                .and_then(|parent_id| workspaces.get(parent_id))
-                .cloned()
-        } else {
-            None
-        };
-        let (default_bin, codex_args) = {
-            let settings = self.app_settings.lock().await;
-            (
-                settings.codex_bin.clone(),
-                codex_args::resolve_workspace_codex_args(
-                    &entry,
-                    parent_entry.as_ref(),
-                    Some(&settings),
-                ),
-            )
-        };
-        let codex_home = codex_home::resolve_workspace_codex_home(&entry, parent_entry.as_ref());
-        let session = spawn_workspace_session(
-            entry,
-            default_bin,
-            codex_args,
-            codex_home,
-            client_version,
-            self.event_sink.clone(),
+        let client_version = client_version.clone();
+        workspaces_core::connect_workspace_core(
+            id,
+            &self.workspaces,
+            &self.sessions,
+            &self.app_settings,
+            move |entry, default_bin, codex_args, codex_home| {
+                spawn_with_client(
+                    self.event_sink.clone(),
+                    client_version.clone(),
+                    entry,
+                    default_bin,
+                    codex_args,
+                    codex_home,
+                )
+            },
         )
-        .await?;
+        .await
+    }
 
-        self.sessions.lock().await.insert(id, session);
-        Ok(())
+    async fn get_app_settings(&self) -> AppSettings {
+        settings_core::get_app_settings_core(&self.app_settings).await
     }
 
     async fn update_app_settings(&self, settings: AppSettings) -> Result<AppSettings, String> {
-        let _ = codex_config::write_collab_enabled(settings.experimental_collab_enabled);
-        let _ = codex_config::write_collaboration_modes_enabled(
-            settings.experimental_collaboration_modes_enabled,
-        );
-        let _ = codex_config::write_steer_enabled(settings.experimental_steer_enabled);
-        let _ = codex_config::write_unified_exec_enabled(settings.experimental_unified_exec_enabled);
-        write_settings(&self.settings_path, &settings)?;
-        let mut current = self.app_settings.lock().await;
-        *current = settings.clone();
-        Ok(settings)
+        settings_core::update_app_settings_core(settings, &self.app_settings, &self.settings_path)
+            .await
     }
 
-    async fn get_session(&self, workspace_id: &str) -> Result<Arc<WorkspaceSession>, String> {
-        let sessions = self.sessions.lock().await;
-        sessions
-            .get(workspace_id)
-            .cloned()
-            .ok_or("workspace not connected".to_string())
+    async fn orbit_connect_test(&self) -> Result<OrbitConnectTestResult, String> {
+        let settings = self.app_settings.lock().await.clone();
+        let ws_url = shared::orbit_core::orbit_ws_url_from_settings(&settings)?;
+        shared::orbit_core::orbit_connect_test_core(
+            &ws_url,
+            settings.remote_backend_token.as_deref(),
+        )
+        .await
+    }
+
+    async fn orbit_sign_in_start(&self) -> Result<OrbitDeviceCodeStart, String> {
+        let settings = self.app_settings.lock().await.clone();
+        let auth_url = shared::orbit_core::orbit_auth_url_from_settings(&settings)?;
+        shared::orbit_core::orbit_sign_in_start_core(
+            &auth_url,
+            settings.orbit_runner_name.as_deref(),
+        )
+        .await
+    }
+
+    async fn orbit_sign_in_poll(
+        &self,
+        device_code: String,
+    ) -> Result<OrbitSignInPollResult, String> {
+        let auth_url = {
+            let settings = self.app_settings.lock().await.clone();
+            shared::orbit_core::orbit_auth_url_from_settings(&settings)?
+        };
+        let result = shared::orbit_core::orbit_sign_in_poll_core(&auth_url, &device_code).await?;
+
+        if matches!(result.status, OrbitSignInStatus::Authorized) {
+            if let Some(token) = result.token.as_ref() {
+                let _ = settings_core::update_remote_backend_token_core(
+                    &self.app_settings,
+                    &self.settings_path,
+                    Some(token),
+                )
+                .await?;
+            }
+        }
+
+        Ok(result)
+    }
+
+    async fn orbit_sign_out(&self) -> Result<OrbitSignOutResult, String> {
+        let settings = self.app_settings.lock().await.clone();
+        let auth_url = shared::orbit_core::orbit_auth_url_optional(&settings);
+        let token = shared::orbit_core::remote_backend_token_optional(&settings);
+
+        let mut logout_error: Option<String> = None;
+        if let (Some(auth_url), Some(token)) = (auth_url.as_ref(), token.as_ref()) {
+            if let Err(err) = shared::orbit_core::orbit_sign_out_core(auth_url, token).await {
+                logout_error = Some(err);
+            }
+        }
+
+        let _ = settings_core::update_remote_backend_token_core(
+            &self.app_settings,
+            &self.settings_path,
+            None,
+        )
+        .await?;
+
+        Ok(OrbitSignOutResult {
+            success: logout_error.is_none(),
+            message: logout_error,
+        })
     }
 
     async fn list_workspace_files(&self, workspace_id: String) -> Result<Vec<String>, String> {
-        let entry = {
-            let workspaces = self.workspaces.lock().await;
-            workspaces
-                .get(&workspace_id)
-                .cloned()
-                .ok_or("workspace not found")?
-        };
-
-        let root = PathBuf::from(entry.path);
-        Ok(list_workspace_files_inner(&root, 20000))
+        workspaces_core::list_workspace_files_core(&self.workspaces, &workspace_id, |root| {
+            list_workspace_files_inner(root, 20000)
+        })
+        .await
     }
 
     async fn read_workspace_file(
@@ -976,33 +605,48 @@ impl DaemonState {
         workspace_id: String,
         path: String,
     ) -> Result<WorkspaceFileResponse, String> {
-        let entry = {
-            let workspaces = self.workspaces.lock().await;
-            workspaces
-                .get(&workspace_id)
-                .cloned()
-                .ok_or("workspace not found")?
-        };
+        workspaces_core::read_workspace_file_core(
+            &self.workspaces,
+            &workspace_id,
+            &path,
+            |root, rel_path| read_workspace_file_inner(root, rel_path),
+        )
+        .await
+    }
 
-        let root = PathBuf::from(entry.path);
-        read_workspace_file_inner(&root, &path)
+    async fn file_read(
+        &self,
+        scope: file_policy::FileScope,
+        kind: file_policy::FileKind,
+        workspace_id: Option<String>,
+    ) -> Result<file_io::TextFileResponse, String> {
+        files_core::file_read_core(&self.workspaces, scope, kind, workspace_id).await
+    }
+
+    async fn file_write(
+        &self,
+        scope: file_policy::FileScope,
+        kind: file_policy::FileKind,
+        workspace_id: Option<String>,
+        content: String,
+    ) -> Result<(), String> {
+        files_core::file_write_core(&self.workspaces, scope, kind, workspace_id, content).await
     }
 
     async fn start_thread(&self, workspace_id: String) -> Result<Value, String> {
-        let session = self.get_session(&workspace_id).await?;
-        let params = json!({
-            "cwd": session.entry.path,
-            "approvalPolicy": "on-request"
-        });
-        session.send_request("thread/start", params).await
+        codex_core::start_thread_core(&self.sessions, workspace_id).await
     }
 
-    async fn resume_thread(&self, workspace_id: String, thread_id: String) -> Result<Value, String> {
-        let session = self.get_session(&workspace_id).await?;
-        let params = json!({
-            "threadId": thread_id
-        });
-        session.send_request("thread/resume", params).await
+    async fn resume_thread(
+        &self,
+        workspace_id: String,
+        thread_id: String,
+    ) -> Result<Value, String> {
+        codex_core::resume_thread_core(&self.sessions, workspace_id, thread_id).await
+    }
+
+    async fn fork_thread(&self, workspace_id: String, thread_id: String) -> Result<Value, String> {
+        codex_core::fork_thread_core(&self.sessions, workspace_id, thread_id).await
     }
 
     async fn list_threads(
@@ -1010,19 +654,43 @@ impl DaemonState {
         workspace_id: String,
         cursor: Option<String>,
         limit: Option<u32>,
+        sort_key: Option<String>,
     ) -> Result<Value, String> {
-        let session = self.get_session(&workspace_id).await?;
-        let params = json!({
-            "cursor": cursor,
-            "limit": limit
-        });
-        session.send_request("thread/list", params).await
+        codex_core::list_threads_core(&self.sessions, workspace_id, cursor, limit, sort_key).await
     }
 
-    async fn archive_thread(&self, workspace_id: String, thread_id: String) -> Result<Value, String> {
-        let session = self.get_session(&workspace_id).await?;
-        let params = json!({ "threadId": thread_id });
-        session.send_request("thread/archive", params).await
+    async fn list_mcp_server_status(
+        &self,
+        workspace_id: String,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<Value, String> {
+        codex_core::list_mcp_server_status_core(&self.sessions, workspace_id, cursor, limit).await
+    }
+
+    async fn archive_thread(
+        &self,
+        workspace_id: String,
+        thread_id: String,
+    ) -> Result<Value, String> {
+        codex_core::archive_thread_core(&self.sessions, workspace_id, thread_id).await
+    }
+
+    async fn compact_thread(
+        &self,
+        workspace_id: String,
+        thread_id: String,
+    ) -> Result<Value, String> {
+        codex_core::compact_thread_core(&self.sessions, workspace_id, thread_id).await
+    }
+
+    async fn set_thread_name(
+        &self,
+        workspace_id: String,
+        thread_id: String,
+        name: String,
+    ) -> Result<Value, String> {
+        codex_core::set_thread_name_core(&self.sessions, workspace_id, thread_id, name).await
     }
 
     async fn send_user_message(
@@ -1036,64 +704,37 @@ impl DaemonState {
         images: Option<Vec<String>>,
         collaboration_mode: Option<Value>,
     ) -> Result<Value, String> {
-        let session = self.get_session(&workspace_id).await?;
-        let access_mode = access_mode.unwrap_or_else(|| "current".to_string());
-        let sandbox_policy = match access_mode.as_str() {
-            "full-access" => json!({
-                "type": "dangerFullAccess"
-            }),
-            "read-only" => json!({
-                "type": "readOnly"
-            }),
-            _ => json!({
-                "type": "workspaceWrite",
-                "writableRoots": [session.entry.path],
-                "networkAccess": true
-            }),
-        };
+        codex_core::send_user_message_core(
+            &self.sessions,
+            workspace_id,
+            thread_id,
+            text,
+            model,
+            effort,
+            access_mode,
+            images,
+            collaboration_mode,
+        )
+        .await
+    }
 
-        let approval_policy = if access_mode == "full-access" {
-            "never"
-        } else {
-            "on-request"
-        };
-
-        let trimmed_text = text.trim();
-        let mut input: Vec<Value> = Vec::new();
-        if !trimmed_text.is_empty() {
-            input.push(json!({ "type": "text", "text": trimmed_text }));
-        }
-        if let Some(paths) = images {
-            for path in paths {
-                let trimmed = path.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if trimmed.starts_with("data:")
-                    || trimmed.starts_with("http://")
-                    || trimmed.starts_with("https://")
-                {
-                    input.push(json!({ "type": "image", "url": trimmed }));
-                } else {
-                    input.push(json!({ "type": "localImage", "path": trimmed }));
-                }
-            }
-        }
-        if input.is_empty() {
-            return Err("empty user message".to_string());
-        }
-
-        let params = json!({
-            "threadId": thread_id,
-            "input": input,
-            "cwd": session.entry.path,
-            "approvalPolicy": approval_policy,
-            "sandboxPolicy": sandbox_policy,
-            "model": model,
-            "effort": effort,
-            "collaborationMode": collaboration_mode,
-        });
-        session.send_request("turn/start", params).await
+    async fn turn_steer(
+        &self,
+        workspace_id: String,
+        thread_id: String,
+        turn_id: String,
+        text: String,
+        images: Option<Vec<String>>,
+    ) -> Result<Value, String> {
+        codex_core::turn_steer_core(
+            &self.sessions,
+            workspace_id,
+            thread_id,
+            turn_id,
+            text,
+            images,
+        )
+        .await
     }
 
     async fn turn_interrupt(
@@ -1102,12 +743,7 @@ impl DaemonState {
         thread_id: String,
         turn_id: String,
     ) -> Result<Value, String> {
-        let session = self.get_session(&workspace_id).await?;
-        let params = json!({
-            "threadId": thread_id,
-            "turnId": turn_id
-        });
-        session.send_request("turn/interrupt", params).await
+        codex_core::turn_interrupt_core(&self.sessions, workspace_id, thread_id, turn_id).await
     }
 
     async fn start_review(
@@ -1117,43 +753,46 @@ impl DaemonState {
         target: Value,
         delivery: Option<String>,
     ) -> Result<Value, String> {
-        let session = self.get_session(&workspace_id).await?;
-        let mut params = Map::new();
-        params.insert("threadId".to_string(), json!(thread_id));
-        params.insert("target".to_string(), target);
-        if let Some(delivery) = delivery {
-            params.insert("delivery".to_string(), json!(delivery));
-        }
-        session
-            .send_request("review/start", Value::Object(params))
+        codex_core::start_review_core(&self.sessions, workspace_id, thread_id, target, delivery)
             .await
     }
 
     async fn model_list(&self, workspace_id: String) -> Result<Value, String> {
-        let session = self.get_session(&workspace_id).await?;
-        session.send_request("model/list", json!({})).await
+        codex_core::model_list_core(&self.sessions, workspace_id).await
     }
 
     async fn collaboration_mode_list(&self, workspace_id: String) -> Result<Value, String> {
-        let session = self.get_session(&workspace_id).await?;
-        session
-            .send_request("collaborationMode/list", json!({}))
-            .await
+        codex_core::collaboration_mode_list_core(&self.sessions, workspace_id).await
     }
 
     async fn account_rate_limits(&self, workspace_id: String) -> Result<Value, String> {
-        let session = self.get_session(&workspace_id).await?;
-        session
-            .send_request("account/rateLimits/read", Value::Null)
+        codex_core::account_rate_limits_core(&self.sessions, workspace_id).await
+    }
+
+    async fn account_read(&self, workspace_id: String) -> Result<Value, String> {
+        codex_core::account_read_core(&self.sessions, &self.workspaces, workspace_id).await
+    }
+
+    async fn codex_login(&self, workspace_id: String) -> Result<Value, String> {
+        codex_core::codex_login_core(&self.sessions, &self.codex_login_cancels, workspace_id).await
+    }
+
+    async fn codex_login_cancel(&self, workspace_id: String) -> Result<Value, String> {
+        codex_core::codex_login_cancel_core(&self.sessions, &self.codex_login_cancels, workspace_id)
             .await
     }
 
     async fn skills_list(&self, workspace_id: String) -> Result<Value, String> {
-        let session = self.get_session(&workspace_id).await?;
-        let params = json!({
-            "cwd": session.entry.path
-        });
-        session.send_request("skills/list", params).await
+        codex_core::skills_list_core(&self.sessions, workspace_id).await
+    }
+
+    async fn apps_list(
+        &self,
+        workspace_id: String,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<Value, String> {
+        codex_core::apps_list_core(&self.sessions, workspace_id, cursor, limit).await
     }
 
     async fn respond_to_server_request(
@@ -1162,8 +801,13 @@ impl DaemonState {
         request_id: Value,
         result: Value,
     ) -> Result<Value, String> {
-        let session = self.get_session(&workspace_id).await?;
-        session.send_response(request_id, result).await?;
+        codex_core::respond_to_server_request_core(
+            &self.sessions,
+            workspace_id,
+            request_id,
+            result,
+        )
+        .await?;
         Ok(json!({ "ok": true }))
     }
 
@@ -1172,61 +816,400 @@ impl DaemonState {
         workspace_id: String,
         command: Vec<String>,
     ) -> Result<Value, String> {
-        let command = command
-            .into_iter()
-            .map(|item| item.trim().to_string())
-            .filter(|item| !item.is_empty())
-            .collect::<Vec<_>>();
-        if command.is_empty() {
-            return Err("empty command".to_string());
-        }
-
-        let codex_home = self.resolve_codex_home_for_workspace(&workspace_id).await?;
-        let rules_path = rules::default_rules_path(&codex_home);
-        rules::append_prefix_rule(&rules_path, &command)?;
-
-        Ok(json!({
-            "ok": true,
-            "rulesPath": rules_path,
-        }))
+        codex_core::remember_approval_rule_core(&self.workspaces, workspace_id, command).await
     }
 
     async fn get_config_model(&self, workspace_id: String) -> Result<Value, String> {
-        let codex_home = self.resolve_codex_home_for_workspace(&workspace_id).await?;
-        let model = codex_config::read_config_model(Some(codex_home))?;
-        Ok(json!({ "model": model }))
+        codex_core::get_config_model_core(&self.workspaces, workspace_id).await
     }
 
-    async fn resolve_codex_home_for_workspace(&self, workspace_id: &str) -> Result<PathBuf, String> {
-        let (entry, parent_entry) = {
-            let workspaces = self.workspaces.lock().await;
-            let entry = workspaces
-                .get(workspace_id)
-                .ok_or("workspace not found")?
-                .clone();
-            let parent_entry = entry
-                .parent_id
-                .as_ref()
-                .and_then(|parent_id| workspaces.get(parent_id))
-                .cloned();
-            (entry, parent_entry)
-        };
-
-        codex_home::resolve_workspace_codex_home(&entry, parent_entry.as_ref())
-            .or_else(codex_home::resolve_default_codex_home)
-            .ok_or("Unable to resolve CODEX_HOME".to_string())
+    async fn add_clone(
+        &self,
+        source_workspace_id: String,
+        copies_folder: String,
+        copy_name: String,
+        client_version: String,
+    ) -> Result<WorkspaceInfo, String> {
+        workspaces_core::add_clone_core(
+            source_workspace_id,
+            copy_name,
+            copies_folder,
+            &self.workspaces,
+            &self.sessions,
+            &self.app_settings,
+            &self.storage_path,
+            |entry, default_bin, codex_args, codex_home| {
+                spawn_with_client(
+                    self.event_sink.clone(),
+                    client_version.clone(),
+                    entry,
+                    default_bin,
+                    codex_args,
+                    codex_home,
+                )
+            },
+        )
+        .await
     }
-}
 
-fn sort_workspaces(workspaces: &mut [WorkspaceInfo]) {
-    workspaces.sort_by(|a, b| {
-        let a_order = a.settings.sort_order.unwrap_or(u32::MAX);
-        let b_order = b.settings.sort_order.unwrap_or(u32::MAX);
-        if a_order != b_order {
-            return a_order.cmp(&b_order);
+    async fn apply_worktree_changes(&self, workspace_id: String) -> Result<(), String> {
+        workspaces_core::apply_worktree_changes_core(&self.workspaces, workspace_id).await
+    }
+
+    async fn open_workspace_in(
+        &self,
+        path: String,
+        app: Option<String>,
+        args: Vec<String>,
+        command: Option<String>,
+    ) -> Result<(), String> {
+        workspaces_core::open_workspace_in_core(path, app, args, command).await
+    }
+
+    async fn get_open_app_icon(&self, app_name: String) -> Result<Option<String>, String> {
+        #[cfg(target_os = "macos")]
+        {
+            return workspaces_core::get_open_app_icon_core(app_name, |name| {
+                workspace_macos::get_open_app_icon_inner(name)
+            })
+            .await;
         }
-        a.name.cmp(&b.name)
-    });
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            workspaces_core::get_open_app_icon_core(app_name, |_name| None).await
+        }
+    }
+
+    async fn get_git_status(&self, workspace_id: String) -> Result<Value, String> {
+        git_ui_core::get_git_status_core(&self.workspaces, workspace_id).await
+    }
+
+    async fn list_git_roots(
+        &self,
+        workspace_id: String,
+        depth: Option<usize>,
+    ) -> Result<Vec<String>, String> {
+        git_ui_core::list_git_roots_core(&self.workspaces, workspace_id, depth).await
+    }
+
+    async fn get_git_diffs(&self, workspace_id: String) -> Result<Vec<GitFileDiff>, String> {
+        git_ui_core::get_git_diffs_core(&self.workspaces, &self.app_settings, workspace_id).await
+    }
+
+    async fn get_git_log(
+        &self,
+        workspace_id: String,
+        limit: Option<usize>,
+    ) -> Result<GitLogResponse, String> {
+        git_ui_core::get_git_log_core(&self.workspaces, workspace_id, limit).await
+    }
+
+    async fn get_git_commit_diff(
+        &self,
+        workspace_id: String,
+        sha: String,
+    ) -> Result<Vec<GitCommitDiff>, String> {
+        git_ui_core::get_git_commit_diff_core(
+            &self.workspaces,
+            &self.app_settings,
+            workspace_id,
+            sha,
+        )
+        .await
+    }
+
+    async fn get_git_remote(&self, workspace_id: String) -> Result<Option<String>, String> {
+        git_ui_core::get_git_remote_core(&self.workspaces, workspace_id).await
+    }
+
+    async fn stage_git_file(&self, workspace_id: String, path: String) -> Result<(), String> {
+        git_ui_core::stage_git_file_core(&self.workspaces, workspace_id, path).await
+    }
+
+    async fn stage_git_all(&self, workspace_id: String) -> Result<(), String> {
+        git_ui_core::stage_git_all_core(&self.workspaces, workspace_id).await
+    }
+
+    async fn unstage_git_file(&self, workspace_id: String, path: String) -> Result<(), String> {
+        git_ui_core::unstage_git_file_core(&self.workspaces, workspace_id, path).await
+    }
+
+    async fn revert_git_file(&self, workspace_id: String, path: String) -> Result<(), String> {
+        git_ui_core::revert_git_file_core(&self.workspaces, workspace_id, path).await
+    }
+
+    async fn revert_git_all(&self, workspace_id: String) -> Result<(), String> {
+        git_ui_core::revert_git_all_core(&self.workspaces, workspace_id).await
+    }
+
+    async fn commit_git(&self, workspace_id: String, message: String) -> Result<(), String> {
+        git_ui_core::commit_git_core(&self.workspaces, workspace_id, message).await
+    }
+
+    async fn push_git(&self, workspace_id: String) -> Result<(), String> {
+        git_ui_core::push_git_core(&self.workspaces, workspace_id).await
+    }
+
+    async fn pull_git(&self, workspace_id: String) -> Result<(), String> {
+        git_ui_core::pull_git_core(&self.workspaces, workspace_id).await
+    }
+
+    async fn fetch_git(&self, workspace_id: String) -> Result<(), String> {
+        git_ui_core::fetch_git_core(&self.workspaces, workspace_id).await
+    }
+
+    async fn sync_git(&self, workspace_id: String) -> Result<(), String> {
+        git_ui_core::sync_git_core(&self.workspaces, workspace_id).await
+    }
+
+    async fn get_github_issues(
+        &self,
+        workspace_id: String,
+    ) -> Result<GitHubIssuesResponse, String> {
+        git_ui_core::get_github_issues_core(&self.workspaces, workspace_id).await
+    }
+
+    async fn get_github_pull_requests(
+        &self,
+        workspace_id: String,
+    ) -> Result<GitHubPullRequestsResponse, String> {
+        git_ui_core::get_github_pull_requests_core(&self.workspaces, workspace_id).await
+    }
+
+    async fn get_github_pull_request_diff(
+        &self,
+        workspace_id: String,
+        pr_number: u64,
+    ) -> Result<Vec<GitHubPullRequestDiff>, String> {
+        git_ui_core::get_github_pull_request_diff_core(&self.workspaces, workspace_id, pr_number)
+            .await
+    }
+
+    async fn get_github_pull_request_comments(
+        &self,
+        workspace_id: String,
+        pr_number: u64,
+    ) -> Result<Vec<GitHubPullRequestComment>, String> {
+        git_ui_core::get_github_pull_request_comments_core(
+            &self.workspaces,
+            workspace_id,
+            pr_number,
+        )
+        .await
+    }
+
+    async fn list_git_branches(&self, workspace_id: String) -> Result<Value, String> {
+        git_ui_core::list_git_branches_core(&self.workspaces, workspace_id).await
+    }
+
+    async fn checkout_git_branch(&self, workspace_id: String, name: String) -> Result<(), String> {
+        git_ui_core::checkout_git_branch_core(&self.workspaces, workspace_id, name).await
+    }
+
+    async fn create_git_branch(&self, workspace_id: String, name: String) -> Result<(), String> {
+        git_ui_core::create_git_branch_core(&self.workspaces, workspace_id, name).await
+    }
+
+    async fn prompts_list(&self, workspace_id: String) -> Result<Vec<CustomPromptEntry>, String> {
+        prompts_core::prompts_list_core(&self.workspaces, &self.settings_path, workspace_id).await
+    }
+
+    async fn prompts_workspace_dir(&self, workspace_id: String) -> Result<String, String> {
+        prompts_core::prompts_workspace_dir_core(
+            &self.workspaces,
+            &self.settings_path,
+            workspace_id,
+        )
+        .await
+    }
+
+    async fn prompts_global_dir(&self, workspace_id: String) -> Result<String, String> {
+        prompts_core::prompts_global_dir_core(&self.workspaces, workspace_id).await
+    }
+
+    async fn prompts_create(
+        &self,
+        workspace_id: String,
+        scope: String,
+        name: String,
+        description: Option<String>,
+        argument_hint: Option<String>,
+        content: String,
+    ) -> Result<CustomPromptEntry, String> {
+        prompts_core::prompts_create_core(
+            &self.workspaces,
+            &self.settings_path,
+            workspace_id,
+            scope,
+            name,
+            description,
+            argument_hint,
+            content,
+        )
+        .await
+    }
+
+    async fn prompts_update(
+        &self,
+        workspace_id: String,
+        path: String,
+        name: String,
+        description: Option<String>,
+        argument_hint: Option<String>,
+        content: String,
+    ) -> Result<CustomPromptEntry, String> {
+        prompts_core::prompts_update_core(
+            &self.workspaces,
+            &self.settings_path,
+            workspace_id,
+            path,
+            name,
+            description,
+            argument_hint,
+            content,
+        )
+        .await
+    }
+
+    async fn prompts_delete(&self, workspace_id: String, path: String) -> Result<(), String> {
+        prompts_core::prompts_delete_core(&self.workspaces, &self.settings_path, workspace_id, path)
+            .await
+    }
+
+    async fn prompts_move(
+        &self,
+        workspace_id: String,
+        path: String,
+        scope: String,
+    ) -> Result<CustomPromptEntry, String> {
+        prompts_core::prompts_move_core(
+            &self.workspaces,
+            &self.settings_path,
+            workspace_id,
+            path,
+            scope,
+        )
+        .await
+    }
+
+    async fn codex_doctor(
+        &self,
+        codex_bin: Option<String>,
+        codex_args: Option<String>,
+    ) -> Result<Value, String> {
+        codex_aux_core::codex_doctor_core(&self.app_settings, codex_bin, codex_args).await
+    }
+
+    async fn get_commit_message_prompt(&self, workspace_id: String) -> Result<String, String> {
+        let repo_root =
+            git_ui_core::resolve_repo_root_for_workspace_core(&self.workspaces, workspace_id)
+                .await?;
+        let diff = git_ui_core::collect_workspace_diff_core(&repo_root)?;
+        if diff.trim().is_empty() {
+            return Err("No changes to generate commit message for".to_string());
+        }
+        Ok(codex_aux_core::build_commit_message_prompt(&diff))
+    }
+
+    async fn generate_commit_message(&self, workspace_id: String) -> Result<String, String> {
+        let repo_root = git_ui_core::resolve_repo_root_for_workspace_core(
+            &self.workspaces,
+            workspace_id.clone(),
+        )
+        .await?;
+        let diff = git_ui_core::collect_workspace_diff_core(&repo_root)?;
+        if diff.trim().is_empty() {
+            return Err("No changes to generate commit message for".to_string());
+        }
+        let prompt = codex_aux_core::build_commit_message_prompt(&diff);
+        let response = codex_aux_core::run_background_prompt_core(
+            &self.sessions,
+            workspace_id,
+            prompt,
+            |workspace_id, thread_id| {
+                emit_background_thread_hide(&self.event_sink, workspace_id, thread_id);
+            },
+            "Timeout waiting for commit message generation",
+            "Unknown error during commit message generation",
+        )
+        .await?;
+
+        let trimmed = response.trim().to_string();
+        if trimmed.is_empty() {
+            return Err("No commit message was generated".to_string());
+        }
+        Ok(trimmed)
+    }
+
+    async fn generate_run_metadata(
+        &self,
+        workspace_id: String,
+        prompt: String,
+    ) -> Result<Value, String> {
+        let cleaned_prompt = prompt.trim();
+        if cleaned_prompt.is_empty() {
+            return Err("Prompt is required.".to_string());
+        }
+
+        let title_prompt = codex_aux_core::build_run_metadata_prompt(cleaned_prompt);
+        let response_text = codex_aux_core::run_background_prompt_core(
+            &self.sessions,
+            workspace_id,
+            title_prompt,
+            |workspace_id, thread_id| {
+                emit_background_thread_hide(&self.event_sink, workspace_id, thread_id);
+            },
+            "Timeout waiting for metadata generation",
+            "Unknown error during metadata generation",
+        )
+        .await?;
+
+        let trimmed = response_text.trim();
+        if trimmed.is_empty() {
+            return Err("No metadata was generated".to_string());
+        }
+        let json_value = codex_aux_core::extract_json_value(trimmed)
+            .ok_or_else(|| "Failed to parse metadata JSON".to_string())?;
+        let title = json_value
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| "Missing title in metadata".to_string())?;
+        let worktree_name = json_value
+            .get("worktreeName")
+            .or_else(|| json_value.get("worktree_name"))
+            .and_then(|v| v.as_str())
+            .map(codex_aux_core::sanitize_run_worktree_name)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| "Missing worktree name in metadata".to_string())?;
+        Ok(json!({
+            "title": title,
+            "worktreeName": worktree_name
+        }))
+    }
+
+    async fn local_usage_snapshot(
+        &self,
+        days: Option<u32>,
+        workspace_path: Option<String>,
+    ) -> Result<LocalUsageSnapshot, String> {
+        local_usage_core::local_usage_snapshot_core(&self.workspaces, days, workspace_path).await
+    }
+
+    async fn menu_set_accelerators(&self, _updates: Vec<Value>) -> Result<(), String> {
+        // Daemon has no native menu runtime; treat as no-op for remote parity.
+        Ok(())
+    }
+
+    async fn is_macos_debug_build(&self) -> bool {
+        cfg!(all(target_os = "macos", debug_assertions))
+    }
+
+    async fn send_notification_fallback(&self, title: String, body: String) -> Result<(), String> {
+        send_notification_fallback_inner(title, body)
+    }
 }
 
 fn should_skip_dir(name: &str) -> bool {
@@ -1238,6 +1221,55 @@ fn should_skip_dir(name: &str) -> bool {
 
 fn normalize_git_path(path: &str) -> String {
     path.replace('\\', "/")
+}
+
+fn parse_optional_u64(value: &Value, key: &str) -> Option<u64> {
+    match value {
+        Value::Object(map) => map.get(key).and_then(|value| value.as_u64()),
+        _ => None,
+    }
+}
+
+fn emit_background_thread_hide(event_sink: &DaemonEventSink, workspace_id: &str, thread_id: &str) {
+    event_sink.emit_app_server_event(AppServerEvent {
+        workspace_id: workspace_id.to_string(),
+        message: json!({
+            "method": "codex/backgroundThread",
+            "params": {
+                "threadId": thread_id,
+                "action": "hide"
+            }
+        }),
+    });
+}
+
+fn send_notification_fallback_inner(title: String, body: String) -> Result<(), String> {
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    {
+        let escape = |value: &str| value.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            escape(&body),
+            escape(&title)
+        );
+
+        let status = std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(script)
+            .status()
+            .map_err(|error| format!("Failed to run osascript: {error}"))?;
+
+        if status.success() {
+            return Ok(());
+        }
+        return Err(format!("osascript exited with status: {status}"));
+    }
+
+    #[cfg(not(all(target_os = "macos", debug_assertions)))]
+    {
+        let _ = (title, body);
+        Err("Notification fallback is only available on macOS debug builds.".to_string())
+    }
 }
 
 fn list_workspace_files_inner(root: &PathBuf, max_files: usize) -> Vec<String> {
@@ -1303,8 +1335,7 @@ fn read_workspace_file_inner(
         return Err("Path is not a file".to_string());
     }
 
-    let mut file =
-        File::open(&canonical_path).map_err(|err| format!("Failed to open file: {err}"))?;
+    let file = File::open(&canonical_path).map_err(|err| format!("Failed to open file: {err}"))?;
     let mut buffer = Vec::new();
     file.take(MAX_WORKSPACE_FILE_BYTES + 1)
         .read_to_end(&mut buffer)
@@ -1315,246 +1346,8 @@ fn read_workspace_file_inner(
         buffer.truncate(MAX_WORKSPACE_FILE_BYTES as usize);
     }
 
-    let content =
-        String::from_utf8(buffer).map_err(|_| "File is not valid UTF-8".to_string())?;
+    let content = String::from_utf8(buffer).map_err(|_| "File is not valid UTF-8".to_string())?;
     Ok(WorkspaceFileResponse { content, truncated })
-}
-
-async fn run_git_command(repo_path: &PathBuf, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo_path)
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run git: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        if detail.is_empty() {
-            Err("Git command failed.".to_string())
-        } else {
-            Err(detail.to_string())
-        }
-    }
-}
-
-fn is_missing_worktree_error(error: &str) -> bool {
-    error.contains("is not a working tree")
-}
-
-async fn git_branch_exists(repo_path: &PathBuf, branch: &str) -> Result<bool, String> {
-    let status = Command::new("git")
-        .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
-        .current_dir(repo_path)
-        .status()
-        .await
-        .map_err(|e| format!("Failed to run git: {e}"))?;
-    Ok(status.success())
-}
-
-async fn git_remote_exists(repo_path: &PathBuf, remote: &str) -> Result<bool, String> {
-    let status = Command::new("git")
-        .args(["remote", "get-url", remote])
-        .current_dir(repo_path)
-        .status()
-        .await
-        .map_err(|e| format!("Failed to run git: {e}"))?;
-    Ok(status.success())
-}
-
-async fn git_remote_branch_exists_live(
-    repo_path: &PathBuf,
-    remote: &str,
-    branch: &str,
-) -> Result<bool, String> {
-    let output = Command::new("git")
-        .args([
-            "ls-remote",
-            "--heads",
-            remote,
-            &format!("refs/heads/{branch}"),
-        ])
-        .current_dir(repo_path)
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run git: {e}"))?;
-    if output.status.success() {
-        Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        if detail.is_empty() {
-            Err("Git command failed.".to_string())
-        } else {
-            Err(detail.to_string())
-        }
-    }
-}
-
-async fn git_remote_branch_exists(repo_path: &PathBuf, remote: &str, branch: &str) -> Result<bool, String> {
-    let status = Command::new("git")
-        .args([
-            "show-ref",
-            "--verify",
-            &format!("refs/remotes/{remote}/{branch}"),
-        ])
-        .current_dir(repo_path)
-        .status()
-        .await
-        .map_err(|e| format!("Failed to run git: {e}"))?;
-    Ok(status.success())
-}
-
-async fn unique_branch_name(
-    repo_path: &PathBuf,
-    desired: &str,
-    remote: Option<&str>,
-) -> Result<(String, bool), String> {
-    let mut candidate = desired.to_string();
-    if desired.is_empty() {
-        return Ok((candidate, false));
-    }
-    if !git_branch_exists(repo_path, &candidate).await?
-        && match remote {
-            Some(remote) => !git_remote_branch_exists_live(repo_path, remote, &candidate).await?,
-            None => true,
-        }
-    {
-        return Ok((candidate, false));
-    }
-    for index in 2..1000 {
-        candidate = format!("{desired}-{index}");
-        let local_exists = git_branch_exists(repo_path, &candidate).await?;
-        let remote_exists = match remote {
-            Some(remote) => git_remote_branch_exists_live(repo_path, remote, &candidate).await?,
-            None => false,
-        };
-        if !local_exists && !remote_exists {
-            return Ok((candidate, true));
-        }
-    }
-    Err("Unable to find an available branch name.".to_string())
-}
-
-async fn git_list_remotes(repo_path: &PathBuf) -> Result<Vec<String>, String> {
-    let output = run_git_command(repo_path, &["remote"]).await?;
-    Ok(output
-        .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .map(|line| line.to_string())
-        .collect())
-}
-
-async fn git_find_remote_for_branch(
-    repo_path: &PathBuf,
-    branch: &str,
-) -> Result<Option<String>, String> {
-    if git_remote_exists(repo_path, "origin").await?
-        && git_remote_branch_exists_live(repo_path, "origin", branch).await?
-    {
-        return Ok(Some("origin".to_string()));
-    }
-
-    for remote in git_list_remotes(repo_path).await? {
-        if remote == "origin" {
-            continue;
-        }
-        if git_remote_branch_exists_live(repo_path, &remote, branch).await? {
-            return Ok(Some(remote));
-        }
-    }
-
-    Ok(None)
-}
-
-async fn git_find_remote_tracking_branch(repo_path: &PathBuf, branch: &str) -> Result<Option<String>, String> {
-    if git_remote_branch_exists(repo_path, "origin", branch).await? {
-        return Ok(Some(format!("origin/{branch}")));
-    }
-
-    for remote in git_list_remotes(repo_path).await? {
-        if remote == "origin" {
-            continue;
-        }
-        if git_remote_branch_exists(repo_path, &remote, branch).await? {
-            return Ok(Some(format!("{remote}/{branch}")));
-        }
-    }
-
-    Ok(None)
-}
-
-fn sanitize_worktree_name(branch: &str) -> String {
-    let mut result = String::new();
-    for ch in branch.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            result.push(ch);
-        } else {
-            result.push('-');
-        }
-    }
-    let trimmed = result.trim_matches('-').to_string();
-    if trimmed.is_empty() {
-        "worktree".to_string()
-    } else {
-        trimmed
-    }
-}
-
-fn unique_worktree_path(base_dir: &PathBuf, name: &str) -> Result<PathBuf, String> {
-    let candidate = base_dir.join(name);
-    if !candidate.exists() {
-        return Ok(candidate);
-    }
-
-    for index in 2..1000 {
-        let next = base_dir.join(format!("{name}-{index}"));
-        if !next.exists() {
-            return Ok(next);
-        }
-    }
-
-    Err(format!(
-        "Failed to find an available worktree path under {}.",
-        base_dir.display()
-    ))
-}
-
-fn unique_worktree_path_for_rename(
-    base_dir: &PathBuf,
-    name: &str,
-    current_path: &PathBuf,
-) -> Result<PathBuf, String> {
-    let candidate = base_dir.join(name);
-    if candidate == *current_path {
-        return Ok(candidate);
-    }
-    if !candidate.exists() {
-        return Ok(candidate);
-    }
-    for index in 2..1000 {
-        let next = base_dir.join(format!("{name}-{index}"));
-        if next == *current_path || !next.exists() {
-            return Ok(next);
-        }
-    }
-    Err(format!(
-        "Failed to find an available worktree path under {}.",
-        base_dir.display()
-    ))
 }
 
 fn default_data_dir() -> PathBuf {
@@ -1574,8 +1367,8 @@ fn default_data_dir() -> PathBuf {
 fn usage() -> String {
     format!(
         "\
-USAGE:\n  codex-monitor-daemon [--listen <addr>] [--data-dir <path>] [--token <token> | --insecure-no-auth]\n\n\
-OPTIONS:\n  --listen <addr>        Bind address (default: {DEFAULT_LISTEN_ADDR})\n  --data-dir <path>      Data dir holding workspaces.json/settings.json\n  --token <token>        Shared token required by clients\n  --insecure-no-auth      Disable auth (dev only)\n  -h, --help             Show this help\n"
+USAGE:\n  codex-monitor-daemon [--listen <addr>] [--data-dir <path>] [--token <token> | --insecure-no-auth]\n  codex-monitor-daemon --orbit-url <ws-url> [--orbit-token <token>] [--orbit-auth-url <url>] [--orbit-runner-name <name>] [--data-dir <path>]\n\n\
+OPTIONS:\n  --listen <addr>          Bind address (default: {DEFAULT_LISTEN_ADDR})\n  --data-dir <path>        Data dir holding workspaces.json/settings.json\n  --token <token>          Shared token required by TCP clients\n  --insecure-no-auth       Disable TCP auth (dev only)\n  --orbit-url <ws-url>     Run in Orbit runner mode and connect outbound to this WS URL\n  --orbit-token <token>    Orbit auth token (optional if URL already includes token)\n  --orbit-auth-url <url>   Orbit auth base URL (metadata only, optional)\n  --orbit-runner-name <n>  Runner display name (metadata only, optional)\n  -h, --help               Show this help\n"
     )
 }
 
@@ -1589,6 +1382,19 @@ fn parse_args() -> Result<DaemonConfig, String> {
         .filter(|value| !value.is_empty());
     let mut insecure_no_auth = false;
     let mut data_dir: Option<PathBuf> = None;
+    let mut orbit_url: Option<String> = None;
+    let mut orbit_token: Option<String> = env::var("CODEX_MONITOR_ORBIT_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let mut orbit_auth_url: Option<String> = env::var("CODEX_MONITOR_ORBIT_AUTH_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let mut orbit_runner_name: Option<String> = env::var("CODEX_MONITOR_ORBIT_RUNNER_NAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -1621,11 +1427,44 @@ fn parse_args() -> Result<DaemonConfig, String> {
                 insecure_no_auth = true;
                 token = None;
             }
+            "--orbit-url" => {
+                let value = args.next().ok_or("--orbit-url requires a value")?;
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err("--orbit-url requires a non-empty value".to_string());
+                }
+                orbit_url = Some(trimmed.to_string());
+            }
+            "--orbit-token" => {
+                let value = args.next().ok_or("--orbit-token requires a value")?;
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err("--orbit-token requires a non-empty value".to_string());
+                }
+                orbit_token = Some(trimmed.to_string());
+            }
+            "--orbit-auth-url" => {
+                let value = args.next().ok_or("--orbit-auth-url requires a value")?;
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err("--orbit-auth-url requires a non-empty value".to_string());
+                }
+                orbit_auth_url = Some(trimmed.to_string());
+            }
+            "--orbit-runner-name" => {
+                let value = args.next().ok_or("--orbit-runner-name requires a value")?;
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err("--orbit-runner-name requires a non-empty value".to_string());
+                }
+                orbit_runner_name = Some(trimmed.to_string());
+            }
             _ => return Err(format!("Unknown argument: {arg}")),
         }
     }
 
-    if token.is_none() && !insecure_no_auth {
+    let is_orbit_mode = orbit_url.is_some();
+    if !is_orbit_mode && token.is_none() && !insecure_no_auth {
         return Err(
             "Missing --token (or set CODEX_MONITOR_DAEMON_TOKEN). Use --insecure-no-auth for local dev only."
                 .to_string(),
@@ -1636,452 +1475,193 @@ fn parse_args() -> Result<DaemonConfig, String> {
         listen,
         token,
         data_dir: data_dir.unwrap_or_else(default_data_dir),
+        orbit_url,
+        orbit_token,
+        orbit_auth_url,
+        orbit_runner_name,
     })
 }
 
-fn build_error_response(id: Option<u64>, message: &str) -> Option<String> {
-    let id = id?;
-    Some(
-        serde_json::to_string(&json!({
-            "id": id,
-            "error": { "message": message }
-        }))
-        .unwrap_or_else(|_| "{\"id\":0,\"error\":{\"message\":\"serialization failed\"}}".to_string()),
-    )
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::WorkspaceKind;
+    use serde_json::json;
+    use std::future::Future;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-fn build_result_response(id: Option<u64>, result: Value) -> Option<String> {
-    let id = id?;
-    Some(serde_json::to_string(&json!({ "id": id, "result": result })).unwrap_or_else(|_| {
-        "{\"id\":0,\"error\":{\"message\":\"serialization failed\"}}".to_string()
-    }))
-}
-
-fn build_event_notification(event: DaemonEvent) -> Option<String> {
-    let payload = match event {
-        DaemonEvent::AppServer(payload) => json!({
-            "method": "app-server-event",
-            "params": payload,
-        }),
-        DaemonEvent::TerminalOutput(payload) => json!({
-            "method": "terminal-output",
-            "params": payload,
-        }),
-    };
-    serde_json::to_string(&payload).ok()
-}
-
-fn parse_auth_token(params: &Value) -> Option<String> {
-    match params {
-        Value::String(value) => Some(value.clone()),
-        Value::Object(map) => map
-            .get("token")
-            .and_then(|value| value.as_str())
-            .map(|v| v.to_string()),
-        _ => None,
+    fn run_async_test<F>(future: F)
+    where
+        F: Future<Output = ()>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(future);
     }
-}
 
-fn parse_string(value: &Value, key: &str) -> Result<String, String> {
-    match value {
-        Value::Object(map) => map
-            .get(key)
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_string())
-            .ok_or_else(|| format!("missing or invalid `{key}`")),
-        _ => Err(format!("missing `{key}`")),
+    fn make_temp_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "codex-monitor-{prefix}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
     }
-}
 
-fn parse_optional_string(value: &Value, key: &str) -> Option<String> {
-    match value {
-        Value::Object(map) => map
-            .get(key)
-            .and_then(|value| value.as_str())
-            .map(|v| v.to_string()),
-        _ => None,
+    fn test_state(data_dir: &std::path::Path) -> DaemonState {
+        let (tx, _rx) = broadcast::channel::<DaemonEvent>(32);
+        DaemonState {
+            data_dir: data_dir.to_path_buf(),
+            workspaces: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
+            storage_path: data_dir.join("workspaces.json"),
+            settings_path: data_dir.join("settings.json"),
+            app_settings: Mutex::new(AppSettings::default()),
+            event_sink: DaemonEventSink { tx },
+            codex_login_cancels: Mutex::new(HashMap::new()),
+            daemon_mode: "tcp".to_string(),
+            daemon_binary_path: Some("/tmp/codex-monitor-daemon".to_string()),
+        }
     }
-}
 
-fn parse_optional_u32(value: &Value, key: &str) -> Option<u32> {
-    match value {
-        Value::Object(map) => map.get(key).and_then(|value| value.as_u64()).and_then(|v| {
-            if v > u32::MAX as u64 {
-                None
-            } else {
-                Some(v as u32)
-            }
-        }),
-        _ => None,
-    }
-}
-
-fn parse_optional_string_array(value: &Value, key: &str) -> Option<Vec<String>> {
-    match value {
-        Value::Object(map) => map.get(key).and_then(|value| value.as_array()).map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(|value| value.to_string()))
-                .collect::<Vec<_>>()
-        }),
-        _ => None,
-    }
-}
-
-fn parse_string_array(value: &Value, key: &str) -> Result<Vec<String>, String> {
-    parse_optional_string_array(value, key).ok_or_else(|| format!("missing `{key}`"))
-}
-
-fn parse_optional_value(value: &Value, key: &str) -> Option<Value> {
-    match value {
-        Value::Object(map) => map.get(key).cloned(),
-        _ => None,
-    }
-}
-
-async fn handle_rpc_request(
-    state: &DaemonState,
-    method: &str,
-    params: Value,
-    client_version: String,
-) -> Result<Value, String> {
-    match method {
-        "ping" => Ok(json!({ "ok": true })),
-        "list_workspaces" => {
-            let workspaces = state.list_workspaces().await;
-            serde_json::to_value(workspaces).map_err(|err| err.to_string())
-        }
-        "is_workspace_path_dir" => {
-            let path = parse_string(&params, "path")?;
-            let is_dir = state.is_workspace_path_dir(path).await;
-            serde_json::to_value(is_dir).map_err(|err| err.to_string())
-        }
-        "add_workspace" => {
-            let path = parse_string(&params, "path")?;
-            let codex_bin = parse_optional_string(&params, "codex_bin");
-            let workspace = state.add_workspace(path, codex_bin, client_version).await?;
-            serde_json::to_value(workspace).map_err(|err| err.to_string())
-        }
-        "add_worktree" => {
-            let parent_id = parse_string(&params, "parentId")?;
-            let branch = parse_string(&params, "branch")?;
-            let workspace = state
-                .add_worktree(parent_id, branch, client_version)
-                .await?;
-            serde_json::to_value(workspace).map_err(|err| err.to_string())
-        }
-        "connect_workspace" => {
-            let id = parse_string(&params, "id")?;
-            state.connect_workspace(id, client_version).await?;
-            Ok(json!({ "ok": true }))
-        }
-        "remove_workspace" => {
-            let id = parse_string(&params, "id")?;
-            state.remove_workspace(id).await?;
-            Ok(json!({ "ok": true }))
-        }
-        "remove_worktree" => {
-            let id = parse_string(&params, "id")?;
-            state.remove_worktree(id).await?;
-            Ok(json!({ "ok": true }))
-        }
-        "rename_worktree" => {
-            let id = parse_string(&params, "id")?;
-            let branch = parse_string(&params, "branch")?;
-            let workspace = state.rename_worktree(id, branch, client_version).await?;
-            serde_json::to_value(workspace).map_err(|err| err.to_string())
-        }
-        "rename_worktree_upstream" => {
-            let id = parse_string(&params, "id")?;
-            let old_branch = parse_string(&params, "oldBranch")?;
-            let new_branch = parse_string(&params, "newBranch")?;
-            state
-                .rename_worktree_upstream(id, old_branch, new_branch)
-                .await?;
-            Ok(json!({ "ok": true }))
-        }
-        "update_workspace_settings" => {
-            let id = parse_string(&params, "id")?;
-            let settings_value = match params {
-                Value::Object(map) => map.get("settings").cloned().unwrap_or(Value::Null),
-                _ => Value::Null,
-            };
-            let settings: WorkspaceSettings =
-                serde_json::from_value(settings_value).map_err(|err| err.to_string())?;
-            let workspace = state
-                .update_workspace_settings(id, settings, client_version)
-                .await?;
-            serde_json::to_value(workspace).map_err(|err| err.to_string())
-        }
-        "update_workspace_codex_bin" => {
-            let id = parse_string(&params, "id")?;
-            let codex_bin = parse_optional_string(&params, "codex_bin");
-            let workspace = state.update_workspace_codex_bin(id, codex_bin).await?;
-            serde_json::to_value(workspace).map_err(|err| err.to_string())
-        }
-        "list_workspace_files" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            let files = state.list_workspace_files(workspace_id).await?;
-            serde_json::to_value(files).map_err(|err| err.to_string())
-        }
-        "read_workspace_file" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            let path = parse_string(&params, "path")?;
-            let response = state.read_workspace_file(workspace_id, path).await?;
-            serde_json::to_value(response).map_err(|err| err.to_string())
-        }
-        "get_app_settings" => {
-            let mut settings = state.app_settings.lock().await.clone();
-            if let Ok(Some(collab_enabled)) = codex_config::read_collab_enabled() {
-                settings.experimental_collab_enabled = collab_enabled;
-            }
-            if let Ok(Some(collaboration_modes_enabled)) =
-                codex_config::read_collaboration_modes_enabled()
-            {
-                settings.experimental_collaboration_modes_enabled = collaboration_modes_enabled;
-            }
-            if let Ok(Some(steer_enabled)) = codex_config::read_steer_enabled() {
-                settings.experimental_steer_enabled = steer_enabled;
-            }
-            if let Ok(Some(unified_exec_enabled)) = codex_config::read_unified_exec_enabled() {
-                settings.experimental_unified_exec_enabled = unified_exec_enabled;
-            }
-            serde_json::to_value(settings).map_err(|err| err.to_string())
-        }
-        "update_app_settings" => {
-            let settings_value = match params {
-                Value::Object(map) => map.get("settings").cloned().unwrap_or(Value::Null),
-                _ => Value::Null,
-            };
-            let settings: AppSettings =
-                serde_json::from_value(settings_value).map_err(|err| err.to_string())?;
-            let updated = state.update_app_settings(settings).await?;
-            serde_json::to_value(updated).map_err(|err| err.to_string())
-        }
-        "get_codex_config_path" => {
-            let path = codex_config::config_toml_path()
-                .ok_or("Unable to resolve CODEX_HOME".to_string())?;
-            let path = path
-                .to_str()
-                .ok_or("Unable to resolve CODEX_HOME".to_string())?;
-            Ok(Value::String(path.to_string()))
-        }
-        "get_config_model" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            state.get_config_model(workspace_id).await
-        }
-        "start_thread" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            state.start_thread(workspace_id).await
-        }
-        "resume_thread" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            let thread_id = parse_string(&params, "threadId")?;
-            state.resume_thread(workspace_id, thread_id).await
-        }
-        "list_threads" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            let cursor = parse_optional_string(&params, "cursor");
-            let limit = parse_optional_u32(&params, "limit");
-            state.list_threads(workspace_id, cursor, limit).await
-        }
-        "archive_thread" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            let thread_id = parse_string(&params, "threadId")?;
-            state.archive_thread(workspace_id, thread_id).await
-        }
-        "send_user_message" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            let thread_id = parse_string(&params, "threadId")?;
-            let text = parse_string(&params, "text")?;
-            let model = parse_optional_string(&params, "model");
-            let effort = parse_optional_string(&params, "effort");
-            let access_mode = parse_optional_string(&params, "accessMode");
-            let images = parse_optional_string_array(&params, "images");
-            let collaboration_mode = parse_optional_value(&params, "collaborationMode");
-            state
-                .send_user_message(
-                    workspace_id,
-                    thread_id,
-                    text,
-                    model,
-                    effort,
-                    access_mode,
-                    images,
-                    collaboration_mode,
-                )
-                .await
-        }
-        "turn_interrupt" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            let thread_id = parse_string(&params, "threadId")?;
-            let turn_id = parse_string(&params, "turnId")?;
-            state.turn_interrupt(workspace_id, thread_id, turn_id).await
-        }
-        "start_review" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            let thread_id = parse_string(&params, "threadId")?;
-            let target = params
-                .as_object()
-                .and_then(|map| map.get("target"))
-                .cloned()
-                .ok_or("missing `target`")?;
-            let delivery = parse_optional_string(&params, "delivery");
-            state.start_review(workspace_id, thread_id, target, delivery).await
-        }
-        "model_list" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            state.model_list(workspace_id).await
-        }
-        "collaboration_mode_list" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            state.collaboration_mode_list(workspace_id).await
-        }
-        "account_rate_limits" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            state.account_rate_limits(workspace_id).await
-        }
-        "skills_list" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            state.skills_list(workspace_id).await
-        }
-        "respond_to_server_request" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            let map = params.as_object().ok_or("missing requestId")?;
-            let request_id = map
-                .get("requestId")
-                .cloned()
-                .filter(|value| value.is_number() || value.is_string())
-                .ok_or("missing requestId")?;
-            let result = map.get("result").cloned().ok_or("missing `result`")?;
-            state
-                .respond_to_server_request(workspace_id, request_id, result)
-                .await
-        }
-        "remember_approval_rule" => {
-            let workspace_id = parse_string(&params, "workspaceId")?;
-            let command = parse_string_array(&params, "command")?;
-            state.remember_approval_rule(workspace_id, command).await
-        }
-        _ => Err(format!("unknown method: {method}")),
-    }
-}
-
-async fn forward_events(
-    mut rx: broadcast::Receiver<DaemonEvent>,
-    out_tx_events: mpsc::UnboundedSender<String>,
-) {
-    loop {
-        let event = match rx.recv().await {
-            Ok(event) => event,
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => break,
+    async fn insert_workspace(state: &DaemonState, workspace_id: &str, workspace_path: &str) {
+        let entry = WorkspaceEntry {
+            id: workspace_id.to_string(),
+            name: "Workspace".to_string(),
+            path: workspace_path.to_string(),
+            codex_bin: None,
+            kind: WorkspaceKind::Main,
+            parent_id: None,
+            worktree: None,
+            settings: WorkspaceSettings {
+                codex_home: Some(format!("{workspace_path}/.codex-home")),
+                ..WorkspaceSettings::default()
+            },
         };
-
-        let Some(payload) = build_event_notification(event) else {
-            continue;
-        };
-
-        if out_tx_events.send(payload).is_err() {
-            break;
-        }
-    }
-}
-
-async fn handle_client(
-    socket: TcpStream,
-    config: Arc<DaemonConfig>,
-    state: Arc<DaemonState>,
-    events: broadcast::Sender<DaemonEvent>,
-) {
-    let (reader, mut writer) = socket.into_split();
-    let mut lines = BufReader::new(reader).lines();
-
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-    let write_task = tokio::spawn(async move {
-        while let Some(message) = out_rx.recv().await {
-            if writer.write_all(message.as_bytes()).await.is_err() {
-                break;
-            }
-            if writer.write_all(b"\n").await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let mut authenticated = config.token.is_none();
-    let mut events_task: Option<tokio::task::JoinHandle<()>> = None;
-
-    if authenticated {
-        let rx = events.subscribe();
-        let out_tx_events = out_tx.clone();
-        events_task = Some(tokio::spawn(forward_events(rx, out_tx_events)));
+        state
+            .workspaces
+            .lock()
+            .await
+            .insert(workspace_id.to_string(), entry);
     }
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+    #[test]
+    fn rpc_add_clone_uses_workspace_core_validation() {
+        run_async_test(async {
+            let tmp = make_temp_dir("rpc-add-clone");
+            let state = test_state(&tmp);
 
-        let message: Value = match serde_json::from_str(line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
+            let err = rpc::handle_rpc_request(
+                &state,
+                "add_clone",
+                json!({
+                    "sourceWorkspaceId": "source",
+                    "copiesFolder": tmp.to_string_lossy().to_string(),
+                    "copyName": "   "
+                }),
+                "daemon-test".to_string(),
+            )
+            .await
+            .expect_err("expected validation error");
 
-        let id = message.get("id").and_then(|value| value.as_u64());
-        let method = message
-            .get("method")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_string();
-        let params = message.get("params").cloned().unwrap_or(Value::Null);
-
-        if !authenticated {
-            if method != "auth" {
-                if let Some(response) = build_error_response(id, "unauthorized") {
-                    let _ = out_tx.send(response);
-                }
-                continue;
-            }
-
-            let expected = config.token.clone().unwrap_or_default();
-            let provided = parse_auth_token(&params).unwrap_or_default();
-            if expected != provided {
-                if let Some(response) = build_error_response(id, "invalid token") {
-                    let _ = out_tx.send(response);
-                }
-                continue;
-            }
-
-            authenticated = true;
-            if let Some(response) = build_result_response(id, json!({ "ok": true })) {
-                let _ = out_tx.send(response);
-            }
-
-            let rx = events.subscribe();
-            let out_tx_events = out_tx.clone();
-            events_task = Some(tokio::spawn(forward_events(rx, out_tx_events)));
-
-            continue;
-        }
-
-        let client_version = format!("daemon-{}", env!("CARGO_PKG_VERSION"));
-        let result = handle_rpc_request(&state, &method, params, client_version).await;
-        let response = match result {
-            Ok(result) => build_result_response(id, result),
-            Err(message) => build_error_response(id, &message),
-        };
-        if let Some(response) = response {
-            let _ = out_tx.send(response);
-        }
+            assert_eq!(err, "Copy name is required.");
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
     }
 
-    drop(out_tx);
-    if let Some(task) = events_task {
-        task.abort();
+    #[test]
+    fn rpc_prompts_list_reads_workspace_prompts() {
+        run_async_test(async {
+            let tmp = make_temp_dir("rpc-prompts-list");
+            let workspace_id = "ws-prompts";
+            let workspace_dir = tmp.join("workspace");
+            std::fs::create_dir_all(&workspace_dir).expect("create workspace dir");
+
+            let state = test_state(&tmp);
+            insert_workspace(&state, workspace_id, &workspace_dir.to_string_lossy()).await;
+
+            let prompts_dir = tmp.join("workspaces").join(workspace_id).join("prompts");
+            std::fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+            std::fs::write(prompts_dir.join("review.md"), "Prompt body").expect("write prompt");
+
+            let result = rpc::handle_rpc_request(
+                &state,
+                "prompts_list",
+                json!({ "workspaceId": workspace_id }),
+                "daemon-test".to_string(),
+            )
+            .await
+            .expect("prompts_list should succeed");
+
+            let prompts = result.as_array().expect("array result");
+            assert!(
+                prompts.iter().any(|entry| {
+                    entry
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name == "review")
+                }),
+                "expected prompts_list to include workspace prompt"
+            );
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
     }
-    write_task.abort();
+
+    #[test]
+    fn rpc_local_usage_snapshot_returns_snapshot_shape() {
+        run_async_test(async {
+            let tmp = make_temp_dir("rpc-local-usage");
+            let state = test_state(&tmp);
+
+            let result = rpc::handle_rpc_request(
+                &state,
+                "local_usage_snapshot",
+                json!({ "days": 7 }),
+                "daemon-test".to_string(),
+            )
+            .await
+            .expect("local_usage_snapshot should succeed");
+
+            assert!(result.get("days").and_then(Value::as_array).is_some());
+            assert!(result.get("totals").is_some());
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn rpc_daemon_info_reports_identity() {
+        run_async_test(async {
+            let tmp = make_temp_dir("rpc-daemon-info");
+            let state = test_state(&tmp);
+
+            let result = rpc::handle_rpc_request(
+                &state,
+                "daemon_info",
+                json!({}),
+                "daemon-test".to_string(),
+            )
+            .await
+            .expect("daemon_info should succeed");
+
+            assert_eq!(
+                result.get("name").and_then(Value::as_str),
+                Some(DAEMON_NAME)
+            );
+            assert_eq!(result.get("mode").and_then(Value::as_str), Some("tcp"));
+            assert_eq!(
+                result.get("version").and_then(Value::as_str),
+                Some(env!("CARGO_PKG_VERSION"))
+            );
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
 }
 
 fn main() {
@@ -2106,9 +1686,26 @@ fn main() {
         let state = Arc::new(DaemonState::load(&config, event_sink));
         let config = Arc::new(config);
 
-        let listener = TcpListener::bind(config.listen)
-            .await
-            .unwrap_or_else(|err| panic!("failed to bind {}: {err}", config.listen));
+        if config.orbit_url.is_some() {
+            eprintln!(
+                "codex-monitor-daemon orbit mode (data dir: {})",
+                state
+                    .storage_path
+                    .parent()
+                    .unwrap_or(&state.storage_path)
+                    .display()
+            );
+            transport::run_orbit_mode(config, state, events_tx).await;
+            return;
+        }
+
+        let listener = match TcpListener::bind(config.listen).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                eprintln!("failed to bind {}: {err}", config.listen);
+                std::process::exit(2);
+            }
+        };
         eprintln!(
             "codex-monitor-daemon listening on {} (data dir: {})",
             config.listen,
@@ -2126,7 +1723,7 @@ fn main() {
                     let state = Arc::clone(&state);
                     let events = events_tx.clone();
                     tokio::spawn(async move {
-                        handle_client(socket, config, state, events).await;
+                        transport::handle_client(socket, config, state, events).await;
                     });
                 }
                 Err(_) => continue,

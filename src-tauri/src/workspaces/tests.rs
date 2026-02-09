@@ -1,12 +1,20 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::settings::{apply_workspace_settings_update, sort_workspaces};
 use super::worktree::{
     build_clone_destination_path, sanitize_clone_dir_name, sanitize_worktree_name,
 };
+use crate::backend::app_server::WorkspaceSession;
+use crate::shared::workspaces_core::rename_worktree_core;
 use crate::storage::{read_workspaces, write_workspaces};
-use crate::types::{WorktreeInfo, WorkspaceEntry, WorkspaceInfo, WorkspaceKind, WorkspaceSettings};
+use crate::types::{
+    AppSettings, WorkspaceEntry, WorkspaceInfo, WorkspaceKind, WorkspaceSettings, WorktreeInfo,
+};
+use tokio::runtime::Runtime;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 fn workspace(name: &str, sort_order: Option<u32>) -> WorkspaceInfo {
@@ -46,13 +54,23 @@ fn workspace_with_id_and_kind(
             codex_home: None,
             codex_args: None,
             launch_script: None,
+            launch_scripts: None,
+            worktree_setup_script: None,
         },
     }
 }
 
+fn run_async<F: Future<Output = ()>>(future: F) {
+    let runtime = Runtime::new().expect("create runtime");
+    runtime.block_on(future);
+}
+
 #[test]
 fn sanitize_worktree_name_rewrites_specials() {
-    assert_eq!(sanitize_worktree_name("feature/new-thing"), "feature-new-thing");
+    assert_eq!(
+        sanitize_worktree_name("feature/new-thing"),
+        "feature-new-thing"
+    );
     assert_eq!(sanitize_worktree_name("///"), "worktree");
     assert_eq!(sanitize_worktree_name("--branch--"), "branch");
 }
@@ -65,7 +83,10 @@ fn sanitize_worktree_name_allows_safe_chars() {
 
 #[test]
 fn sanitize_clone_dir_name_rewrites_specials() {
-    assert_eq!(sanitize_clone_dir_name("feature/new-thing"), "feature-new-thing");
+    assert_eq!(
+        sanitize_clone_dir_name("feature/new-thing"),
+        "feature-new-thing"
+    );
     assert_eq!(sanitize_clone_dir_name("///"), "copy");
     assert_eq!(sanitize_clone_dir_name("--name--"), "name");
 }
@@ -196,6 +217,7 @@ fn update_workspace_settings_persists_sort_and_group() {
     settings.sidebar_collapsed = true;
     settings.git_root = Some("/tmp".to_string());
     settings.launch_script = Some("npm run dev".to_string());
+    settings.worktree_setup_script = Some("pnpm install".to_string());
 
     let updated =
         apply_workspace_settings_update(&mut workspaces, &id, settings.clone()).expect("update");
@@ -203,7 +225,14 @@ fn update_workspace_settings_persists_sort_and_group() {
     assert_eq!(updated.settings.group_id.as_deref(), Some("group-1"));
     assert!(updated.settings.sidebar_collapsed);
     assert_eq!(updated.settings.git_root.as_deref(), Some("/tmp"));
-    assert_eq!(updated.settings.launch_script.as_deref(), Some("npm run dev"));
+    assert_eq!(
+        updated.settings.launch_script.as_deref(),
+        Some("npm run dev")
+    );
+    assert_eq!(
+        updated.settings.worktree_setup_script.as_deref(),
+        Some("pnpm install"),
+    );
 
     let temp_dir = std::env::temp_dir().join(format!("codex-monitor-test-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).expect("create temp dir");
@@ -217,5 +246,151 @@ fn update_workspace_settings_persists_sort_and_group() {
     assert_eq!(stored.settings.group_id.as_deref(), Some("group-1"));
     assert!(stored.settings.sidebar_collapsed);
     assert_eq!(stored.settings.git_root.as_deref(), Some("/tmp"));
-    assert_eq!(stored.settings.launch_script.as_deref(), Some("npm run dev"));
+    assert_eq!(
+        stored.settings.launch_script.as_deref(),
+        Some("npm run dev")
+    );
+    assert_eq!(
+        stored.settings.worktree_setup_script.as_deref(),
+        Some("pnpm install"),
+    );
+}
+
+#[test]
+fn rename_worktree_preserves_custom_name() {
+    run_async(async {
+        let temp_dir = std::env::temp_dir().join(format!("codex-monitor-test-{}", Uuid::new_v4()));
+        let repo_path = temp_dir.join("repo");
+        std::fs::create_dir_all(&repo_path).expect("create repo path");
+        let worktree_path = temp_dir.join("worktrees").join("parent").join("old");
+        std::fs::create_dir_all(&worktree_path).expect("create worktree path");
+
+        let parent = WorkspaceEntry {
+            id: "parent".to_string(),
+            name: "Parent".to_string(),
+            path: repo_path.to_string_lossy().to_string(),
+            codex_bin: None,
+            kind: WorkspaceKind::Main,
+            parent_id: None,
+            worktree: None,
+            settings: WorkspaceSettings::default(),
+        };
+        let worktree = WorkspaceEntry {
+            id: "wt-1".to_string(),
+            name: "Custom label".to_string(),
+            path: worktree_path.to_string_lossy().to_string(),
+            codex_bin: None,
+            kind: WorkspaceKind::Worktree,
+            parent_id: Some(parent.id.clone()),
+            worktree: Some(WorktreeInfo {
+                branch: "feature/old".to_string(),
+            }),
+            settings: WorkspaceSettings::default(),
+        };
+        let workspaces = Mutex::new(HashMap::from([
+            (parent.id.clone(), parent.clone()),
+            (worktree.id.clone(), worktree.clone()),
+        ]));
+        let sessions: Mutex<HashMap<String, Arc<WorkspaceSession>>> = Mutex::new(HashMap::new());
+        let app_settings = Mutex::new(AppSettings::default());
+        let storage_path = temp_dir.join("workspaces.json");
+
+        let updated = rename_worktree_core(
+            worktree.id.clone(),
+            "feature/new".to_string(),
+            &temp_dir,
+            &workspaces,
+            &sessions,
+            &app_settings,
+            &storage_path,
+            |_| Ok(repo_path.clone()),
+            |_root, branch| {
+                let branch = branch.to_string();
+                async move { Ok(branch) }
+            },
+            |value| sanitize_worktree_name(value),
+            |_, _, current| Ok(current.to_path_buf()),
+            |_root, _args| async move { Ok(()) },
+            |_entry, _default_bin, _codex_args, _codex_home| async move {
+                Err("spawn not expected".to_string())
+            },
+        )
+        .await
+        .expect("rename worktree");
+
+        assert_eq!(updated.name, "Custom label");
+        assert_eq!(
+            updated
+                .worktree
+                .as_ref()
+                .map(|worktree| worktree.branch.as_str()),
+            Some("feature/new")
+        );
+    });
+}
+
+#[test]
+fn rename_worktree_updates_name_when_unmodified() {
+    run_async(async {
+        let temp_dir = std::env::temp_dir().join(format!("codex-monitor-test-{}", Uuid::new_v4()));
+        let repo_path = temp_dir.join("repo");
+        std::fs::create_dir_all(&repo_path).expect("create repo path");
+        let worktree_path = temp_dir.join("worktrees").join("parent").join("old");
+        std::fs::create_dir_all(&worktree_path).expect("create worktree path");
+
+        let parent = WorkspaceEntry {
+            id: "parent".to_string(),
+            name: "Parent".to_string(),
+            path: repo_path.to_string_lossy().to_string(),
+            codex_bin: None,
+            kind: WorkspaceKind::Main,
+            parent_id: None,
+            worktree: None,
+            settings: WorkspaceSettings::default(),
+        };
+        let worktree = WorkspaceEntry {
+            id: "wt-2".to_string(),
+            name: "feature/old".to_string(),
+            path: worktree_path.to_string_lossy().to_string(),
+            codex_bin: None,
+            kind: WorkspaceKind::Worktree,
+            parent_id: Some(parent.id.clone()),
+            worktree: Some(WorktreeInfo {
+                branch: "feature/old".to_string(),
+            }),
+            settings: WorkspaceSettings::default(),
+        };
+        let workspaces = Mutex::new(HashMap::from([
+            (parent.id.clone(), parent.clone()),
+            (worktree.id.clone(), worktree.clone()),
+        ]));
+        let sessions: Mutex<HashMap<String, Arc<WorkspaceSession>>> = Mutex::new(HashMap::new());
+        let app_settings = Mutex::new(AppSettings::default());
+        let storage_path = temp_dir.join("workspaces.json");
+
+        let updated = rename_worktree_core(
+            worktree.id.clone(),
+            "feature/new".to_string(),
+            &temp_dir,
+            &workspaces,
+            &sessions,
+            &app_settings,
+            &storage_path,
+            |_| Ok(repo_path.clone()),
+            |_root, branch| {
+                let branch = branch.to_string();
+                async move { Ok(branch) }
+            },
+            |value| sanitize_worktree_name(value),
+            |_, _, current| Ok(current.to_path_buf()),
+            |_root, _args| async move { Ok(()) },
+            |_entry, _default_bin, _codex_args, _codex_home| async move {
+                Err("spawn not expected".to_string())
+            },
+        )
+        .await
+        .expect("rename worktree");
+
+        assert_eq!(updated.name, "feature/new");
+    });
 }

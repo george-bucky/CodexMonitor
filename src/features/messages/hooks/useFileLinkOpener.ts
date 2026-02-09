@@ -4,8 +4,15 @@ import { Menu, MenuItem, PredefinedMenuItem } from "@tauri-apps/api/menu";
 import { LogicalPosition } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import * as Sentry from "@sentry/react";
 import { openWorkspaceIn } from "../../../services/tauri";
+import { pushErrorToast } from "../../../services/toasts";
 import type { OpenAppTarget } from "../../../types";
+import {
+  isAbsolutePath,
+  joinWorkspacePath,
+  revealInFileManagerLabel,
+} from "../../../utils/platformPaths";
 
 type OpenTarget = {
   id: string;
@@ -25,16 +32,27 @@ const DEFAULT_OPEN_TARGET: OpenTarget = {
   args: [],
 };
 
+const resolveAppName = (target: OpenTarget) => (target.appName ?? "").trim();
+const resolveCommand = (target: OpenTarget) => (target.command ?? "").trim();
+const canOpenTarget = (target: OpenTarget) => {
+  if (target.kind === "finder") {
+    return true;
+  }
+  if (target.kind === "command") {
+    return Boolean(resolveCommand(target));
+  }
+  return Boolean(resolveAppName(target));
+};
+
 function resolveFilePath(path: string, workspacePath?: string | null) {
   const trimmed = path.trim();
   if (!workspacePath) {
     return trimmed;
   }
-  if (trimmed.startsWith("/") || trimmed.startsWith("~/")) {
+  if (isAbsolutePath(trimmed)) {
     return trimmed;
   }
-  const base = workspacePath.replace(/\/+$/, "");
-  return `${base}/${trimmed}`;
+  return joinWorkspacePath(workspacePath, trimmed);
 }
 
 function stripLineSuffix(path: string) {
@@ -42,25 +60,32 @@ function stripLineSuffix(path: string) {
   return match ? match[1] : path;
 }
 
-function revealLabel() {
-  const platform =
-    (navigator as Navigator & { userAgentData?: { platform?: string } })
-      .userAgentData?.platform ?? navigator.platform ?? "";
-  const normalized = platform.toLowerCase();
-  if (normalized.includes("mac")) {
-    return "Reveal in Finder";
-  }
-  if (normalized.includes("win")) {
-    return "Show in Explorer";
-  }
-  return "Reveal in File Manager";
-}
-
 export function useFileLinkOpener(
   workspacePath: string | null,
   openTargets: OpenAppTarget[],
   selectedOpenAppId: string,
 ) {
+  const reportOpenError = useCallback(
+    (error: unknown, context: Record<string, string | null>) => {
+      const message = error instanceof Error ? error.message : String(error);
+      Sentry.captureException(
+        error instanceof Error ? error : new Error(message),
+        {
+          tags: {
+            feature: "file-link-open",
+          },
+          extra: context,
+        },
+      );
+      pushErrorToast({
+        title: "Couldn’t open file",
+        message,
+      });
+      console.warn("Failed to open file link", { message, ...context });
+    },
+    [],
+  );
+
   const openFileLink = useCallback(
     async (rawPath: string) => {
       const target = {
@@ -70,32 +95,48 @@ export function useFileLinkOpener(
       };
       const resolvedPath = resolveFilePath(stripLineSuffix(rawPath), workspacePath);
 
-      if (target.kind === "finder") {
-        await revealItemInDir(resolvedPath);
-        return;
-      }
+      try {
+        if (!canOpenTarget(target)) {
+          return;
+        }
+        if (target.kind === "finder") {
+          await revealItemInDir(resolvedPath);
+          return;
+        }
 
-      if (target.kind === "command") {
-        if (!target.command) {
+        if (target.kind === "command") {
+          const command = resolveCommand(target);
+          if (!command) {
+            return;
+          }
+          await openWorkspaceIn(resolvedPath, {
+            command,
+            args: target.args,
+          });
+          return;
+        }
+
+        const appName = resolveAppName(target);
+        if (!appName) {
           return;
         }
         await openWorkspaceIn(resolvedPath, {
-          command: target.command,
+          appName,
           args: target.args,
         });
-        return;
+      } catch (error) {
+        reportOpenError(error, {
+          rawPath,
+          resolvedPath,
+          workspacePath,
+          targetId: target.id,
+          targetKind: target.kind,
+          targetAppName: target.appName ?? null,
+          targetCommand: target.command ?? null,
+        });
       }
-
-      const appName = (target.appName || target.label || "").trim();
-      if (!appName) {
-        return;
-      }
-      await openWorkspaceIn(resolvedPath, {
-        appName,
-        args: target.args,
-      });
     },
-    [openTargets, selectedOpenAppId, workspacePath],
+    [openTargets, reportOpenError, selectedOpenAppId, workspacePath],
   );
 
   const showFileLinkMenu = useCallback(
@@ -108,18 +149,23 @@ export function useFileLinkOpener(
           openTargets[0]),
       };
       const resolvedPath = resolveFilePath(stripLineSuffix(rawPath), workspacePath);
-      const appName = (target.appName || target.label || "").trim();
+      const appName = resolveAppName(target);
+      const command = resolveCommand(target);
+      const canOpen = canOpenTarget(target);
       const openLabel =
         target.kind === "finder"
-          ? revealLabel()
+          ? revealInFileManagerLabel()
           : target.kind === "command"
-            ? `Open in ${target.label}`
+            ? command
+              ? `Open in ${target.label}`
+              : "Set command in Settings"
             : appName
               ? `Open in ${appName}`
-              : "Open Link";
+              : "Set app name in Settings";
       const items = [
         await MenuItem.new({
           text: openLabel,
+          enabled: canOpen,
           action: async () => {
             await openFileLink(rawPath);
           },
@@ -128,9 +174,21 @@ export function useFileLinkOpener(
           ? []
           : [
               await MenuItem.new({
-                text: revealLabel(),
+                text: revealInFileManagerLabel(),
                 action: async () => {
-                  await revealItemInDir(resolvedPath);
+                  try {
+                    await revealItemInDir(resolvedPath);
+                  } catch (error) {
+                    reportOpenError(error, {
+                      rawPath,
+                      resolvedPath,
+                      workspacePath,
+                      targetId: target.id,
+                      targetKind: "finder",
+                      targetAppName: null,
+                      targetCommand: null,
+                    });
+                  }
                 },
               }),
             ]),
@@ -159,7 +217,7 @@ export function useFileLinkOpener(
       const position = new LogicalPosition(event.clientX, event.clientY);
       await menu.popup(position, window);
     },
-    [openFileLink, openTargets, selectedOpenAppId, workspacePath],
+    [openFileLink, openTargets, reportOpenError, selectedOpenAppId, workspacePath],
   );
 
   return { openFileLink, showFileLinkMenu };

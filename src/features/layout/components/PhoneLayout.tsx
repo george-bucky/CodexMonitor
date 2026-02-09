@@ -4,9 +4,11 @@ import { MainTopbar } from "../../app/components/MainTopbar";
 type PhoneLayoutProps = {
   approvalToastsNode: ReactNode;
   updateToastNode: ReactNode;
+  errorToastsNode: ReactNode;
   tabBarNode: ReactNode;
+  homeNode: ReactNode;
   sidebarNode: ReactNode;
-  activeTab: "projects" | "codex" | "git" | "log";
+  activeTab: "home" | "projects" | "codex" | "git" | "log";
   activeWorkspace: boolean;
   showGitDetail: boolean;
   compactEmptyCodexNode: ReactNode;
@@ -23,7 +25,9 @@ type PhoneLayoutProps = {
 export function PhoneLayout({
   approvalToastsNode,
   updateToastNode,
+  errorToastsNode,
   tabBarNode,
+  homeNode,
   sidebarNode,
   activeTab,
   activeWorkspace,
@@ -42,6 +46,8 @@ export function PhoneLayout({
     <div className="compact-shell">
       {approvalToastsNode}
       {updateToastNode}
+      {errorToastsNode}
+      {activeTab === "home" && <div className="compact-panel">{homeNode}</div>}
       {activeTab === "projects" && <div className="compact-panel">{sidebarNode}</div>}
       {activeTab === "codex" && (
         <div className="compact-panel">
@@ -68,6 +74,7 @@ export function PhoneLayout({
           {activeWorkspace && !showGitDetail && (
             <>
               <MainTopbar leftNode={topbarLeftNode} className="compact-topbar" />
+              {compactGitBackNode}
               <div className="compact-git">
                 <div className="compact-git-list">{gitDiffPanelNode}</div>
               </div>

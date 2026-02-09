@@ -1,12 +1,20 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Check from "lucide-react/dist/esm/icons/check";
 import Copy from "lucide-react/dist/esm/icons/copy";
 import Terminal from "lucide-react/dist/esm/icons/terminal";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { BranchInfo, OpenAppTarget, WorkspaceInfo } from "../../../types";
 import type { ReactNode } from "react";
+import { revealInFileManagerLabel } from "../../../utils/platformPaths";
+import { BranchList } from "../../git/components/BranchList";
+import { filterBranches, findExactBranch } from "../../git/utils/branchSearch";
+import { validateBranchName } from "../../git/utils/branchValidation";
+import { PopoverSurface } from "../../design-system/components/popover/PopoverPrimitives";
 import { OpenAppMenu } from "./OpenAppMenu";
 import { LaunchScriptButton } from "./LaunchScriptButton";
+import { LaunchScriptEntryButton } from "./LaunchScriptEntryButton";
+import type { WorkspaceLaunchScriptsState } from "../hooks/useWorkspaceLaunchScripts";
+import { useDismissibleMenu } from "../hooks/useDismissibleMenu";
 
 type MainHeaderProps = {
   workspace: WorkspaceInfo;
@@ -28,6 +36,7 @@ type MainHeaderProps = {
   onToggleTerminal: () => void;
   isTerminalOpen: boolean;
   showTerminalButton?: boolean;
+  showWorkspaceTools?: boolean;
   extraActionsNode?: ReactNode;
   launchScript?: string | null;
   launchScriptEditorOpen?: boolean;
@@ -39,6 +48,7 @@ type MainHeaderProps = {
   onCloseLaunchScriptEditor?: () => void;
   onLaunchScriptDraftChange?: (value: string) => void;
   onSaveLaunchScript?: () => void;
+  launchScriptsState?: WorkspaceLaunchScriptsState;
   worktreeRename?: {
     name: string;
     error: string | null;
@@ -79,6 +89,7 @@ export function MainHeader({
   onToggleTerminal,
   isTerminalOpen,
   showTerminalButton = true,
+  showWorkspaceTools = true,
   extraActionsNode,
   launchScript = null,
   launchScriptEditorOpen = false,
@@ -90,6 +101,7 @@ export function MainHeader({
   onCloseLaunchScriptEditor,
   onLaunchScriptDraftChange,
   onSaveLaunchScript,
+  launchScriptsState,
   worktreeRename,
 }: MainHeaderProps) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -104,77 +116,49 @@ export function MainHeader({
   const renameConfirmRef = useRef<HTMLButtonElement | null>(null);
   const renameOnCancel = worktreeRename?.onCancel;
 
-  const recentBranches = branches;
   const trimmedQuery = branchQuery.trim();
-  const lowercaseQuery = trimmedQuery.toLowerCase();
-  const filteredBranches =
-    trimmedQuery.length > 0
-      ? recentBranches.filter((branch) =>
-          branch.name.toLowerCase().includes(lowercaseQuery),
-        )
-      : recentBranches.slice(0, 12);
-  const exactMatch = trimmedQuery
-    ? recentBranches.find((branch) => branch.name === trimmedQuery) ?? null
-    : null;
+  const filteredBranches = useMemo(
+    () => filterBranches(branches, branchQuery, { mode: "includes", whenEmptyLimit: 12 }),
+    [branches, branchQuery],
+  );
+  const exactMatch = useMemo(
+    () => findExactBranch(branches, trimmedQuery),
+    [branches, trimmedQuery],
+  );
   const canCreate = trimmedQuery.length > 0 && !exactMatch;
-  const branchValidationMessage = (() => {
-    if (trimmedQuery.length === 0) {
-      return null;
-    }
-    if (trimmedQuery === "." || trimmedQuery === "..") {
-      return "Branch name cannot be '.' or '..'.";
-    }
-    if (/\s/.test(trimmedQuery)) {
-      return "Branch name cannot contain spaces.";
-    }
-    if (trimmedQuery.startsWith("/") || trimmedQuery.endsWith("/")) {
-      return "Branch name cannot start or end with '/'.";
-    }
-    if (trimmedQuery.endsWith(".lock")) {
-      return "Branch name cannot end with '.lock'.";
-    }
-    if (trimmedQuery.includes("..")) {
-      return "Branch name cannot contain '..'.";
-    }
-    if (trimmedQuery.includes("@{")) {
-      return "Branch name cannot contain '@{'.";
-    }
-    const invalidChars = ["~", "^", ":", "?", "*", "[", "\\"];
-    if (invalidChars.some((char) => trimmedQuery.includes(char))) {
-      return "Branch name contains invalid characters.";
-    }
-    if (trimmedQuery.endsWith(".")) {
-      return "Branch name cannot end with '.'.";
-    }
-    return null;
-  })();
+  const branchValidationMessage = useMemo(
+    () => validateBranchName(trimmedQuery),
+    [trimmedQuery],
+  );
   const resolvedWorktreePath = worktreePath ?? workspace.path;
-  const relativeWorktreePath =
-    parentPath && resolvedWorktreePath.startsWith(`${parentPath}/`)
+  const relativeWorktreePath = useMemo(() => {
+    if (!parentPath) {
+      return resolvedWorktreePath;
+    }
+    return resolvedWorktreePath.startsWith(`${parentPath}/`)
       ? resolvedWorktreePath.slice(parentPath.length + 1)
       : resolvedWorktreePath;
-  const cdCommand = `cd "${relativeWorktreePath}"`;
+  }, [parentPath, resolvedWorktreePath]);
+  const cdCommand = useMemo(
+    () => `cd "${relativeWorktreePath}"`,
+    [relativeWorktreePath],
+  );
 
-  useEffect(() => {
-    if (!menuOpen && !infoOpen) {
-      return;
-    }
-    const handleClick = (event: MouseEvent) => {
-      const target = event.target as Node;
-      const menuContains = menuRef.current?.contains(target) ?? false;
-      const infoContains = infoRef.current?.contains(target) ?? false;
-      if (!menuContains && !infoContains) {
-        setMenuOpen(false);
-        setInfoOpen(false);
-        setBranchQuery("");
-        setError(null);
-      }
-    };
-    window.addEventListener("mousedown", handleClick);
-    return () => {
-      window.removeEventListener("mousedown", handleClick);
-    };
-  }, [infoOpen, menuOpen]);
+  useDismissibleMenu({
+    isOpen: menuOpen,
+    containerRef: menuRef,
+    onClose: () => {
+      setMenuOpen(false);
+      setBranchQuery("");
+      setError(null);
+    },
+  });
+
+  useDismissibleMenu({
+    isOpen: infoOpen,
+    containerRef: infoRef,
+    onClose: () => setInfoOpen(false),
+  });
 
   useEffect(() => {
     if (!infoOpen && renameOnCancel) {
@@ -232,7 +216,7 @@ export function MainHeader({
                 {worktreeLabel || branchName}
               </button>
               {infoOpen && (
-                <div className="worktree-info-popover popover-surface" role="dialog">
+                <PopoverSurface className="worktree-info-popover" role="dialog">
                   {worktreeRename && (
                     <div className="worktree-info-rename">
                       <span className="worktree-info-label">Name</span>
@@ -358,10 +342,10 @@ export function MainHeader({
                       }}
                       data-tauri-drag-region="false"
                     >
-                      Reveal in Finder
+                      {revealInFileManagerLabel()}
                     </button>
                   </div>
-                </div>
+                </PopoverSurface>
               )}
             </div>
           ) : (
@@ -380,8 +364,8 @@ export function MainHeader({
                 </span>
               </button>
               {menuOpen && (
-                <div
-                  className="workspace-branch-dropdown popover-surface"
+                <PopoverSurface
+                  className="workspace-branch-dropdown"
                   role="menu"
                   data-tauri-drag-region="false"
                 >
@@ -474,72 +458,101 @@ export function MainHeader({
                       </div>
                     )}
                   </div>
-                  <div className="branch-list" role="none">
-                    {filteredBranches.map((branch) => (
-                      <button
-                        key={branch.name}
-                        type="button"
-                        className={`branch-item${
-                          branch.name === branchName ? " is-active" : ""
-                        }`}
-                        onClick={async () => {
-                          if (branch.name === branchName) {
-                            return;
-                          }
-                          try {
-                            await onCheckoutBranch(branch.name);
-                            setMenuOpen(false);
-                            setBranchQuery("");
-                            setError(null);
-                          } catch (err) {
-                            setError(
-                              err instanceof Error ? err.message : String(err),
-                            );
-                          }
-                        }}
-                        role="menuitem"
-                        data-tauri-drag-region="false"
-                      >
-                        {branch.name}
-                      </button>
-                    ))}
-                    {filteredBranches.length === 0 && (
-                      <div className="branch-empty">No branches found</div>
-                    )}
-                  </div>
+                  <BranchList
+                    branches={filteredBranches}
+                    currentBranch={branchName}
+                    listClassName="branch-list"
+                    listRole="none"
+                    itemClassName="branch-item"
+                    currentItemClassName="is-active"
+                    itemRole="menuitem"
+                    itemDataTauriDragRegion="false"
+                    emptyClassName="branch-empty"
+                    emptyText="No branches found"
+                    onSelect={async (branch) => {
+                      if (branch.name === branchName) {
+                        return;
+                      }
+                      try {
+                        await onCheckoutBranch(branch.name);
+                        setMenuOpen(false);
+                        setBranchQuery("");
+                        setError(null);
+                      } catch (err) {
+                        setError(err instanceof Error ? err.message : String(err));
+                      }
+                    }}
+                  />
                   {error && <div className="branch-error">{error}</div>}
-                </div>
+                </PopoverSurface>
               )}
             </div>
           )}
         </div>
       </div>
       <div className="main-header-actions">
-        {onRunLaunchScript &&
+        {showWorkspaceTools &&
+          onRunLaunchScript &&
           onOpenLaunchScriptEditor &&
           onCloseLaunchScriptEditor &&
           onLaunchScriptDraftChange &&
           onSaveLaunchScript && (
-            <LaunchScriptButton
-              launchScript={launchScript}
-              editorOpen={launchScriptEditorOpen}
-              draftScript={launchScriptDraft}
-              isSaving={launchScriptSaving}
-              error={launchScriptError}
-              onRun={onRunLaunchScript}
-              onOpenEditor={onOpenLaunchScriptEditor}
-              onCloseEditor={onCloseLaunchScriptEditor}
-              onDraftChange={onLaunchScriptDraftChange}
-              onSave={onSaveLaunchScript}
-            />
+            <div className="launch-script-cluster">
+              <LaunchScriptButton
+                launchScript={launchScript}
+                editorOpen={launchScriptEditorOpen}
+                draftScript={launchScriptDraft}
+                isSaving={launchScriptSaving}
+                error={launchScriptError}
+                onRun={onRunLaunchScript}
+                onOpenEditor={onOpenLaunchScriptEditor}
+                onCloseEditor={onCloseLaunchScriptEditor}
+                onDraftChange={onLaunchScriptDraftChange}
+                onSave={onSaveLaunchScript}
+                showNew={Boolean(launchScriptsState)}
+                newEditorOpen={launchScriptsState?.newEditorOpen}
+                newDraftScript={launchScriptsState?.newDraftScript}
+                newDraftIcon={launchScriptsState?.newDraftIcon}
+                newDraftLabel={launchScriptsState?.newDraftLabel}
+                newError={launchScriptsState?.newError ?? null}
+                onOpenNew={launchScriptsState?.onOpenNew}
+                onCloseNew={launchScriptsState?.onCloseNew}
+                onNewDraftChange={launchScriptsState?.onNewDraftScriptChange}
+                onNewDraftIconChange={launchScriptsState?.onNewDraftIconChange}
+                onNewDraftLabelChange={launchScriptsState?.onNewDraftLabelChange}
+                onCreateNew={launchScriptsState?.onCreateNew}
+              />
+              {launchScriptsState?.launchScripts.map((entry) => (
+                <LaunchScriptEntryButton
+                  key={entry.id}
+                  entry={entry}
+                  editorOpen={launchScriptsState.editorOpenId === entry.id}
+                  draftScript={launchScriptsState.draftScript}
+                  draftIcon={launchScriptsState.draftIcon}
+                  draftLabel={launchScriptsState.draftLabel}
+                  isSaving={launchScriptsState.isSaving}
+                  error={launchScriptsState.errorById[entry.id] ?? null}
+                  onRun={() => launchScriptsState.onRunScript(entry.id)}
+                  onOpenEditor={() => launchScriptsState.onOpenEditor(entry.id)}
+                  onCloseEditor={launchScriptsState.onCloseEditor}
+                  onDraftChange={launchScriptsState.onDraftScriptChange}
+                  onDraftIconChange={launchScriptsState.onDraftIconChange}
+                  onDraftLabelChange={launchScriptsState.onDraftLabelChange}
+                  onSave={launchScriptsState.onSaveScript}
+                  onDelete={launchScriptsState.onDeleteScript}
+                />
+              ))}
+            </div>
           )}
-        <OpenAppMenu
-          path={resolvedWorktreePath}
-          openTargets={openTargets}
-          selectedOpenAppId={selectedOpenAppId}
-          onSelectOpenAppId={onSelectOpenAppId}
-          iconById={openAppIconById}
-        />
+        {showWorkspaceTools ? (
+          <OpenAppMenu
+            path={resolvedWorktreePath}
+            openTargets={openTargets}
+            selectedOpenAppId={selectedOpenAppId}
+            onSelectOpenAppId={onSelectOpenAppId}
+            iconById={openAppIconById}
+          />
+        ) : null}
         {showTerminalButton && (
           <button
             type="button"

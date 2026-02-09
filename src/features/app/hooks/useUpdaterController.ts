@@ -1,26 +1,37 @@
 import { useCallback, useRef } from "react";
 import { useUpdater } from "../../update/hooks/useUpdater";
 import { useAgentSoundNotifications } from "../../notifications/hooks/useAgentSoundNotifications";
+import { useAgentSystemNotifications } from "../../notifications/hooks/useAgentSystemNotifications";
 import { useWindowFocusState } from "../../layout/hooks/useWindowFocusState";
 import { useTauriEvent } from "./useTauriEvent";
 import { playNotificationSound } from "../../../utils/notificationSounds";
 import { subscribeUpdaterCheck } from "../../../services/events";
+import { sendNotification } from "../../../services/tauri";
 import type { DebugEntry } from "../../../types";
 
 type Params = {
+  enabled?: boolean;
   notificationSoundsEnabled: boolean;
+  systemNotificationsEnabled: boolean;
+  getWorkspaceName?: (workspaceId: string) => string | undefined;
+  onThreadNotificationSent?: (workspaceId: string, threadId: string) => void;
   onDebug: (entry: DebugEntry) => void;
   successSoundUrl: string;
   errorSoundUrl: string;
 };
 
 export function useUpdaterController({
+  enabled = true,
   notificationSoundsEnabled,
+  systemNotificationsEnabled,
+  getWorkspaceName,
+  onThreadNotificationSent,
   onDebug,
   successSoundUrl,
   errorSoundUrl,
 }: Params) {
   const { state: updaterState, startUpdate, checkForUpdates, dismiss } = useUpdater({
+    enabled,
     onDebug,
   });
   const isWindowFocused = useWindowFocusState();
@@ -42,13 +53,25 @@ export function useUpdaterController({
     [onDebug],
   );
 
-  useTauriEvent(subscribeUpdaterCheckEvent, () => {
-    void checkForUpdates({ announceNoUpdate: true });
-  });
+  useTauriEvent(
+    subscribeUpdaterCheckEvent,
+    () => {
+      void checkForUpdates({ announceNoUpdate: true });
+    },
+    { enabled },
+  );
 
   useAgentSoundNotifications({
     enabled: notificationSoundsEnabled,
     isWindowFocused,
+    onDebug,
+  });
+
+  useAgentSystemNotifications({
+    enabled: systemNotificationsEnabled,
+    isWindowFocused,
+    getWorkspaceName,
+    onThreadNotificationSent,
     onDebug,
   });
 
@@ -60,11 +83,30 @@ export function useUpdaterController({
     playNotificationSound(url, type, onDebug);
   }, [errorSoundUrl, onDebug, successSoundUrl]);
 
+  const handleTestSystemNotification = useCallback(() => {
+    if (!systemNotificationsEnabled) {
+      return;
+    }
+    void sendNotification(
+      "Test Notification",
+      "This is a test notification from CodexMonitor.",
+    ).catch((error) => {
+      onDebug({
+        id: `${Date.now()}-client-notification-test-error`,
+        timestamp: Date.now(),
+        source: "error",
+        label: "notification/test-error",
+        payload: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }, [onDebug, systemNotificationsEnabled]);
+
   return {
     updaterState,
     startUpdate,
     checkForUpdates,
     dismissUpdate: dismiss,
     handleTestNotificationSound,
+    handleTestSystemNotification,
   };
 }

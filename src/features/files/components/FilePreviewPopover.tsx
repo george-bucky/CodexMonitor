@@ -3,6 +3,7 @@ import type { CSSProperties, MouseEvent } from "react";
 import X from "lucide-react/dist/esm/icons/x";
 import { highlightLine, languageFromPath } from "../../../utils/syntax";
 import { OpenAppMenu } from "../../app/components/OpenAppMenu";
+import { PopoverSurface } from "../../design-system/components/popover/PopoverPrimitives";
 import type { OpenAppTarget } from "../../../types";
 
 type FilePreviewPopoverProps = {
@@ -18,9 +19,14 @@ type FilePreviewPopoverProps = {
   onSelectOpenAppId: (id: string) => void;
   selection: { start: number; end: number } | null;
   onSelectLine: (index: number, event: MouseEvent<HTMLButtonElement>) => void;
+  onLineMouseDown?: (index: number, event: MouseEvent<HTMLButtonElement>) => void;
+  onLineMouseEnter?: (index: number, event: MouseEvent<HTMLButtonElement>) => void;
+  onLineMouseUp?: (index: number, event: MouseEvent<HTMLButtonElement>) => void;
   onClearSelection: () => void;
   onAddSelection: () => void;
+  canInsertText?: boolean;
   onClose: () => void;
+  selectionHints?: string[];
   style?: CSSProperties;
   isLoading?: boolean;
   error?: string | null;
@@ -39,9 +45,14 @@ export function FilePreviewPopover({
   onSelectOpenAppId,
   selection,
   onSelectLine,
+  onLineMouseDown,
+  onLineMouseEnter,
+  onLineMouseUp,
   onClearSelection,
   onAddSelection,
+  canInsertText = true,
   onClose,
+  selectionHints = [],
   style,
   isLoading = false,
   error = null,
@@ -69,7 +80,7 @@ export function FilePreviewPopover({
   );
 
   return (
-    <div className="file-preview-popover popover-surface" style={style}>
+    <PopoverSurface className="file-preview-popover" style={style}>
       <div className="file-preview-header">
         <div className="file-preview-title">
           <span className="file-preview-path">{path}</span>
@@ -118,7 +129,18 @@ export function FilePreviewPopover({
       ) : (
         <div className="file-preview-body">
           <div className="file-preview-toolbar">
-            <span className="file-preview-selection">{selectionLabel}</span>
+            <div className="file-preview-selection-group">
+              <span className="file-preview-selection">{selectionLabel}</span>
+              {selectionHints.length > 0 ? (
+                <div className="file-preview-hints" aria-label="Selection hints">
+                  {selectionHints.map((hint) => (
+                    <span key={hint} className="file-preview-hint">
+                      {hint}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+            </div>
             <div className="file-preview-actions">
               <OpenAppMenu
                 path={absolutePath}
@@ -139,7 +161,7 @@ export function FilePreviewPopover({
                 type="button"
                 className="primary file-preview-action file-preview-action--add"
                 onClick={onAddSelection}
-                disabled={!selection}
+                disabled={!selection || !canInsertText}
               >
                 Add to chat
               </button>
@@ -162,6 +184,9 @@ export function FilePreviewPopover({
                     isSelected ? " is-selected" : ""
                   }${isStart ? " is-start" : ""}${isEnd ? " is-end" : ""}`}
                   onClick={(event) => onSelectLine(index, event)}
+                  onMouseDown={(event) => onLineMouseDown?.(index, event)}
+                  onMouseEnter={(event) => onLineMouseEnter?.(index, event)}
+                  onMouseUp={(event) => onLineMouseUp?.(index, event)}
                 >
                   <span className="file-preview-line-number">{index + 1}</span>
                   <span
@@ -174,6 +199,6 @@ export function FilePreviewPopover({
           </div>
         </div>
       )}
-    </div>
+    </PopoverSurface>
   );
 }

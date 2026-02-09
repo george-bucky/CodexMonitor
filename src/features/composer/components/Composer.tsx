@@ -1,11 +1,25 @@
-import { useCallback, useEffect, useRef, useState, type ClipboardEvent } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ClipboardEvent,
+} from "react";
 import type {
+  AppOption,
   ComposerEditorSettings,
   CustomPromptOption,
   DictationTranscript,
   QueuedMessage,
   ThreadTokenUsage,
 } from "../../../types";
+import type {
+  ReviewPromptState,
+  ReviewPromptStep,
+} from "../../threads/hooks/useReviewPrompt";
 import { computeDictationInsertion } from "../../../utils/dictation";
 import { isComposingEvent } from "../../../utils/keys";
 import {
@@ -16,10 +30,13 @@ import {
   isCursorInsideFence,
   normalizePastedText,
 } from "../../../utils/composerText";
+import { getCaretPosition } from "../../../utils/caretPosition";
 import { useComposerAutocompleteState } from "../hooks/useComposerAutocompleteState";
+import { usePromptHistory } from "../hooks/usePromptHistory";
 import { ComposerInput } from "./ComposerInput";
 import { ComposerMetaBar } from "./ComposerMetaBar";
 import { ComposerQueue } from "./ComposerQueue";
+import { isMobilePlatform } from "../../../utils/platformPaths";
 
 type ComposerProps = {
   onSend: (text: string, images: string[]) => void;
@@ -27,6 +44,7 @@ type ComposerProps = {
   onStop: () => void;
   canStop: boolean;
   disabled?: boolean;
+  appsEnabled: boolean;
   isProcessing: boolean;
   steerEnabled: boolean;
   collaborationModes: { id: string; label: string }[];
@@ -42,6 +60,7 @@ type ComposerProps = {
   accessMode: "read-only" | "current" | "full-access";
   onSelectAccessMode: (mode: "read-only" | "current" | "full-access") => void;
   skills: { name: string; description?: string }[];
+  apps: AppOption[];
   prompts: CustomPromptOption[];
   files: string[];
   contextUsage?: ThreadTokenUsage | null;
@@ -51,6 +70,7 @@ type ComposerProps = {
   sendLabel?: string;
   draftText?: string;
   onDraftChange?: (text: string) => void;
+  historyKey?: string | null;
   attachedImages?: string[];
   onPickImages?: () => void;
   onAttachImages?: (paths: string[]) => void;
@@ -74,6 +94,32 @@ type ComposerProps = {
   onDismissDictationError?: () => void;
   dictationHint?: string | null;
   onDismissDictationHint?: () => void;
+  reviewPrompt?: ReviewPromptState;
+  onReviewPromptClose?: () => void;
+  onReviewPromptShowPreset?: () => void;
+  onReviewPromptChoosePreset?: (
+    preset: Exclude<ReviewPromptStep, "preset"> | "uncommitted",
+  ) => void;
+  highlightedPresetIndex?: number;
+  onReviewPromptHighlightPreset?: (index: number) => void;
+  highlightedBranchIndex?: number;
+  onReviewPromptHighlightBranch?: (index: number) => void;
+  highlightedCommitIndex?: number;
+  onReviewPromptHighlightCommit?: (index: number) => void;
+  onReviewPromptKeyDown?: (event: {
+    key: string;
+    shiftKey?: boolean;
+    preventDefault: () => void;
+  }) => boolean;
+  onReviewPromptSelectBranch?: (value: string) => void;
+  onReviewPromptSelectBranchAtIndex?: (index: number) => void;
+  onReviewPromptConfirmBranch?: () => Promise<void>;
+  onReviewPromptSelectCommit?: (sha: string, title: string) => void;
+  onReviewPromptSelectCommitAtIndex?: (index: number) => void;
+  onReviewPromptConfirmCommit?: () => Promise<void>;
+  onReviewPromptUpdateCustomInstructions?: (value: string) => void;
+  onReviewPromptConfirmCustom?: () => Promise<void>;
+  onFileAutocompleteActiveChange?: (active: boolean) => void;
 };
 
 const DEFAULT_EDITOR_SETTINGS: ComposerEditorSettings = {
@@ -86,13 +132,15 @@ const DEFAULT_EDITOR_SETTINGS: ComposerEditorSettings = {
   autoWrapPasteCodeLike: false,
   continueListOnShiftEnter: false,
 };
+const CARET_ANCHOR_GAP = 8;
 
-export function Composer({
+export const Composer = memo(function Composer({
   onSend,
   onQueue,
   onStop,
   canStop,
   disabled = false,
+  appsEnabled,
   isProcessing,
   steerEnabled,
   collaborationModes,
@@ -108,6 +156,7 @@ export function Composer({
   accessMode,
   onSelectAccessMode,
   skills,
+  apps,
   prompts,
   files,
   contextUsage = null,
@@ -117,6 +166,7 @@ export function Composer({
   sendLabel = "Send",
   draftText = "",
   onDraftChange,
+  historyKey = null,
   attachedImages = [],
   onPickImages,
   onAttachImages,
@@ -140,9 +190,32 @@ export function Composer({
   onDismissDictationError,
   dictationHint = null,
   onDismissDictationHint,
+  reviewPrompt,
+  onReviewPromptClose,
+  onReviewPromptShowPreset,
+  onReviewPromptChoosePreset,
+  highlightedPresetIndex,
+  onReviewPromptHighlightPreset,
+  highlightedBranchIndex,
+  onReviewPromptHighlightBranch,
+  highlightedCommitIndex,
+  onReviewPromptHighlightCommit,
+  onReviewPromptKeyDown,
+  onReviewPromptSelectBranch,
+  onReviewPromptSelectBranchAtIndex,
+  onReviewPromptConfirmBranch,
+  onReviewPromptSelectCommit,
+  onReviewPromptSelectCommitAtIndex,
+  onReviewPromptConfirmCommit,
+  onReviewPromptUpdateCustomInstructions,
+  onReviewPromptConfirmCustom,
+  onFileAutocompleteActiveChange,
 }: ComposerProps) {
   const [text, setText] = useState(draftText);
   const [selectionStart, setSelectionStart] = useState<number | null>(null);
+  const [suggestionsStyle, setSuggestionsStyle] = useState<
+    CSSProperties | undefined
+  >(undefined);
   const internalRef = useRef<HTMLTextAreaElement | null>(null);
   const textareaRef = externalTextareaRef ?? internalRef;
   const editorSettings = editorSettingsProp ?? DEFAULT_EDITOR_SETTINGS;
@@ -170,6 +243,92 @@ export function Composer({
     [onDraftChange],
   );
 
+  const {
+    isAutocompleteOpen,
+    autocompleteMatches,
+    autocompleteAnchorIndex,
+    highlightIndex,
+    setHighlightIndex,
+    applyAutocomplete,
+    handleInputKeyDown,
+    handleTextChange,
+    handleSelectionChange,
+    fileTriggerActive,
+  } = useComposerAutocompleteState({
+    text,
+    selectionStart,
+    disabled,
+    appsEnabled,
+    skills,
+    apps,
+    prompts,
+    files,
+    textareaRef,
+    setText: setComposerText,
+    setSelectionStart,
+  });
+  useEffect(() => {
+    onFileAutocompleteActiveChange?.(fileTriggerActive);
+  }, [fileTriggerActive, onFileAutocompleteActiveChange]);
+  const reviewPromptOpen = Boolean(reviewPrompt);
+  const suggestionsOpen = reviewPromptOpen || isAutocompleteOpen;
+  const suggestions = reviewPromptOpen ? [] : autocompleteMatches;
+
+  useLayoutEffect(() => {
+    if (!isAutocompleteOpen) {
+      setSuggestionsStyle(undefined);
+      return;
+    }
+    const textarea = textareaRef.current;
+    if (!textarea) {
+      return;
+    }
+    const cursor = autocompleteAnchorIndex ?? textarea.selectionStart ?? selectionStart ?? text.length;
+    const caret = getCaretPosition(textarea, cursor);
+    if (!caret) {
+      return;
+    }
+    const textareaRect = textarea.getBoundingClientRect();
+    const container = textarea.closest(".composer-input");
+    const containerRect = container?.getBoundingClientRect();
+    const offsetLeft = textareaRect.left - (containerRect?.left ?? 0);
+    const containerWidth = container?.clientWidth ?? textarea.clientWidth ?? 0;
+    const popoverWidth = Math.min(containerWidth, 420);
+    const rawLeft = offsetLeft + caret.left;
+    const maxLeft = Math.max(0, containerWidth - popoverWidth);
+    const left = Math.min(Math.max(0, rawLeft), maxLeft);
+    setSuggestionsStyle({
+      left,
+      right: "auto",
+      bottom: `calc(100% + ${CARET_ANCHOR_GAP}px)`,
+      top: "auto",
+    });
+  }, [autocompleteAnchorIndex, isAutocompleteOpen, selectionStart, text, textareaRef]);
+
+  const {
+    handleHistoryKeyDown,
+    handleHistoryTextChange,
+    recordHistory,
+    resetHistoryNavigation,
+  } = usePromptHistory({
+    historyKey,
+    text,
+    hasAttachments: attachedImages.length > 0,
+    disabled,
+    isAutocompleteOpen: suggestionsOpen,
+    textareaRef,
+    setText: setComposerText,
+    setSelectionStart,
+  });
+
+  const handleTextChangeWithHistory = useCallback(
+    (next: string, cursor: number | null) => {
+      handleHistoryTextChange(next);
+      handleTextChange(next, cursor);
+    },
+    [handleHistoryTextChange, handleTextChange],
+  );
+
   const handleSend = useCallback(() => {
     if (disabled) {
       return;
@@ -178,9 +337,21 @@ export function Composer({
     if (!trimmed && attachedImages.length === 0) {
       return;
     }
+    if (trimmed) {
+      recordHistory(trimmed);
+    }
     onSend(trimmed, attachedImages);
+    resetHistoryNavigation();
     setComposerText("");
-  }, [attachedImages, disabled, onSend, setComposerText, text]);
+  }, [
+    attachedImages,
+    disabled,
+    onSend,
+    recordHistory,
+    resetHistoryNavigation,
+    setComposerText,
+    text,
+  ]);
 
   const handleQueue = useCallback(() => {
     if (disabled) {
@@ -190,46 +361,39 @@ export function Composer({
     if (!trimmed && attachedImages.length === 0) {
       return;
     }
+    if (trimmed) {
+      recordHistory(trimmed);
+    }
     onQueue(trimmed, attachedImages);
+    resetHistoryNavigation();
     setComposerText("");
-  }, [attachedImages, disabled, onQueue, setComposerText, text]);
-
-  const {
-    isAutocompleteOpen,
-    autocompleteMatches,
-    highlightIndex,
-    setHighlightIndex,
-    applyAutocomplete,
-    handleInputKeyDown,
-    handleTextChange,
-    handleSelectionChange,
-  } = useComposerAutocompleteState({
-    text,
-    selectionStart,
+  }, [
+    attachedImages,
     disabled,
-    skills,
-    prompts,
-    files,
-    textareaRef,
-    setText: setComposerText,
-    setSelectionStart,
-  });
+    onQueue,
+    recordHistory,
+    resetHistoryNavigation,
+    setComposerText,
+    text,
+  ]);
 
   useEffect(() => {
     if (!prefillDraft) {
       return;
     }
     setComposerText(prefillDraft.text);
+    resetHistoryNavigation();
     onPrefillHandled?.(prefillDraft.id);
-  }, [prefillDraft, onPrefillHandled, setComposerText]);
+  }, [onPrefillHandled, prefillDraft, resetHistoryNavigation, setComposerText]);
 
   useEffect(() => {
     if (!insertText) {
       return;
     }
     setComposerText(insertText.text);
+    resetHistoryNavigation();
     onInsertHandled?.(insertText.id);
-  }, [insertText, onInsertHandled, setComposerText]);
+  }, [insertText, onInsertHandled, resetHistoryNavigation, setComposerText]);
 
   useEffect(() => {
     if (!dictationTranscript) {
@@ -250,6 +414,7 @@ export function Composer({
       end,
     );
     setComposerText(nextText);
+    resetHistoryNavigation();
     requestAnimationFrame(() => {
       if (!textareaRef.current) {
         return;
@@ -263,6 +428,7 @@ export function Composer({
     dictationTranscript,
     handleSelectionChange,
     onDictationTranscriptHandled,
+    resetHistoryNavigation,
     selectionStart,
     setComposerText,
     text,
@@ -412,13 +578,17 @@ export function Composer({
         onAddAttachment={onPickImages}
         onAttachImages={onAttachImages}
         onRemoveAttachment={onRemoveImage}
-        onTextChange={handleTextChange}
+        onTextChange={handleTextChangeWithHistory}
         onSelectionChange={handleSelectionChange}
         onTextPaste={handleTextPaste}
         isExpanded={editorExpanded}
         onToggleExpand={onToggleEditorExpanded}
         onKeyDown={(event) => {
           if (isComposingEvent(event)) {
+            return;
+          }
+          handleHistoryKeyDown(event);
+          if (event.defaultPrevented) {
             return;
           }
           if (
@@ -441,7 +611,7 @@ export function Composer({
             }
           }
           if (event.key === "Enter" && event.shiftKey) {
-            if (continueListOnShiftEnter && !isAutocompleteOpen) {
+            if (continueListOnShiftEnter && !suggestionsOpen) {
               const textarea = textareaRef.current;
               if (textarea) {
                 const start = textarea.selectionStart ?? text.length;
@@ -477,11 +647,17 @@ export function Composer({
             !event.shiftKey &&
             steerEnabled &&
             isProcessing &&
-            !isAutocompleteOpen
+            !suggestionsOpen
           ) {
             event.preventDefault();
             handleQueue();
             return;
+          }
+          if (reviewPromptOpen && onReviewPromptKeyDown) {
+            const handled = onReviewPromptKeyDown(event);
+            if (handled) {
+              return;
+            }
           }
           handleInputKeyDown(event);
           if (event.defaultPrevented) {
@@ -504,15 +680,38 @@ export function Composer({
               return;
             }
             event.preventDefault();
+            const dismissKeyboardAfterSend = canSend && isMobilePlatform();
             handleSend();
+            if (dismissKeyboardAfterSend) {
+              textareaRef.current?.blur();
+            }
           }
         }}
         textareaRef={textareaRef}
-        suggestionsOpen={isAutocompleteOpen}
-        suggestions={autocompleteMatches}
+        suggestionsOpen={suggestionsOpen}
+        suggestions={suggestions}
         highlightIndex={highlightIndex}
         onHighlightIndex={setHighlightIndex}
         onSelectSuggestion={applyAutocomplete}
+        suggestionsStyle={suggestionsStyle}
+        reviewPrompt={reviewPrompt}
+        onReviewPromptClose={onReviewPromptClose}
+        onReviewPromptShowPreset={onReviewPromptShowPreset}
+        onReviewPromptChoosePreset={onReviewPromptChoosePreset}
+        highlightedPresetIndex={highlightedPresetIndex}
+        onReviewPromptHighlightPreset={onReviewPromptHighlightPreset}
+        highlightedBranchIndex={highlightedBranchIndex}
+        onReviewPromptHighlightBranch={onReviewPromptHighlightBranch}
+        highlightedCommitIndex={highlightedCommitIndex}
+        onReviewPromptHighlightCommit={onReviewPromptHighlightCommit}
+        onReviewPromptSelectBranch={onReviewPromptSelectBranch}
+        onReviewPromptSelectBranchAtIndex={onReviewPromptSelectBranchAtIndex}
+        onReviewPromptConfirmBranch={onReviewPromptConfirmBranch}
+        onReviewPromptSelectCommit={onReviewPromptSelectCommit}
+        onReviewPromptSelectCommitAtIndex={onReviewPromptSelectCommitAtIndex}
+        onReviewPromptConfirmCommit={onReviewPromptConfirmCommit}
+        onReviewPromptUpdateCustomInstructions={onReviewPromptUpdateCustomInstructions}
+        onReviewPromptConfirmCustom={onReviewPromptConfirmCustom}
       />
       <ComposerMetaBar
         disabled={disabled}
@@ -532,4 +731,6 @@ export function Composer({
       />
     </footer>
   );
-}
+});
+
+Composer.displayName = "Composer";

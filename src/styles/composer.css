@@ -87,6 +87,22 @@
   gap: 8px;
 }
 
+.composer-mobile-menu {
+  display: none;
+  position: relative;
+}
+
+.composer-mobile-actions-popover {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  min-width: 170px;
+  padding: 6px;
+  display: grid;
+  gap: 4px;
+  z-index: 30;
+}
+
 .composer-attach {
   border: 1px solid var(--border-muted);
   background: var(--surface-card);
@@ -258,6 +274,10 @@
   align-items: center;
   justify-content: center;
   position: relative;
+}
+
+.composer-action--mobile-menu {
+  display: none;
 }
 
 :root[data-theme="light"] .composer-action {
@@ -486,28 +506,80 @@
   min-width: 0;
 }
 
+.composer-suggestion-section {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  padding: 6px 8px 2px;
+}
+
 .composer-suggestion:hover,
 .composer-suggestion.is-active {
   background: var(--surface-item);
   border-color: var(--border-muted);
 }
 
+.composer-suggestion-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.composer-suggestion-icon {
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.composer-suggestion-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.composer-suggestion-icon-image {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
+.composer-suggestion-content {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
 .composer-suggestion-title {
   font-size: 12px;
   font-weight: 600;
   width: 100%;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .composer-suggestion-description {
   font-size: 10px;
   color: var(--text-muted);
   width: 100%;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.composer-suggestion-description--skill {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
   overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .composer-bar {
@@ -593,6 +665,58 @@
   width: max-content;
 }
 
+.composer-plan-toggle-wrap {
+  padding: 2px 8px;
+}
+
+.composer-plan-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.composer-plan-toggle-input {
+  margin: 0;
+  width: 12px;
+  height: 12px;
+  accent-color: var(--message-link-color);
+  cursor: pointer;
+}
+
+.composer-plan-toggle-icon {
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
+}
+
+.composer-plan-toggle-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.composer-plan-toggle-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1;
+}
+
+.composer-plan-toggle:has(.composer-plan-toggle-input:checked) .composer-plan-toggle-icon,
+.composer-plan-toggle:has(.composer-plan-toggle-input:checked) .composer-plan-toggle-label {
+  color: var(--text-strong);
+}
+
+.composer-plan-toggle-input:disabled {
+  cursor: not-allowed;
+}
+
+.composer-plan-toggle:has(.composer-plan-toggle-input:disabled) .composer-plan-toggle-icon,
+.composer-plan-toggle:has(.composer-plan-toggle-input:disabled) .composer-plan-toggle-label {
+  opacity: 0.6;
+}
+
 .composer-icon {
   display: inline-flex;
   width: 14px;
@@ -603,6 +727,21 @@
 .composer-icon svg {
   width: 14px;
   height: 14px;
+}
+
+.composer-icon--model {
+  width: 16px;
+  height: 16px;
+}
+
+.composer-icon--model svg {
+  width: 16px;
+  height: 16px;
+}
+
+.composer-icon--model,
+.composer-icon--effort {
+  transform: translateY(1px);
 }
 
 .composer-select {
@@ -632,13 +771,13 @@
 }
 
 .composer-select--collab {
-  width: 88px;
-  max-width: 88px;
+  width: 78px;
+  max-width: 78px;
 }
 
 .composer-select--effort {
-  width: 60px;
-  max-width: 60px;
+  width: 80px;
+  max-width: 80px;
 }
 
 .composer-select--approval {
@@ -649,4 +788,103 @@
 .composer-select:focus {
   outline: none;
   color: var(--text-strong);
+}
+
+@media (max-width: 720px) {
+  .app.layout-phone .composer-input {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: flex-start;
+  }
+
+  .app.layout-phone .composer-input.is-phone-tall {
+    align-items: end;
+  }
+
+  .app.layout-phone .composer-input-row {
+    gap: 6px;
+    align-items: flex-start;
+  }
+
+  .app.layout-phone .composer-input.is-phone-tall .composer-input-row {
+    align-items: flex-end;
+  }
+
+  .app.layout-phone .composer-input > .composer-action {
+    align-self: flex-start;
+    margin-top: 2px;
+  }
+
+  .app.layout-phone .composer-input.is-phone-tall > .composer-action {
+    align-self: flex-end;
+    margin-top: 0;
+  }
+
+  .app.layout-phone .composer-action--mobile-menu {
+    align-self: flex-start;
+  }
+
+  .app.layout-phone .composer-input.is-phone-tall .composer-action--mobile-menu {
+    align-self: flex-end;
+  }
+
+  .app.layout-phone .composer-attach,
+  .app.layout-phone .composer-action--expand,
+  .app.layout-phone .composer-action--mic {
+    display: none;
+  }
+
+  .app.layout-phone .composer-mobile-menu {
+    display: inline-flex;
+    align-self: flex-start;
+    margin-top: 2px;
+  }
+
+  .app.layout-phone .composer-input.is-phone-tall .composer-mobile-menu {
+    align-self: flex-end;
+    margin-top: 0;
+  }
+
+  .app.layout-phone .composer-action--mobile-menu {
+    display: inline-flex;
+  }
+
+  .app.layout-phone .composer textarea {
+    min-height: 52px;
+    max-height: 168px;
+    height: 52px;
+    font-size: 16px;
+    padding: 8px 2px;
+  }
+
+  .app.layout-phone .composer-action {
+    width: 32px;
+    height: 32px;
+  }
+
+  .app.layout-phone .composer-bar {
+    gap: 8px;
+    padding-top: 4px;
+  }
+
+  .app.layout-phone .composer-meta {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    gap: 6px;
+    padding-bottom: 2px;
+    scrollbar-width: thin;
+  }
+
+  .app.layout-phone .composer-context {
+    display: none;
+  }
+
+  .app.layout-phone .composer-select-wrap {
+    gap: 4px;
+    padding: 2px 5px;
+  }
+
+  .app.layout-phone .composer-select {
+    font-size: 12px;
+  }
 }

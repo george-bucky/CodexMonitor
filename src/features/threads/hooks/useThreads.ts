@@ -1,6 +1,11 @@
-import { useCallback, useReducer, useRef } from "react";
+import { useCallback, useMemo, useReducer, useRef } from "react";
 import * as Sentry from "@sentry/react";
-import type { CustomPromptOption, DebugEntry, WorkspaceInfo } from "../../../types";
+import type {
+  CustomPromptOption,
+  DebugEntry,
+  ThreadListSortKey,
+  WorkspaceInfo,
+} from "../../../types";
 import { useAppServerEvents } from "../../app/hooks/useAppServerEvents";
 import { initialState, threadReducer } from "./useThreadsReducer";
 import { useThreadStorage } from "./useThreadStorage";
@@ -9,10 +14,12 @@ import { useThreadEventHandlers } from "./useThreadEventHandlers";
 import { useThreadActions } from "./useThreadActions";
 import { useThreadMessaging } from "./useThreadMessaging";
 import { useThreadApprovals } from "./useThreadApprovals";
+import { useThreadAccountInfo } from "./useThreadAccountInfo";
 import { useThreadRateLimits } from "./useThreadRateLimits";
 import { useThreadSelectors } from "./useThreadSelectors";
 import { useThreadStatus } from "./useThreadStatus";
 import { useThreadUserInput } from "./useThreadUserInput";
+import { setThreadName as setThreadNameService } from "../../../services/tauri";
 import { makeCustomNameKey, saveCustomName } from "../utils/threadStorage";
 
 type UseThreadsOptions = {
@@ -23,9 +30,11 @@ type UseThreadsOptions = {
   effort?: string | null;
   collaborationMode?: Record<string, unknown> | null;
   accessMode?: "read-only" | "current" | "full-access";
+  reviewDeliveryMode?: "inline" | "detached";
   steerEnabled?: boolean;
   customPrompts?: CustomPromptOption[];
   onMessageActivity?: () => void;
+  threadSortKey?: ThreadListSortKey;
 };
 
 export function useThreads({
@@ -36,14 +45,19 @@ export function useThreads({
   effort,
   collaborationMode,
   accessMode,
+  reviewDeliveryMode = "inline",
   steerEnabled = false,
   customPrompts = [],
   onMessageActivity,
+  threadSortKey = "updated_at",
 }: UseThreadsOptions) {
   const [state, dispatch] = useReducer(threadReducer, initialState);
   const loadedThreadsRef = useRef<Record<string, boolean>>({});
   const replaceOnResumeRef = useRef<Record<string, boolean>>({});
   const pendingInterruptsRef = useRef<Set<string>>(new Set());
+  const planByThreadRef = useRef(state.planByThread);
+  const detachedReviewNoticeRef = useRef<Set<string>>(new Set());
+  planByThreadRef.current = state.planByThread;
   const { approvalAllowlistRef, handleApprovalDecision, handleApprovalRemember } =
     useThreadApprovals({ dispatch, onDebug });
   const { handleUserInputSubmit } = useThreadUserInput({ dispatch });
@@ -68,6 +82,12 @@ export function useThreads({
   });
 
   const { refreshAccountRateLimits } = useThreadRateLimits({
+    activeWorkspaceId,
+    activeWorkspaceConnected: activeWorkspace?.connected,
+    dispatch,
+    onDebug,
+  });
+  const { refreshAccountInfo } = useThreadAccountInfo({
     activeWorkspaceId,
     activeWorkspaceConnected: activeWorkspace?.connected,
     dispatch,
@@ -99,7 +119,7 @@ export function useThreads({
       // Ignore refresh errors to avoid breaking the UI.
     }
   }, [onMessageActivity]);
-  const { applyCollabThreadLinks, applyCollabThreadLinksFromThread } =
+  const { applyCollabThreadLinks, applyCollabThreadLinksFromThread, updateThreadParent } =
     useThreadLinking({
       dispatch,
       threadParentById: state.threadParentById,
@@ -109,14 +129,82 @@ export function useThreads({
     (workspaceId: string) => {
       onWorkspaceConnected(workspaceId);
       void refreshAccountRateLimits(workspaceId);
+      void refreshAccountInfo(workspaceId);
     },
-    [onWorkspaceConnected, refreshAccountRateLimits],
+    [onWorkspaceConnected, refreshAccountRateLimits, refreshAccountInfo],
   );
 
-  const handlers = useThreadEventHandlers({
+  const handleAccountUpdated = useCallback(
+    (workspaceId: string) => {
+      void refreshAccountRateLimits(workspaceId);
+      void refreshAccountInfo(workspaceId);
+    },
+    [refreshAccountRateLimits, refreshAccountInfo],
+  );
+
+  const isThreadHidden = useCallback(
+    (workspaceId: string, threadId: string) =>
+      Boolean(state.hiddenThreadIdsByWorkspace[workspaceId]?.[threadId]),
+    [state.hiddenThreadIdsByWorkspace],
+  );
+
+  const handleReviewExited = useCallback(
+    (workspaceId: string, threadId: string) => {
+      const parentId = state.threadParentById[threadId];
+      if (!parentId || parentId === threadId) {
+        return;
+      }
+      const parentStatus = state.threadStatusById[parentId];
+      if (!parentStatus?.isReviewing) {
+        return;
+      }
+
+      markReviewing(parentId, false);
+      markProcessing(parentId, false);
+      setActiveTurnId(parentId, null);
+
+      const timestamp = Date.now();
+      recordThreadActivity(workspaceId, parentId, timestamp);
+      dispatch({
+        type: "setThreadTimestamp",
+        workspaceId,
+        threadId: parentId,
+        timestamp,
+      });
+      const noticeKey = `${parentId}->${threadId}`;
+      const alreadyNotified = detachedReviewNoticeRef.current.has(noticeKey);
+      if (!alreadyNotified) {
+        detachedReviewNoticeRef.current.add(noticeKey);
+        dispatch({
+          type: "addAssistantMessage",
+          threadId: parentId,
+          text: `Detached review completed. [Open review thread](/thread/${threadId})`,
+        });
+      }
+      if (parentId !== activeThreadId) {
+        dispatch({ type: "markUnread", threadId: parentId, hasUnread: true });
+      }
+      safeMessageActivity();
+    },
+    [
+      activeThreadId,
+      dispatch,
+      markProcessing,
+      markReviewing,
+      recordThreadActivity,
+      safeMessageActivity,
+      setActiveTurnId,
+      state.threadParentById,
+      state.threadStatusById,
+    ],
+  );
+
+  const threadHandlers = useThreadEventHandlers({
     activeThreadId,
     dispatch,
+    planByThreadRef,
     getCustomName,
+    isThreadHidden,
     markProcessing,
     markReviewing,
     setActiveTurnId,
@@ -126,14 +214,32 @@ export function useThreads({
     onDebug,
     onWorkspaceConnected: handleWorkspaceConnected,
     applyCollabThreadLinks,
+    onReviewExited: handleReviewExited,
     approvalAllowlistRef,
     pendingInterruptsRef,
   });
+
+  const handleAccountLoginCompleted = useCallback(
+    (workspaceId: string) => {
+      handleAccountUpdated(workspaceId);
+    },
+    [handleAccountUpdated],
+  );
+
+  const handlers = useMemo(
+    () => ({
+      ...threadHandlers,
+      onAccountUpdated: handleAccountUpdated,
+      onAccountLoginCompleted: handleAccountLoginCompleted,
+    }),
+    [threadHandlers, handleAccountUpdated, handleAccountLoginCompleted],
+  );
 
   useAppServerEvents(handlers);
 
   const {
     startThreadForWorkspace,
+    forkThreadForWorkspace,
     resumeThreadForWorkspace,
     refreshThread,
     resetWorkspaceThreads,
@@ -147,12 +253,14 @@ export function useThreads({
     activeThreadIdByWorkspace: state.activeThreadIdByWorkspace,
     threadListCursorByWorkspace: state.threadListCursorByWorkspace,
     threadStatusById: state.threadStatusById,
+    threadSortKey,
     onDebug,
     getCustomName,
     threadActivityRef,
     loadedThreadsRef,
     replaceOnResumeRef,
     applyCollabThreadLinksFromThread,
+    updateThreadParent,
   });
 
   const startThread = useCallback(async () => {
@@ -178,11 +286,67 @@ export function useThreads({
     return threadId;
   }, [activeWorkspace, activeThreadId, resumeThreadForWorkspace, startThreadForWorkspace]);
 
+  const ensureThreadForWorkspace = useCallback(
+    async (workspaceId: string) => {
+      const currentActiveThreadId = state.activeThreadIdByWorkspace[workspaceId] ?? null;
+      const shouldActivate = workspaceId === activeWorkspaceId;
+      let threadId = currentActiveThreadId;
+      if (!threadId) {
+        threadId = await startThreadForWorkspace(workspaceId, {
+          activate: shouldActivate,
+        });
+        if (!threadId) {
+          return null;
+        }
+      } else if (!loadedThreadsRef.current[threadId]) {
+        await resumeThreadForWorkspace(workspaceId, threadId);
+      }
+      if (shouldActivate && currentActiveThreadId !== threadId) {
+        dispatch({ type: "setActiveThreadId", workspaceId, threadId });
+      }
+      return threadId;
+    },
+    [
+      activeWorkspaceId,
+      dispatch,
+      loadedThreadsRef,
+      resumeThreadForWorkspace,
+      startThreadForWorkspace,
+      state.activeThreadIdByWorkspace,
+    ],
+  );
+
   const {
     interruptTurn,
     sendUserMessage,
     sendUserMessageToThread,
+    startFork,
     startReview,
+    startResume,
+    startCompact,
+    startApps,
+    startMcp,
+    startStatus,
+    reviewPrompt,
+    openReviewPrompt,
+    closeReviewPrompt,
+    showPresetStep,
+    choosePreset,
+    highlightedPresetIndex,
+    setHighlightedPresetIndex,
+    highlightedBranchIndex,
+    setHighlightedBranchIndex,
+    highlightedCommitIndex,
+    setHighlightedCommitIndex,
+    handleReviewPromptKeyDown,
+    confirmBranch,
+    selectBranch,
+    selectBranchAtIndex,
+    selectCommit,
+    selectCommitAtIndex,
+    confirmCommit,
+    updateCustomInstructions,
+    confirmCustom,
   } = useThreadMessaging({
     activeWorkspace,
     activeThreadId,
@@ -190,10 +354,12 @@ export function useThreads({
     model,
     effort,
     collaborationMode,
+    reviewDeliveryMode,
     steerEnabled,
     customPrompts,
     threadStatusById: state.threadStatusById,
     activeTurnIdByThread: state.activeTurnIdByThread,
+    rateLimitsByWorkspace: state.rateLimitsByWorkspace,
     pendingInterruptsRef,
     dispatch,
     getCustomName,
@@ -205,6 +371,10 @@ export function useThreads({
     onDebug,
     pushThreadErrorMessage,
     ensureThreadForActiveWorkspace,
+    ensureThreadForWorkspace,
+    refreshThread,
+    forkThreadForWorkspace,
+    updateThreadParent,
   });
 
   const setActiveThreadId = useCallback(
@@ -246,8 +416,19 @@ export function useThreads({
       const key = makeCustomNameKey(workspaceId, threadId);
       customNamesRef.current[key] = newName;
       dispatch({ type: "setThreadName", workspaceId, threadId, name: newName });
+      void Promise.resolve(
+        setThreadNameService(workspaceId, threadId, newName),
+      ).catch((error) => {
+        onDebug?.({
+          id: `${Date.now()}-client-thread-rename-error`,
+          timestamp: Date.now(),
+          source: "error",
+          label: "thread/name/set error",
+          payload: error instanceof Error ? error.message : String(error),
+        });
+      });
     },
-    [customNamesRef, dispatch],
+    [customNamesRef, dispatch, onDebug],
   );
 
   return {
@@ -259,15 +440,19 @@ export function useThreads({
     threadsByWorkspace: state.threadsByWorkspace,
     threadParentById: state.threadParentById,
     threadStatusById: state.threadStatusById,
+    threadResumeLoadingById: state.threadResumeLoadingById,
     threadListLoadingByWorkspace: state.threadListLoadingByWorkspace,
     threadListPagingByWorkspace: state.threadListPagingByWorkspace,
     threadListCursorByWorkspace: state.threadListCursorByWorkspace,
     activeTurnIdByThread: state.activeTurnIdByThread,
+    turnDiffByThread: state.turnDiffByThread,
     tokenUsageByThread: state.tokenUsageByThread,
     rateLimitsByWorkspace: state.rateLimitsByWorkspace,
+    accountByWorkspace: state.accountByWorkspace,
     planByThread: state.planByThread,
     lastAgentMessageByThread: state.lastAgentMessageByThread,
     refreshAccountRateLimits,
+    refreshAccountInfo,
     interruptTurn,
     removeThread,
     pinThread,
@@ -277,13 +462,40 @@ export function useThreads({
     renameThread,
     startThread,
     startThreadForWorkspace,
+    forkThreadForWorkspace,
     listThreadsForWorkspace,
     refreshThread,
     resetWorkspaceThreads,
     loadOlderThreadsForWorkspace,
     sendUserMessage,
     sendUserMessageToThread,
+    startFork,
     startReview,
+    startResume,
+    startCompact,
+    startApps,
+    startMcp,
+    startStatus,
+    reviewPrompt,
+    openReviewPrompt,
+    closeReviewPrompt,
+    showPresetStep,
+    choosePreset,
+    highlightedPresetIndex,
+    setHighlightedPresetIndex,
+    highlightedBranchIndex,
+    setHighlightedBranchIndex,
+    highlightedCommitIndex,
+    setHighlightedCommitIndex,
+    handleReviewPromptKeyDown,
+    confirmBranch,
+    selectBranch,
+    selectBranchAtIndex,
+    selectCommit,
+    selectCommitAtIndex,
+    confirmCommit,
+    updateCustomInstructions,
+    confirmCustom,
     handleApprovalDecision,
     handleApprovalRemember,
     handleUserInputSubmit,

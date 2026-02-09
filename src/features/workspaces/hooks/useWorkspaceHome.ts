@@ -30,6 +30,8 @@ type UseWorkspaceHomeOptions = {
   activeWorkspace: WorkspaceInfo | null;
   models: ModelOption[];
   selectedModelId: string | null;
+  effort?: string | null;
+  collaborationMode?: Record<string, unknown> | null;
   addWorktreeAgent: (
     workspace: WorkspaceInfo,
     branch: string,
@@ -45,8 +47,13 @@ type UseWorkspaceHomeOptions = {
     threadId: string,
     text: string,
     images?: string[],
-    options?: { model?: string | null; effort?: string | null },
+    options?: {
+      model?: string | null;
+      effort?: string | null;
+      collaborationMode?: Record<string, unknown> | null;
+    },
   ) => Promise<void>;
+  onWorktreeCreated?: (worktree: WorkspaceInfo, parent: WorkspaceInfo) => Promise<void> | void;
 };
 
 type WorkspaceHomeState = {
@@ -165,10 +172,13 @@ export function useWorkspaceHome({
   activeWorkspace,
   models,
   selectedModelId,
+  effort = null,
+  collaborationMode = null,
   addWorktreeAgent,
   connectWorkspace,
   startThreadForWorkspace,
   sendUserMessageToThread,
+  onWorktreeCreated,
 }: UseWorkspaceHomeOptions) {
   const [state, setState] = useState<WorkspaceHomeState>({
     runsByWorkspace: {},
@@ -467,6 +477,8 @@ export function useWorkspaceHome({
             : null;
           await sendUserMessageToThread(activeWorkspace, threadId, prompt, images, {
             model: localModel,
+            effort,
+            collaborationMode,
           });
           const model =
             selectedModelId ? modelLookup.get(selectedModelId) ?? null : null;
@@ -510,6 +522,11 @@ export function useWorkspaceHome({
               if (!worktreeWorkspace.connected) {
                 await connectWorkspace(worktreeWorkspace);
               }
+              try {
+                await onWorktreeCreated?.(worktreeWorkspace, activeWorkspace);
+              } catch {
+                // Setup script errors are handled by the caller; runs should still proceed.
+              }
               const threadId = await startThreadForWorkspace(worktreeWorkspace.id, {
                 activate: false,
               });
@@ -523,7 +540,8 @@ export function useWorkspaceHome({
                 images,
                 {
                   model: selection.model?.model ?? selection.modelId,
-                  effort: null,
+                  effort,
+                  collaborationMode,
                 },
               );
               instances.push({
@@ -573,8 +591,11 @@ export function useWorkspaceHome({
     activeWorkspace,
     activeWorkspaceId,
     addWorktreeAgent,
+    collaborationMode,
     connectWorkspace,
+    onWorktreeCreated,
     draft,
+    effort,
     isSubmitting,
     modelLookup,
     modelSelections,

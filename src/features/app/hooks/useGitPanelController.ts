@@ -7,6 +7,8 @@ import { useGitCommitDiffs } from "../../git/hooks/useGitCommitDiffs";
 
 export function useGitPanelController({
   activeWorkspace,
+  gitDiffPreloadEnabled,
+  gitDiffIgnoreWhitespaceChanges,
   isCompact,
   isTablet,
   activeTab,
@@ -17,11 +19,13 @@ export function useGitPanelController({
   prDiffsError,
 }: {
   activeWorkspace: WorkspaceInfo | null;
+  gitDiffPreloadEnabled: boolean;
+  gitDiffIgnoreWhitespaceChanges: boolean;
   isCompact: boolean;
   isTablet: boolean;
-  activeTab: "projects" | "codex" | "git" | "log";
+  activeTab: "home" | "projects" | "codex" | "git" | "log";
   tabletTab: "codex" | "git" | "log";
-  setActiveTab: (tab: "projects" | "codex" | "git" | "log") => void;
+  setActiveTab: (tab: "home" | "projects" | "codex" | "git" | "log") => void;
   prDiffs: GitHubPullRequestDiff[];
   prDiffsLoading: boolean;
   prDiffsError: string | null;
@@ -94,18 +98,33 @@ export function useGitPanelController({
     centerMode === "diff" ||
     (isCompact ? compactTab === "git" : gitPanelMode === "diff");
   const shouldPreloadDiffs = Boolean(
-    activeWorkspace && !preloadedWorkspaceIdsRef.current.has(activeWorkspace.id),
+    gitDiffPreloadEnabled &&
+      activeWorkspace &&
+      !preloadedWorkspaceIdsRef.current.has(activeWorkspace.id),
   );
+  const shouldLoadSelectedLocalDiff =
+    centerMode === "diff" && Boolean(selectedDiffPath);
+  const shouldLoadLocalDiffs =
+    Boolean(activeWorkspace) &&
+    (shouldPreloadDiffs ||
+      (gitDiffPreloadEnabled ? diffUiVisible : shouldLoadSelectedLocalDiff));
   const shouldLoadDiffs =
-    Boolean(activeWorkspace) && (diffUiVisible || shouldPreloadDiffs);
-  const shouldLoadGitLog = gitPanelMode === "log" && Boolean(activeWorkspace);
+    Boolean(activeWorkspace) &&
+    (diffSource === "local" ? shouldLoadLocalDiffs : diffUiVisible);
+  const shouldLoadGitLog =
+    Boolean(activeWorkspace) && (gitPanelMode === "log" || diffUiVisible);
 
   const {
     diffs: gitDiffs,
     isLoading: isDiffLoading,
     error: diffError,
     refresh: refreshGitDiffs,
-  } = useGitDiffs(activeWorkspace, gitStatus.files, shouldLoadDiffs);
+  } = useGitDiffs(
+    activeWorkspace,
+    gitStatus.files,
+    shouldLoadLocalDiffs,
+    gitDiffIgnoreWhitespaceChanges,
+  );
 
   useEffect(() => {
     if (!activeWorkspace || !shouldPreloadDiffs) {
@@ -144,6 +163,7 @@ export function useGitPanelController({
     activeWorkspace,
     selectedCommitSha,
     shouldLoadDiffs && diffSource === "commit",
+    gitDiffIgnoreWhitespaceChanges,
   );
 
   const activeDiffs =

@@ -47,11 +47,18 @@ describe("useAppServerEvents", () => {
     const handlers: Handlers = {
       onAppServerEvent: vi.fn(),
       onWorkspaceConnected: vi.fn(),
+      onThreadStarted: vi.fn(),
+      onThreadNameUpdated: vi.fn(),
+      onBackgroundThreadAction: vi.fn(),
       onAgentMessageDelta: vi.fn(),
+      onReasoningSummaryBoundary: vi.fn(),
+      onPlanDelta: vi.fn(),
       onApprovalRequest: vi.fn(),
       onRequestUserInput: vi.fn(),
       onItemCompleted: vi.fn(),
       onAgentMessageCompleted: vi.fn(),
+      onAccountUpdated: vi.fn(),
+      onAccountLoginCompleted: vi.fn(),
     };
     const { root } = await mount(handlers);
 
@@ -77,6 +84,80 @@ describe("useAppServerEvents", () => {
       itemId: "item-1",
       delta: "Hello",
     });
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "item/reasoning/summaryPartAdded",
+          params: { threadId: "thread-1", itemId: "reasoning-1", summaryIndex: 1 },
+        },
+      });
+    });
+    expect(handlers.onReasoningSummaryBoundary).toHaveBeenCalledWith(
+      "ws-1",
+      "thread-1",
+      "reasoning-1",
+    );
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "item/plan/delta",
+          params: { threadId: "thread-1", itemId: "plan-1", delta: "- Step 1" },
+        },
+      });
+    });
+    expect(handlers.onPlanDelta).toHaveBeenCalledWith(
+      "ws-1",
+      "thread-1",
+      "plan-1",
+      "- Step 1",
+    );
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "thread/started",
+          params: { thread: { id: "thread-2", preview: "New thread" } },
+        },
+      });
+    });
+    expect(handlers.onThreadStarted).toHaveBeenCalledWith("ws-1", {
+      id: "thread-2",
+      preview: "New thread",
+    });
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "thread/name/updated",
+          params: { threadId: "thread-2", threadName: "Renamed from server" },
+        },
+      });
+    });
+    expect(handlers.onThreadNameUpdated).toHaveBeenCalledWith("ws-1", {
+      threadId: "thread-2",
+      threadName: "Renamed from server",
+    });
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "codex/backgroundThread",
+          params: { threadId: "thread-2", action: "hide" },
+        },
+      });
+    });
+    expect(handlers.onBackgroundThreadAction).toHaveBeenCalledWith(
+      "ws-1",
+      "thread-2",
+      "hide",
+    );
 
     act(() => {
       listener?.({
@@ -132,6 +213,7 @@ describe("useAppServerEvents", () => {
             id: "confirm_path",
             header: "Confirm",
             question: "Proceed?",
+            isOther: false,
             options: [
               { label: "Yes", description: "Continue." },
               { label: "No", description: "Stop." },
@@ -163,6 +245,32 @@ describe("useAppServerEvents", () => {
       threadId: "thread-1",
       itemId: "item-2",
       text: "Done",
+    });
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "account/updated",
+          params: { authMode: "chatgpt" },
+        },
+      });
+    });
+    expect(handlers.onAccountUpdated).toHaveBeenCalledWith("ws-1", "chatgpt");
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "account/login/completed",
+          params: { loginId: "login-1", success: true, error: null },
+        },
+      });
+    });
+    expect(handlers.onAccountLoginCompleted).toHaveBeenCalledWith("ws-1", {
+      loginId: "login-1",
+      success: true,
+      error: null,
     });
 
     await act(async () => {
@@ -225,6 +333,7 @@ describe("useAppServerEvents", () => {
             id: "q-1",
             header: "",
             question: "Choose",
+            isOther: false,
             options: [
               { label: "Yes", description: "" },
               { label: "", description: "No label" },

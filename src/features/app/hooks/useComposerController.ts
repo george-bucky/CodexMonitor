@@ -5,24 +5,52 @@ import { useQueuedSend } from "../../threads/hooks/useQueuedSend";
 
 export function useComposerController({
   activeThreadId,
+  activeTurnId,
   activeWorkspaceId,
   activeWorkspace,
   isProcessing,
   isReviewing,
   steerEnabled,
+  appsEnabled,
   connectWorkspace,
+  startThreadForWorkspace,
   sendUserMessage,
+  sendUserMessageToThread,
+  startFork,
   startReview,
+  startResume,
+  startCompact,
+  startApps,
+  startMcp,
+  startStatus,
 }: {
   activeThreadId: string | null;
+  activeTurnId: string | null;
   activeWorkspaceId: string | null;
   activeWorkspace: WorkspaceInfo | null;
   isProcessing: boolean;
   isReviewing: boolean;
   steerEnabled: boolean;
+  appsEnabled: boolean;
   connectWorkspace: (workspace: WorkspaceInfo) => Promise<void>;
+  startThreadForWorkspace: (
+    workspaceId: string,
+    options?: { activate?: boolean },
+  ) => Promise<string | null>;
   sendUserMessage: (text: string, images?: string[]) => Promise<void>;
+  sendUserMessageToThread: (
+    workspace: WorkspaceInfo,
+    threadId: string,
+    text: string,
+    images?: string[],
+  ) => Promise<void>;
+  startFork: (text: string) => Promise<void>;
   startReview: (text: string) => Promise<void>;
+  startResume: (text: string) => Promise<void>;
+  startCompact: (text: string) => Promise<void>;
+  startApps: (text: string) => Promise<void>;
+  startMcp: (text: string) => Promise<void>;
+  startStatus: (text: string) => Promise<void>;
 }) {
   const [composerDraftsByThread, setComposerDraftsByThread] = useState<
     Record<string, string>
@@ -49,13 +77,23 @@ export function useComposerController({
     removeQueuedMessage,
   } = useQueuedSend({
     activeThreadId,
+    activeTurnId,
     isProcessing,
     isReviewing,
     steerEnabled,
+    appsEnabled,
     activeWorkspace,
     connectWorkspace,
+    startThreadForWorkspace,
     sendUserMessage,
+    sendUserMessageToThread,
+    startFork,
     startReview,
+    startResume,
+    startCompact,
+    startApps,
+    startMcp,
+    startStatus,
     clearActiveImages,
   });
 
