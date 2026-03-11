@@ -13,11 +13,12 @@ CodexMonitor is a Tauri app for orchestrating multiple Codex agents across local
 - Worktree and clone agents for isolated work; worktrees live under the app data directory (legacy `.codex-worktrees` supported).
 - Thread management: pin/rename/archive/copy, per-thread drafts, and stop/interrupt in-flight turns.
 - Optional remote backend (daemon) mode for running Codex on another machine.
-- Remote setup helpers for self-hosted connectivity (Orbit actions + Tailscale detection/host bootstrap for TCP mode).
+- Remote setup helpers for self-hosted connectivity (Tailscale detection/host bootstrap for TCP mode).
 
 ### Composer & Agent Controls
 
-- Compose with queueing plus image attachments (picker, drag/drop, paste).
+- Compose with image attachments (picker, drag/drop, paste) and configurable follow-up behavior (`Queue` vs `Steer` while a run is active).
+- Use `Shift+Cmd+Enter` (macOS) or `Shift+Ctrl+Enter` (Windows/Linux) to send the opposite follow-up action for a single message.
 - Autocomplete for skills (`$`), prompts (`/prompts:`), reviews (`/review`), and file paths (`@`).
 - Model picker, collaboration modes (when enabled), reasoning effort, access mode, and context usage ring.
 - Dictation with hold-to-talk shortcuts and live waveform (Whisper).
@@ -84,23 +85,56 @@ iOS support is currently in progress.
 ### iOS + Tailscale Setup (TCP)
 
 Use this when connecting the iOS app to a desktop-hosted daemon over your Tailscale tailnet.
+Canonical runbook: `docs/mobile-ios-tailscale-blueprint.md`.
 
 1. Install and sign in to Tailscale on both desktop and iPhone (same tailnet).
 2. On desktop CodexMonitor, open `Settings > Server`.
-3. Keep `Remote provider` set to `TCP (wip)`.
-4. Set a `Remote backend token`.
-5. Start the desktop daemon with `Start daemon` (in `Mobile access daemon`).
-6. In `Tailscale helper`, use `Detect Tailscale` and note the suggested host (for example `your-mac.your-tailnet.ts.net:4732`).
-7. On iOS CodexMonitor, open `Settings > Server`.
-8. Set `Connection type` to `TCP`.
-9. Enter the desktop Tailscale host and the same token.
-10. Tap `Connect & test` and confirm it succeeds.
+3. Set a `Remote backend token`.
+4. Start the desktop daemon with `Start daemon` (in `Mobile access daemon`).
+5. In `Tailscale helper`, use `Detect Tailscale` and note the suggested host (for example `your-mac.your-tailnet.ts.net:4732`).
+6. On iOS CodexMonitor, open `Settings > Server`.
+7. Enter the desktop Tailscale host and the same token.
+8. Tap `Connect & test` and confirm it succeeds.
 
 Notes:
 
 - The desktop daemon must stay running while iOS is connected.
 - If the test fails, confirm both devices are online in Tailscale and that host/token match desktop settings.
-- If you want to use Orbit instead of Tailscale TCP, switch `Connection type` to `Orbit` on iOS and use your desktop Orbit websocket URL/token.
+
+### Headless Daemon Management (No Desktop UI)
+
+Use the standalone daemon control CLI when you want iOS remote mode without keeping the desktop app open.
+
+Build binaries:
+
+```bash
+cd src-tauri
+cargo build --bin codex_monitor_daemon --bin codex_monitor_daemonctl
+```
+
+Examples:
+
+```bash
+# Show current daemon status
+./target/debug/codex_monitor_daemonctl status
+
+# Start daemon using host/token from settings.json
+./target/debug/codex_monitor_daemonctl start
+
+# Stop daemon
+./target/debug/codex_monitor_daemonctl stop
+
+# Print equivalent daemon start command
+./target/debug/codex_monitor_daemonctl command-preview
+```
+
+Useful overrides:
+
+- `--data-dir <path>`: app data dir containing `settings.json` / `workspaces.json`
+- `--listen <addr>`: bind address override
+- `--token <token>`: token override
+- `--daemon-path <path>`: explicit `codex-monitor-daemon` binary path
+- `--json`: machine-readable output
 
 ### iOS Prerequisites
 
@@ -114,8 +148,10 @@ rustup target add x86_64-apple-ios
 ```
 
 - Apple signing configured (development team).
-  - Set `bundle.iOS.developmentTeam` in `src-tauri/tauri.ios.conf.json` (preferred), or
+  - Set `bundle.iOS.developmentTeam` and `identifier` in `src-tauri/tauri.ios.local.conf.json` (preferred for local machine setup), or
+  - set values in `src-tauri/tauri.ios.conf.json`, or
   - pass `--team <TEAM_ID>` to the device script.
+  - `build_run_ios*.sh` and `release_testflight_ios.sh` automatically merge `src-tauri/tauri.ios.local.conf.json` when present.
 
 ### Run on iOS Simulator
 
@@ -219,18 +255,30 @@ npm run typecheck
 cd src-tauri && cargo check
 ```
 
+## Codebase Navigation
+
+For task-oriented file lookup ("if you need X, edit Y"), use:
+
+- `docs/codebase-map.md`
+
 ## Project Structure
 
 ```
 src/
   features/         feature-sliced UI + hooks
+  features/app/bootstrap/      app bootstrap orchestration
+  features/app/orchestration/  app layout/thread/workspace orchestration
+  features/threads/hooks/threadReducer/  thread reducer slices
   services/         Tauri IPC wrapper
   styles/           split CSS by area
   types.ts          shared types
 src-tauri/
   src/lib.rs        Tauri app backend command registry
   src/bin/codex_monitor_daemon.rs  remote daemon JSON-RPC process
+  src/bin/codex_monitor_daemon/rpc/  daemon RPC domain handlers
   src/shared/       shared backend core used by app + daemon
+  src/shared/git_ui_core/      git/github shared core modules
+  src/shared/workspaces_core/  workspace/worktree shared core modules
   src/workspaces/   workspace/worktree adapters
   src/codex/        codex app-server adapters
   src/files/        file adapters
@@ -240,14 +288,15 @@ src-tauri/
 ## Notes
 
 - Workspaces persist to `workspaces.json` under the app data directory.
-- App settings persist to `settings.json` under the app data directory (theme, backend mode/provider, remote endpoints/tokens, Codex path, default access mode, UI scale).
-- Feature settings are supported in the UI and synced to `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`) on load/save. Stable: Collaboration modes (`features.collaboration_modes`), personality (`personality`), Steer mode (`features.steer`), and Background terminal (`features.unified_exec`). Experimental: Collab mode (`features.collab`) and Apps (`features.apps`).
+- App settings persist to `settings.json` under the app data directory (theme, backend mode/provider, remote endpoints/tokens, Codex path, default access mode, UI scale, follow-up message behavior).
+- Feature settings are supported in the UI and synced to `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`) on load/save. Stable: Collaboration modes (`features.collaboration_modes`), personality (`personality`), and Background terminal (`features.unified_exec`). Experimental: Apps (`features.apps`). Steering capability still follows Codex `features.steer`, but follow-up default behavior is controlled in Settings → Composer.
 - On launch and on window focus, the app reconnects and refreshes thread lists for each workspace.
 - Threads are restored by filtering `thread/list` results using the workspace `cwd`.
 - Selecting a thread always calls `thread/resume` to refresh messages from disk.
 - CLI sessions appear if their `cwd` matches the workspace path; they are not live-streamed unless resumed.
 - The app uses `codex app-server` over stdio; see `src-tauri/src/lib.rs` and `src-tauri/src/codex/`.
-- The remote daemon entrypoint is `src-tauri/src/bin/codex_monitor_daemon.rs`; shared domain logic lives in `src-tauri/src/shared/`.
+- The remote daemon entrypoint is `src-tauri/src/bin/codex_monitor_daemon.rs`; RPC routing lives in `src-tauri/src/bin/codex_monitor_daemon/rpc.rs` and domain handlers in `src-tauri/src/bin/codex_monitor_daemon/rpc/`.
+- Shared domain logic lives in `src-tauri/src/shared/` (notably `src-tauri/src/shared/git_ui_core/` and `src-tauri/src/shared/workspaces_core/`).
 - Codex home resolves from workspace settings (if set), then legacy `.codexmonitor/`, then `$CODEX_HOME`/`~/.codex`.
 - Worktree agents live under the app data directory (`worktrees/<workspace-id>`); legacy `.codex-worktrees/` paths remain supported, and the app no longer edits repo `.gitignore` files.
 - UI state (panel sizes, reduced transparency toggle, recent thread activity) is stored in `localStorage`.
@@ -258,10 +307,10 @@ src-tauri/
 Frontend calls live in `src/services/tauri.ts` and map to commands in `src-tauri/src/lib.rs`. The current surface includes:
 
 - Settings/config/files: `get_app_settings`, `update_app_settings`, `get_codex_config_path`, `get_config_model`, `file_read`, `file_write`, `codex_doctor`, `menu_set_accelerators`.
-- Workspaces/worktrees: `list_workspaces`, `is_workspace_path_dir`, `add_workspace`, `add_clone`, `add_worktree`, `worktree_setup_status`, `worktree_setup_mark_ran`, `rename_worktree`, `rename_worktree_upstream`, `apply_worktree_changes`, `update_workspace_settings`, `update_workspace_codex_bin`, `remove_workspace`, `remove_worktree`, `connect_workspace`, `list_workspace_files`, `read_workspace_file`, `open_workspace_in`, `get_open_app_icon`.
+- Workspaces/worktrees: `list_workspaces`, `is_workspace_path_dir`, `add_workspace`, `add_clone`, `add_worktree`, `worktree_setup_status`, `worktree_setup_mark_ran`, `rename_worktree`, `rename_worktree_upstream`, `apply_worktree_changes`, `update_workspace_settings`, `remove_workspace`, `remove_worktree`, `connect_workspace`, `list_workspace_files`, `read_workspace_file`, `open_workspace_in`, `get_open_app_icon`.
 - Threads/turns/reviews: `start_thread`, `fork_thread`, `compact_thread`, `list_threads`, `resume_thread`, `archive_thread`, `set_thread_name`, `send_user_message`, `turn_interrupt`, `respond_to_server_request`, `start_review`, `remember_approval_rule`, `get_commit_message_prompt`, `generate_commit_message`, `generate_run_metadata`.
 - Account/models/collaboration: `model_list`, `account_rate_limits`, `account_read`, `skills_list`, `apps_list`, `collaboration_mode_list`, `codex_login`, `codex_login_cancel`, `list_mcp_server_status`.
 - Git/GitHub: `get_git_status`, `list_git_roots`, `get_git_diffs`, `get_git_log`, `get_git_commit_diff`, `get_git_remote`, `stage_git_file`, `stage_git_all`, `unstage_git_file`, `revert_git_file`, `revert_git_all`, `commit_git`, `push_git`, `pull_git`, `fetch_git`, `sync_git`, `list_git_branches`, `checkout_git_branch`, `create_git_branch`, `get_github_issues`, `get_github_pull_requests`, `get_github_pull_request_diff`, `get_github_pull_request_comments`.
 - Prompts: `prompts_list`, `prompts_create`, `prompts_update`, `prompts_delete`, `prompts_move`, `prompts_workspace_dir`, `prompts_global_dir`.
 - Terminal/dictation/notifications/usage: `terminal_open`, `terminal_write`, `terminal_resize`, `terminal_close`, `dictation_model_status`, `dictation_download_model`, `dictation_cancel_download`, `dictation_remove_model`, `dictation_request_permission`, `dictation_start`, `dictation_stop`, `dictation_cancel`, `send_notification_fallback`, `is_macos_debug_build`, `local_usage_snapshot`.
-- Remote backend helpers: `orbit_connect_test`, `orbit_sign_in_start`, `orbit_sign_in_poll`, `orbit_sign_out`, `orbit_runner_start`, `orbit_runner_stop`, `orbit_runner_status`, `tailscale_status`, `tailscale_daemon_command_preview`, `tailscale_daemon_start`, `tailscale_daemon_stop`, `tailscale_daemon_status`.
+- Remote backend helpers: `tailscale_status`, `tailscale_daemon_command_preview`, `tailscale_daemon_start`, `tailscale_daemon_stop`, `tailscale_daemon_status`.

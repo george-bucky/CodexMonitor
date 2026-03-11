@@ -1,4 +1,4 @@
-# App-Server Events Reference (Codex `383b45279efda1ef611a4aa286621815fe656b8a`)
+# App-Server Events Reference (Codex `6baeec68bd1bdc11284885a6d00fa4db4e1327b6`)
 
 This document helps agents quickly answer:
 - Which app-server events CodexMonitor supports right now.
@@ -7,11 +7,15 @@ This document helps agents quickly answer:
 - Where to look in `../Codex` to compare event lists and find emitters.
 
 When updating this document:
-1. Update the Codex hash in the title using `git -C ../Codex rev-parse HEAD`.
-2. Compare Codex events vs CodexMonitor routing.
-3. Compare Codex client request methods vs CodexMonitor outgoing request methods.
-4. Compare Codex server request methods vs CodexMonitor inbound request handling.
-5. Update supported and missing lists below.
+1. Fetch latest refs with `git -C ../Codex fetch --all --prune`.
+2. Update the Codex hash in the title using `git -C ../Codex rev-parse origin/main`.
+3. Compare Codex events vs CodexMonitor routing.
+4. Compare Codex client request methods vs CodexMonitor outgoing request methods.
+5. Compare Codex server request methods vs CodexMonitor inbound request handling.
+6. Update supported and missing lists below.
+
+Related project skill:
+- `.codex/skills/app-server-events-sync/SKILL.md`
 
 ## Where To Look In CodexMonitor
 
@@ -29,6 +33,7 @@ Thread/turn/item handlers:
 - `src/features/threads/hooks/useThreadItemEvents.ts`
 - `src/features/threads/hooks/useThreadApprovalEvents.ts`
 - `src/features/threads/hooks/useThreadUserInputEvents.ts`
+- `src/features/skills/hooks/useSkills.ts`
 
 State updates:
 - `src/features/threads/hooks/useThreadsReducer.ts`
@@ -45,38 +50,53 @@ Primary outgoing request layer:
 - `src-tauri/src/codex/mod.rs`
 - `src-tauri/src/bin/codex_monitor_daemon.rs`
 
-## Supported Events (Current)
+## Supported Notifications (Codex v2)
 
-These are the app-server methods currently supported in
-`src/utils/appServerEvents.ts` (`SUPPORTED_APP_SERVER_METHODS`) and routed in
-`useAppServerEvents.ts`.
+These are the current Codex v2 `ServerNotification` methods that CodexMonitor
+supports in `src/utils/appServerEvents.ts` (`SUPPORTED_APP_SERVER_METHODS`) and
+then either routes in `useAppServerEvents.ts` or handles in feature-specific
+subscriptions.
 
-- `codex/connected`
-- `*requestApproval` methods (matched via
-  `isApprovalRequestMethod(method)`; suffix check)
-- `item/tool/requestUserInput`
-- `item/agentMessage/delta`
-- `turn/started`
-- `thread/started`
-- `thread/name/updated`
-- `codex/backgroundThread`
-- `error`
-- `turn/completed`
-- `turn/plan/updated`
-- `turn/diff/updated`
-- `thread/tokenUsage/updated`
+- `account/login/completed`
 - `account/rateLimits/updated`
 - `account/updated`
-- `account/login/completed`
-- `item/started`
-- `item/completed`
-- `item/reasoning/summaryTextDelta`
-- `item/reasoning/summaryPartAdded`
-- `item/reasoning/textDelta`
-- `item/plan/delta`
+- `app/list/updated`
+- `error`
+- `item/agentMessage/delta`
 - `item/commandExecution/outputDelta`
 - `item/commandExecution/terminalInteraction`
+- `item/completed`
 - `item/fileChange/outputDelta`
+- `item/plan/delta`
+- `item/reasoning/summaryPartAdded`
+- `item/reasoning/summaryTextDelta`
+- `item/reasoning/textDelta`
+- `item/started`
+- `thread/archived`
+- `thread/closed`
+- `thread/name/updated`
+- `thread/started`
+- `thread/status/changed`
+- `thread/tokenUsage/updated`
+- `thread/unarchived`
+- `turn/completed`
+- `turn/diff/updated`
+- `turn/plan/updated`
+- `turn/started`
+
+## Additional Stream Methods Handled In CodexMonitor
+
+These arrive on the same frontend event stream but are not Codex v2
+`ServerNotification` methods:
+
+- approval requests ending in `requestApproval`, including
+  `item/commandExecution/requestApproval`,
+  `item/fileChange/requestApproval`, and
+  `item/permissions/requestApproval`, via suffix match in
+  `isApprovalRequestMethod(method)`
+- `item/tool/requestUserInput` (a Codex v2 server request, not a notification)
+- `codex/backgroundThread` (CodexMonitor synthetic bridge event)
+- `codex/connected` (CodexMonitor synthetic bridge event)
 - `codex/event/skills_update_available` (handled via
   `isSkillsUpdateAvailableEvent(...)` in `useSkills.ts`)
 
@@ -98,14 +118,27 @@ CodexMonitor status:
 Compared against Codex app-server protocol v2 notifications, the following
 events are currently not routed:
 
-- `app/list/updated`
-- `rawResponseItem/completed`
+- `configWarning`
+- `command/exec/outputDelta`
+- `deprecationNotice`
+- `fuzzyFileSearch/sessionCompleted`
+- `fuzzyFileSearch/sessionUpdated`
+- `hook/completed`
+- `hook/started`
 - `item/mcpToolCall/progress`
 - `mcpServer/oauthLogin/completed`
+- `model/rerouted`
+- `rawResponseItem/completed`
+- `serverRequest/resolved`
+- `skills/changed`
 - `thread/compacted` (deprecated; intentionally not routed)
-- `deprecationNotice`
-- `configWarning`
+- `thread/realtime/closed`
+- `thread/realtime/error`
+- `thread/realtime/itemAdded`
+- `thread/realtime/outputAudio/delta`
+- `thread/realtime/started`
 - `windows/worldWritableWarning`
+- `windowsSandbox/setupCompleted`
 
 ## Supported Requests (CodexMonitor -> App-Server, v2)
 
@@ -119,10 +152,11 @@ These are v2 request methods CodexMonitor currently sends to Codex app-server:
 - `thread/compact/start`
 - `thread/name/set`
 - `turn/start`
-- `turn/steer` (best-effort; falls back to `turn/start` when unsupported)
+- `turn/steer` (used for explicit steer follow-ups while a turn is active)
 - `turn/interrupt`
 - `review/start`
 - `model/list`
+- `experimentalFeature/list`
 - `collaborationMode/list`
 - `mcpServerStatus/list`
 - `account/login/start`
@@ -132,40 +166,66 @@ These are v2 request methods CodexMonitor currently sends to Codex app-server:
 - `skills/list`
 - `app/list`
 
+Notes:
+- `turn/start` now forwards the optional `serviceTier` override (`"fast"` for `/fast`, `null` for default/off) alongside `model`, `effort`, and `collaborationMode`.
+
 ## Missing Client Requests (Codex v2 ClientRequest Methods)
 
 Compared against Codex v2 request methods, CodexMonitor currently does not send:
 
-- `thread/unarchive`
-- `thread/rollback`
-- `thread/loaded/list`
-- `thread/read`
-- `skills/remote/read`
-- `skills/remote/write`
-- `skills/config/write`
-- `experimentalFeature/list`
-- `mock/experimentalMethod`
-- `mcpServer/oauth/login`
-- `config/mcpServer/reload`
 - `account/logout`
-- `feedback/upload`
 - `command/exec`
+- `command/exec/resize`
+- `command/exec/terminate`
+- `command/exec/write`
+- `config/batchWrite`
+- `config/mcpServer/reload`
 - `config/read`
 - `config/value/write`
-- `config/batchWrite`
 - `configRequirements/read`
+- `externalAgentConfig/detect`
+- `externalAgentConfig/import`
+- `feedback/upload`
+- `fuzzyFileSearch/sessionStart`
+- `fuzzyFileSearch/sessionStop`
+- `fuzzyFileSearch/sessionUpdate`
+- `mcpServer/oauth/login`
+- `mock/experimentalMethod`
+- `plugin/install`
+- `plugin/list`
+- `plugin/uninstall`
+- `skills/config/write`
+- `skills/remote/export`
+- `skills/remote/list`
+- `thread/backgroundTerminals/clean`
+- `thread/decrement_elicitation`
+- `thread/increment_elicitation`
+- `thread/loaded/list`
+- `thread/metadata/update`
+- `thread/read`
+- `thread/realtime/appendAudio`
+- `thread/realtime/appendText`
+- `thread/realtime/start`
+- `thread/realtime/stop`
+- `thread/rollback`
+- `thread/unarchive`
+- `thread/unsubscribe`
+- `windowsSandbox/setupStart`
 
 ## Server Requests (App-Server -> CodexMonitor, v2)
 
 Supported server requests:
 
-- `*requestApproval` methods (handled via suffix match in `isApprovalRequestMethod(method)`)
+- `item/commandExecution/requestApproval`
+- `item/fileChange/requestApproval`
+- `item/permissions/requestApproval`
 - `item/tool/requestUserInput`
 
 Missing server requests:
 
 - `item/tool/call`
 - `account/chatgptAuthTokens/refresh`
+- `mcpServer/elicitation/request`
 
 ## Where To Look In ../Codex
 
@@ -185,9 +245,9 @@ Useful follow-ups:
 Use this workflow to update the lists above:
 
 1. Get the current Codex hash:
-   - `git -C ../Codex rev-parse HEAD`
+   - `git -C ../Codex fetch --all --prune && git -C ../Codex rev-parse origin/main`
 2. List Codex v2 notification methods:
-   - `(rg -N -o '=>\\s*\"[^\"]+\"\\s*\\(v2::[^)]*Notification\\)' ../Codex/codex-rs/app-server-protocol/src/protocol/common.rs | sed -E 's/.*\"([^\"]+)\".*/\\1/'; printf '%s\\n' 'account/login/completed') | sort -u`
+   - `git -C ../Codex show origin/main:codex-rs/app-server-protocol/src/protocol/common.rs | awk '/server_notification_definitions! \\{/,/client_notification_definitions! \\{/' | rg -N -o '=>\\s*\"[^\"]+\"|rename = \"[^\"]+\"' | sed -E 's/.*\"([^\"]+)\".*/\\1/' | sort -u`
 3. List CodexMonitor routed methods:
    - `rg -n \"SUPPORTED_APP_SERVER_METHODS\" src/utils/appServerEvents.ts`
 4. Update the Supported and Missing sections.
@@ -197,13 +257,13 @@ Use this workflow to update the lists above:
 Use this workflow to update request support lists:
 
 1. Get the current Codex hash:
-   - `git -C ../Codex rev-parse HEAD`
+   - `git -C ../Codex fetch --all --prune && git -C ../Codex rev-parse origin/main`
 2. List Codex client request methods:
-   - `awk '/client_request_definitions! \\{/,/\\/\\/\\/ DEPRECATED APIs below/' ../Codex/codex-rs/app-server-protocol/src/protocol/common.rs | rg -N -o '=>\\s*\"[^\"]+\"\\s*\\{' | sed -E 's/.*\"([^\"]+)\".*/\\1/' | sort -u`
+   - `git -C ../Codex show origin/main:codex-rs/app-server-protocol/src/protocol/common.rs | awk '/client_request_definitions! \\{/,/\\/\\/\\/ DEPRECATED APIs below/' | rg -N -o '=>\\s*\"[^\"]+\"\\s*\\{' | sed -E 's/.*\"([^\"]+)\".*/\\1/' | sort -u`
 3. List Codex server request methods:
-   - `awk '/server_request_definitions! \\{/,/\\/\\/\\/ DEPRECATED APIs below/' ../Codex/codex-rs/app-server-protocol/src/protocol/common.rs | rg -N -o '=>\\s*\"[^\"]+\"\\s*\\{' | sed -E 's/.*\"([^\"]+)\".*/\\1/' | sort -u`
+   - `git -C ../Codex show origin/main:codex-rs/app-server-protocol/src/protocol/common.rs | awk '/server_request_definitions! \\{/,/\\/\\/\\/ DEPRECATED APIs below/' | rg -N -o '=>\\s*\"[^\"]+\"\\s*\\{' | sed -E 's/.*\"([^\"]+)\".*/\\1/' | sort -u`
 4. List CodexMonitor outgoing requests:
-   - `perl -0777 -ne 'while(/send_request\\(\\s*\"([^\"]+)\"/g){print \"$1\\n\"}' $(rg --files src-tauri/src -g '*.rs') | sort -u`
+   - `perl -0777 -ne 'while(/send_request_for_workspace\\(\\s*&[^,]+\\s*,\\s*\"([^\"]+)\"/g){print \"$1\\n\"}' src-tauri/src/shared/codex_core.rs | sort -u`
 5. Update the Supported Requests, Missing Client Requests, and Server Requests sections.
 
 ## Schema Drift Workflow (Best)
@@ -211,18 +271,18 @@ Use this workflow to update request support lists:
 Use this when the method list is unchanged but behavior looks off.
 
 1. Confirm the current Codex hash:
-   - `git -C ../Codex rev-parse HEAD`
+   - `git -C ../Codex fetch --all --prune && git -C ../Codex rev-parse origin/main`
 2. Inspect the authoritative notification structs:
-   - `rg -n \"struct .*Notification\" ../Codex/codex-rs/app-server-protocol/src/protocol/v2.rs`
+   - `git -C ../Codex show origin/main:codex-rs/app-server-protocol/src/protocol/v2.rs | rg -n \"struct .*Notification\"`
 3. For a specific method, jump to its struct definition:
-   - Example: `rg -n \"struct TurnPlanUpdatedNotification|struct ThreadTokenUsageUpdatedNotification|struct AccountRateLimitsUpdatedNotification|struct ItemStartedNotification|struct ItemCompletedNotification\" ../Codex/codex-rs/app-server-protocol/src/protocol/v2.rs`
+   - Example: `git -C ../Codex show origin/main:codex-rs/app-server-protocol/src/protocol/v2.rs | rg -n \"struct TurnPlanUpdatedNotification|struct ThreadTokenUsageUpdatedNotification|struct AccountRateLimitsUpdatedNotification|struct ItemStartedNotification|struct ItemCompletedNotification\"`
 4. Compare payload shapes to the router expectations:
    - Parser/source of truth: `src/utils/appServerEvents.ts`
    - Router: `src/features/app/hooks/useAppServerEvents.ts`
    - Turn/plan/token/rate-limit normalization: `src/features/threads/utils/threadNormalize.ts`
    - Item shaping for display: `src/utils/threadItems.ts`
 5. Verify the ThreadItem schema (many UI issues start here):
-   - `rg -n \"enum ThreadItem|CommandExecution|FileChange|McpToolCall|EnteredReviewMode|ExitedReviewMode|ContextCompaction\" ../Codex/codex-rs/app-server-protocol/src/protocol/v2.rs`
+   - `git -C ../Codex show origin/main:codex-rs/app-server-protocol/src/protocol/v2.rs | rg -n \"enum ThreadItem|CommandExecution|FileChange|McpToolCall|EnteredReviewMode|ExitedReviewMode|ContextCompaction\"`
 6. Check for camelCase vs snake_case mismatches:
    - The protocol uses `#[serde(rename_all = \"camelCase\")]`, but fields are often declared in snake_case.
    - CodexMonitor generally defends against this by checking both forms (for example in `threadNormalize.ts` and `useAppServerEvents.ts`), while centralizing method/type parsing in `appServerEvents.ts`.
@@ -245,6 +305,10 @@ Use this when the method list is unchanged but behavior looks off.
   - Stored in `useThreadsReducer.ts` (`turnDiffByThread`)
   - Exposed by `useThreads.ts` for UI consumers
 - Steering behavior while a turn is processing:
-  - CodexMonitor attempts `turn/steer` when steering is enabled and an active turn exists.
-  - If the server/daemon reports unknown `turn/steer`/`turn_steer`, CodexMonitor
-    degrades to `turn/start` and caches that workspace as steer-unsupported.
+  - CodexMonitor attempts `turn/steer` only when steer capability is enabled, the thread is processing, and an active turn id exists.
+  - If `turn/steer` fails, CodexMonitor does not fall back to `turn/start`; it clears stale processing/turn state when applicable, surfaces an error, and returns `steer_failed`.
+  - Local queue fallback on `steer_failed` is handled in the composer queued-send flow (`useQueuedSend`), not by all direct `sendUserMessageToThread` callers.
+- Feature toggles in Settings:
+  - `experimentalFeature/list` is an app-server request.
+  - Toggle writes use local/daemon command surfaces (`set_codex_feature_flag` and app settings update),
+    which write `config.toml`; they are not app-server `ClientRequest` methods.

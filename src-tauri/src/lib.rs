@@ -21,7 +21,6 @@ mod menu;
 #[path = "menu_mobile.rs"]
 mod menu;
 mod notifications;
-mod orbit;
 mod prompts;
 mod remote_backend;
 mod rules;
@@ -35,6 +34,7 @@ mod terminal;
 #[cfg(not(desktop))]
 #[path = "terminal_mobile.rs"]
 mod terminal;
+mod tray;
 mod types;
 mod utils;
 mod window;
@@ -58,8 +58,6 @@ fn keep_daemon_running_after_close(app_handle: &tauri::AppHandle) -> bool {
 #[cfg(desktop)]
 async fn stop_managed_daemons_for_exit(app_handle: tauri::AppHandle) {
     let state = app_handle.state::<state::AppState>();
-    let _ = orbit::orbit_runner_stop(state).await;
-    let state = app_handle.state::<state::AppState>();
     let _ = tailscale::tailscale_daemon_stop(state).await;
 }
 
@@ -76,18 +74,30 @@ pub fn run() {
         if std::env::var_os("__NV_PRIME_RENDER_OFFLOAD").is_none() {
             std::env::set_var("__NV_PRIME_RENDER_OFFLOAD", "1");
         }
+        let is_wayland = std::env::var("XDG_SESSION_TYPE")
+            .map(|session| session.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false)
+            || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let has_nvidia = std::path::Path::new("/proc/driver/nvidia/version").exists();
+        if is_wayland && has_nvidia && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
+        {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+        let is_x11 = !is_wayland && std::env::var_os("DISPLAY").is_some();
         // Work around sporadic blank WebKitGTK renders on X11 by disabling compositing mode.
-        if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
+        // Keep Wayland untouched because this can interfere with input behavior on some setups.
+        if is_x11 && std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
             std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
         }
     }
 
     #[cfg(desktop)]
     let builder = tauri::Builder::default()
-        .enable_macos_default_menu(false)
         .manage(menu::MenuItemRegistry::<tauri::Wry>::default())
-        .menu(menu::build_menu)
-        .on_menu_event(menu::handle_menu_event);
+        .manage(tray::TrayState::default())
+        .on_menu_event(menu::handle_menu_event)
+        .enable_macos_default_menu(false)
+        .menu(menu::build_menu);
 
     #[cfg(not(desktop))]
     let builder = tauri::Builder::default();
@@ -106,6 +116,19 @@ pub fn run() {
         .setup(|app| {
             let state = state::AppState::load(&app.handle());
             app.manage(state);
+            #[cfg(target_os = "macos")]
+            {
+                let tray_state = app.state::<tray::TrayState>();
+                tray::initialize(&app.handle(), tray_state.inner())?;
+            }
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(main_window) = app.get_webview_window("main") {
+                    let _ = main_window.set_decorations(false);
+                    // Keep menu accelerators wired while suppressing a visible native menu bar.
+                    let _ = main_window.hide_menu();
+                }
+            }
             #[cfg(desktop)]
             {
                 let app_handle = app.handle().clone();
@@ -128,48 +151,6 @@ pub fn run() {
                                     let state = app_handle.state::<state::AppState>();
                                     let _ = tailscale::tailscale_daemon_start(state).await;
                                 }
-                            }
-                        }
-                    }
-
-                    if matches!(settings.backend_mode, crate::types::BackendMode::Remote)
-                        && matches!(
-                            settings.remote_backend_provider,
-                            crate::types::RemoteBackendProvider::Orbit
-                        )
-                    {
-                        if settings.orbit_auto_start_runner {
-                            if settings.keep_daemon_running_after_app_close {
-                                // Avoid duplicate detached Orbit runners across relaunches.
-                                // orbit_runner_start can still be called manually from Settings.
-                                let state = app_handle.state::<state::AppState>();
-                                let _ = orbit::orbit_runner_status(state).await;
-                            } else {
-                                let state = app_handle.state::<state::AppState>();
-                                let _ = orbit::orbit_runner_start(state).await;
-                            }
-                        } else {
-                            let state = app_handle.state::<state::AppState>();
-                            if let Ok(status) = orbit::orbit_runner_status(state).await {
-                                if matches!(status.state, crate::types::OrbitRunnerState::Running) {
-                                    // Enforce version for a currently running managed runner.
-                                    let state = app_handle.state::<state::AppState>();
-                                    let _ = orbit::orbit_runner_start(state).await;
-                                }
-                            }
-                        }
-                    } else if matches!(
-                        settings.remote_backend_provider,
-                        crate::types::RemoteBackendProvider::Orbit
-                    ) {
-                        // Local mode with Orbit selected: only enforce version if runner is already running.
-                        let state = app_handle.state::<state::AppState>();
-                        if let Ok(status) = orbit::orbit_runner_status(state).await {
-                            if matches!(status.state, crate::types::OrbitRunnerState::Running)
-                                && !settings.keep_daemon_running_after_app_close
-                            {
-                                let state = app_handle.state::<state::AppState>();
-                                let _ = orbit::orbit_runner_start(state).await;
                             }
                         }
                     }
@@ -204,13 +185,18 @@ pub fn run() {
             settings::get_codex_config_path,
             files::file_read,
             files::file_write,
+            files::read_image_as_data_url,
+            files::write_text_file,
             codex::get_config_model,
             menu::menu_set_accelerators,
+            tray::set_tray_recent_threads,
+            tray::set_tray_session_usage,
             codex::codex_doctor,
             codex::codex_update,
             workspaces::list_workspaces,
             workspaces::is_workspace_path_dir,
             workspaces::add_workspace,
+            workspaces::add_workspace_from_git_url,
             workspaces::add_clone,
             workspaces::add_worktree,
             workspaces::worktree_setup_status,
@@ -221,7 +207,7 @@ pub fn run() {
             workspaces::rename_worktree_upstream,
             workspaces::apply_worktree_changes,
             workspaces::update_workspace_settings,
-            workspaces::update_workspace_codex_bin,
+            workspaces::set_workspace_runtime_codex_args,
             codex::start_thread,
             codex::send_user_message,
             codex::turn_steer,
@@ -229,10 +215,12 @@ pub fn run() {
             codex::start_review,
             codex::respond_to_server_request,
             codex::remember_approval_rule,
-            codex::get_commit_message_prompt,
             codex::generate_commit_message,
             codex::generate_run_metadata,
+            codex::generate_agent_description,
             codex::resume_thread,
+            codex::thread_live_subscribe,
+            codex::thread_live_unsubscribe,
             codex::fork_thread,
             codex::list_threads,
             codex::list_mcp_server_status,
@@ -242,6 +230,8 @@ pub fn run() {
             codex::collaboration_mode_list,
             workspaces::connect_workspace,
             git::get_git_status,
+            git::init_git_repo,
+            git::create_github_repo,
             git::list_git_roots,
             git::get_git_diffs,
             git::get_git_log,
@@ -261,6 +251,7 @@ pub fn run() {
             git::get_github_pull_requests,
             git::get_github_pull_request_diff,
             git::get_github_pull_request_comments,
+            git::checkout_github_pull_request,
             workspaces::list_workspace_files,
             workspaces::read_workspace_file,
             workspaces::open_workspace_in,
@@ -269,6 +260,15 @@ pub fn run() {
             git::checkout_git_branch,
             git::create_git_branch,
             codex::model_list,
+            codex::experimental_feature_list,
+            codex::set_codex_feature_flag,
+            codex::get_agents_settings,
+            codex::set_agents_core_settings,
+            codex::create_agent,
+            codex::update_agent,
+            codex::delete_agent,
+            codex::read_agent_config_toml,
+            codex::write_agent_config_toml,
             codex::account_rate_limits,
             codex::account_read,
             codex::codex_login,
@@ -296,14 +296,8 @@ pub fn run() {
             dictation::dictation_cancel,
             local_usage::local_usage_snapshot,
             notifications::is_macos_debug_build,
+            notifications::app_build_type,
             notifications::send_notification_fallback,
-            orbit::orbit_connect_test,
-            orbit::orbit_sign_in_start,
-            orbit::orbit_sign_in_poll,
-            orbit::orbit_sign_out,
-            orbit::orbit_runner_start,
-            orbit::orbit_runner_stop,
-            orbit::orbit_runner_status,
             tailscale::tailscale_status,
             tailscale::tailscale_daemon_command_preview,
             tailscale::tailscale_daemon_start,

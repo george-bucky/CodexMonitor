@@ -5,17 +5,19 @@ import Brain from "lucide-react/dist/esm/icons/brain";
 import Check from "lucide-react/dist/esm/icons/check";
 import Copy from "lucide-react/dist/esm/icons/copy";
 import Diff from "lucide-react/dist/esm/icons/diff";
-import FileDiff from "lucide-react/dist/esm/icons/file-diff";
+import FileDiffIcon from "lucide-react/dist/esm/icons/file-diff";
 import FileText from "lucide-react/dist/esm/icons/file-text";
 import Image from "lucide-react/dist/esm/icons/image";
+import Quote from "lucide-react/dist/esm/icons/quote";
 import Search from "lucide-react/dist/esm/icons/search";
 import Terminal from "lucide-react/dist/esm/icons/terminal";
 import Users from "lucide-react/dist/esm/icons/users";
 import Wrench from "lucide-react/dist/esm/icons/wrench";
 import X from "lucide-react/dist/esm/icons/x";
+import { exportMarkdownFile } from "@services/tauri";
+import { pushErrorToast } from "@services/toasts";
 import type { ConversationItem } from "../../../types";
-import { languageFromPath } from "../../../utils/syntax";
-import { DiffBlock } from "../../git/components/DiffBlock";
+import { PierreDiffBlock } from "../../git/components/PierreDiffBlock";
 import {
   MAX_COMMAND_OUTPUT_LINES,
   basename,
@@ -46,12 +48,15 @@ type WorkingIndicatorProps = {
   lastDurationMs?: number | null;
   hasItems: boolean;
   reasoningLabel?: string | null;
+  showPollingFetchStatus?: boolean;
+  pollingIntervalMs?: number;
 };
 
 type MessageRowProps = MarkdownFileLinkProps & {
   item: Extract<ConversationItem, { kind: "message" }>;
   isCopied: boolean;
   onCopy: (item: Extract<ConversationItem, { kind: "message" }>) => void;
+  onQuote?: (item: Extract<ConversationItem, { kind: "message" }>, selectedText?: string) => void;
   codeBlockCopyUseModifier?: boolean;
 };
 
@@ -68,6 +73,12 @@ type ReviewRowProps = MarkdownFileLinkProps & {
 
 type DiffRowProps = {
   item: Extract<ConversationItem, { kind: "diff" }>;
+};
+
+type UserInputRowProps = {
+  item: Extract<ConversationItem, { kind: "userInput" }>;
+  isExpanded: boolean;
+  onToggle: (id: string) => void;
 };
 
 type ToolRowProps = MarkdownFileLinkProps & {
@@ -242,7 +253,7 @@ function toolIconForSummary(
     return Terminal;
   }
   if (item.toolType === "fileChange") {
-    return FileDiff;
+    return FileDiffIcon;
   }
   if (item.toolType === "webSearch") {
     return Search;
@@ -258,7 +269,7 @@ function toolIconForSummary(
   if (label === "read") {
     return FileText;
   }
-  if (label === "searched") {
+  if (label === "searched" || label === "searching") {
     return Search;
   }
 
@@ -271,14 +282,32 @@ function toolIconForSummary(
   return Wrench;
 }
 
+function buildPlanExportFileName(itemId: string) {
+  const normalized = itemId
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  if (!normalized) {
+    return "plan.md";
+  }
+  return normalized.startsWith("plan-") ? `${normalized}.md` : `plan-${normalized}.md`;
+}
+
 export const WorkingIndicator = memo(function WorkingIndicator({
   isThinking,
   processingStartedAt = null,
   lastDurationMs = null,
   hasItems,
   reasoningLabel = null,
+  showPollingFetchStatus = false,
+  pollingIntervalMs = 12000,
 }: WorkingIndicatorProps) {
   const [elapsedMs, setElapsedMs] = useState(0);
+  const [pollCountdownSeconds, setPollCountdownSeconds] = useState(() =>
+    Math.max(1, Math.ceil(pollingIntervalMs / 1000)),
+  );
 
   useEffect(() => {
     if (!isThinking || !processingStartedAt) {
@@ -291,6 +320,22 @@ export const WorkingIndicator = memo(function WorkingIndicator({
     }, 1000);
     return () => window.clearInterval(interval);
   }, [isThinking, processingStartedAt]);
+
+  useEffect(() => {
+    if (!showPollingFetchStatus || isThinking) {
+      return undefined;
+    }
+    const intervalSeconds = Math.max(1, Math.ceil(pollingIntervalMs / 1000));
+    setPollCountdownSeconds(intervalSeconds);
+    const timer = window.setInterval(() => {
+      setPollCountdownSeconds((previous) =>
+        previous <= 1 ? intervalSeconds : previous - 1,
+      );
+    }, 1000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [isThinking, pollingIntervalMs, showPollingFetchStatus]);
 
   return (
     <>
@@ -307,7 +352,9 @@ export const WorkingIndicator = memo(function WorkingIndicator({
         <div className="turn-complete" aria-live="polite">
           <span className="turn-complete-line" aria-hidden />
           <span className="turn-complete-label">
-            Done in {formatDurationMs(lastDurationMs)}
+            {showPollingFetchStatus
+              ? `New message will be fetched in ${pollCountdownSeconds} seconds`
+              : `Done in ${formatDurationMs(lastDurationMs)}`}
           </span>
           <span className="turn-complete-line" aria-hidden />
         </div>
@@ -320,6 +367,7 @@ export const MessageRow = memo(function MessageRow({
   item,
   isCopied,
   onCopy,
+  onQuote,
   codeBlockCopyUseModifier,
   showMessageFilePath,
   workspacePath,
@@ -328,6 +376,8 @@ export const MessageRow = memo(function MessageRow({
   onOpenThreadLink,
 }: MessageRowProps) {
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
+  const bubbleRef = useRef<HTMLDivElement | null>(null);
+  const selectionSnapshotRef = useRef<string | null>(null);
   const hasText = item.text.trim().length > 0;
   const imageItems = useMemo(() => {
     if (!item.images || item.images.length === 0) {
@@ -344,9 +394,47 @@ export const MessageRow = memo(function MessageRow({
       .filter(Boolean) as MessageImage[];
   }, [item.images]);
 
+  const getSelectedMessageText = useCallback(() => {
+    const bubble = bubbleRef.current;
+    const selection = window.getSelection();
+    if (!bubble || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
+      return null;
+    }
+    const selectedText = selection.toString().trim();
+    if (!selectedText) {
+      return null;
+    }
+    const range = selection.getRangeAt(0);
+    if (!bubble.contains(range.commonAncestorContainer)) {
+      return null;
+    }
+
+    const isWithinMessageControls = (node: Node | null) => {
+      if (!node) {
+        return false;
+      }
+      const element = node instanceof Element ? node : node.parentElement;
+      return Boolean(element?.closest(".message-quote-button, .message-copy-button"));
+    };
+
+    if (isWithinMessageControls(selection.anchorNode) || isWithinMessageControls(selection.focusNode)) {
+      return null;
+    }
+    return selectedText;
+  }, []);
+
+  const handleQuote = useCallback(() => {
+    if (!onQuote) {
+      return;
+    }
+    const selectedText = getSelectedMessageText() ?? selectionSnapshotRef.current ?? undefined;
+    selectionSnapshotRef.current = null;
+    onQuote(item, selectedText);
+  }, [getSelectedMessageText, item, onQuote]);
+
   return (
     <div className={`message ${item.role}`}>
-      <div className="bubble message-bubble">
+      <div ref={bubbleRef} className="bubble message-bubble">
         {imageItems.length > 0 && (
           <MessageImageGrid
             images={imageItems}
@@ -373,6 +461,23 @@ export const MessageRow = memo(function MessageRow({
             activeIndex={lightboxIndex}
             onClose={() => setLightboxIndex(null)}
           />
+        )}
+        {onQuote && hasText && (
+          <button
+            type="button"
+            className="ghost message-quote-button"
+            onMouseDown={() => {
+              selectionSnapshotRef.current = getSelectedMessageText();
+            }}
+            onTouchStart={() => {
+              selectionSnapshotRef.current = getSelectedMessageText();
+            }}
+            onClick={handleQuote}
+            aria-label="Quote message"
+            title="Quote message"
+          >
+            <Quote size={14} aria-hidden />
+          </button>
         )}
         <button
           type="button"
@@ -487,7 +592,81 @@ export const DiffRow = memo(function DiffRow({ item }: DiffRowProps) {
         {item.status && <span className="item-status">{item.status}</span>}
       </div>
       <div className="diff-viewer-output">
-        <DiffBlock diff={item.diff} language={languageFromPath(item.title)} />
+        <PierreDiffBlock diff={item.diff} displayPath={item.title} />
+      </div>
+    </div>
+  );
+});
+
+export const UserInputRow = memo(function UserInputRow({
+  item,
+  isExpanded,
+  onToggle,
+}: UserInputRowProps) {
+  const first = item.questions[0];
+  const previewQuestion =
+    first?.question?.trim() || first?.header?.trim() || "Input requested";
+  const firstAnswer = first?.answers[0]?.trim() || "No answer provided";
+  const previewAnswer =
+    first && first.answers.length > 1
+      ? `${firstAnswer} +${first.answers.length - 1}`
+      : firstAnswer;
+  const extraQuestions = Math.max(0, item.questions.length - 1);
+
+  return (
+    <div className={`tool-inline user-input-inline ${isExpanded ? "tool-inline-expanded" : ""}`}>
+      <button
+        type="button"
+        className="tool-inline-bar-toggle"
+        onClick={() => onToggle(item.id)}
+        aria-expanded={isExpanded}
+        aria-label="Toggle answered input details"
+      />
+      <div className="tool-inline-content">
+        <button
+          type="button"
+          className="tool-inline-summary tool-inline-toggle"
+          onClick={() => onToggle(item.id)}
+          aria-expanded={isExpanded}
+        >
+          <Check className="tool-inline-icon completed" size={14} aria-hidden />
+          <span className="tool-inline-label">answered:</span>
+          <span className="tool-inline-value user-input-inline-preview">
+            {previewQuestion}: {previewAnswer}
+            {extraQuestions > 0 ? ` +${extraQuestions} more` : ""}
+          </span>
+        </button>
+        {isExpanded && (
+          <div className="user-input-inline-details">
+            {item.questions.map((question, index) => {
+              const title = question.question || question.header || `Question ${index + 1}`;
+              return (
+                <div
+                  key={`${question.id}-${index}`}
+                  className="user-input-inline-entry"
+                >
+                  <div className="user-input-inline-question">{title}</div>
+                  {question.answers.length > 0 ? (
+                    <div className="user-input-inline-answers">
+                      {question.answers.map((answer, answerIndex) => (
+                        <div
+                          key={`${question.id}-answer-${answerIndex}`}
+                          className="user-input-inline-answer"
+                        >
+                          {answer}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="user-input-inline-empty-answer">
+                      No answer provided.
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -506,6 +685,7 @@ export const ToolRow = memo(function ToolRow({
 }: ToolRowProps) {
   const isFileChange = item.toolType === "fileChange";
   const isCommand = item.toolType === "commandExecution";
+  const isPlan = item.toolType === "plan";
   const commandText = isCommand
     ? item.title.replace(/^Command:\s*/i, "").trim()
     : "";
@@ -537,6 +717,7 @@ export const ToolRow = memo(function ToolRow({
     typeof item.durationMs === "number" ? item.durationMs : null;
   const isLongRunning = commandDurationMs !== null && commandDurationMs >= 1200;
   const [showLiveOutput, setShowLiveOutput] = useState(false);
+  const [isExportingPlan, setIsExportingPlan] = useState(false);
 
   useEffect(() => {
     if (!isCommandRunning) {
@@ -561,6 +742,30 @@ export const ToolRow = memo(function ToolRow({
       onRequestAutoScroll?.();
     }
   }, [isCommandRunning, onRequestAutoScroll, showCommandOutput, showLiveOutput]);
+
+  const handlePlanExport = useCallback(
+    async (event: MouseEvent<HTMLButtonElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const output = (summary.output ?? "").trim();
+      if (!output) {
+        return;
+      }
+      setIsExportingPlan(true);
+      try {
+        await exportMarkdownFile(output, buildPlanExportFileName(item.id));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unable to export plan.";
+        pushErrorToast({
+          title: "Plan export failed",
+          message,
+        });
+      } finally {
+        setIsExportingPlan(false);
+      }
+    },
+    [item.id, summary.output],
+  );
 
   return (
     <div className={`tool-inline ${isExpanded ? "tool-inline-expanded" : ""}`}>
@@ -629,10 +834,7 @@ export const ToolRow = memo(function ToolRow({
                 </div>
                 {change.diff && (
                   <div className="diff-viewer-output">
-                    <DiffBlock
-                      diff={change.diff}
-                      language={languageFromPath(change.path)}
-                    />
+                    <PierreDiffBlock diff={change.diff} displayPath={change.path} />
                   </div>
                 )}
               </div>
@@ -655,13 +857,25 @@ export const ToolRow = memo(function ToolRow({
           <Markdown
             value={summary.output}
             className="tool-inline-output markdown"
-            codeBlock
+            codeBlock={item.toolType !== "plan"}
             showFilePath={showMessageFilePath}
             workspacePath={workspacePath}
             onOpenFileLink={onOpenFileLink}
             onOpenFileLinkMenu={onOpenFileLinkMenu}
             onOpenThreadLink={onOpenThreadLink}
           />
+        )}
+        {showToolOutput && isPlan && (summary.output ?? "").trim() && (
+          <div className="tool-inline-actions">
+            <button
+              type="button"
+              className="ghost tool-inline-action"
+              onClick={handlePlanExport}
+              disabled={isExportingPlan}
+            >
+              {isExportingPlan ? "Exporting..." : "Export .md"}
+            </button>
+          </div>
         )}
       </div>
     </div>

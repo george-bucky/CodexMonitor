@@ -2,19 +2,16 @@
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type {
+  GitLogEntry,
   GitHubPullRequest,
-  GitHubPullRequestDiff,
+  PullRequestReviewAction,
   WorkspaceInfo,
 } from "../../../types";
-import {
-  buildPullRequestDraft,
-  buildPullRequestPrompt,
-} from "../../../utils/pullRequestPrompt";
+import { buildPullRequestDraft } from "../../../utils/pullRequestPrompt";
 import { usePullRequestComposer } from "./usePullRequestComposer";
 
 vi.mock("../../../utils/pullRequestPrompt", () => ({
   buildPullRequestDraft: vi.fn(() => "Draft text"),
-  buildPullRequestPrompt: vi.fn(() => "Prompt text"),
 }));
 
 const pullRequest: GitHubPullRequest = {
@@ -30,9 +27,17 @@ const pullRequest: GitHubPullRequest = {
   author: { login: "octocat" },
 };
 
-const diffs: GitHubPullRequestDiff[] = [
-  { path: "src/App.tsx", status: "modified", diff: "diff" },
+const reviewActions: PullRequestReviewAction[] = [
+  { id: "pr-review-full", label: "Review PR", intent: "full" },
+  { id: "pr-review-risks", label: "Risk Scan", intent: "risks" },
 ];
+
+const selectedCommit: GitLogEntry = {
+  sha: "abcdef1234567890",
+  summary: "Tighten sidebar commit selection",
+  author: "octocat",
+  timestamp: 1_706_246_400,
+};
 
 const connectedWorkspace: WorkspaceInfo = {
   id: "workspace-1",
@@ -42,18 +47,10 @@ const connectedWorkspace: WorkspaceInfo = {
   settings: { sidebarCollapsed: false },
 };
 
-const disconnectedWorkspace: WorkspaceInfo = {
-  id: "workspace-2",
-  name: "CodexMonitor",
-  path: "/tmp/codex",
-  connected: false,
-  settings: { sidebarCollapsed: false },
-};
-
 const makeOptions = (overrides: Partial<Parameters<typeof usePullRequestComposer>[0]> = {}) => ({
   activeWorkspace: connectedWorkspace,
   selectedPullRequest: null,
-  gitPullRequestDiffs: diffs,
+  selectedCommit: null,
   filePanelMode: "git" as const,
   gitPanelMode: "prs" as const,
   centerMode: "diff" as const,
@@ -65,12 +62,12 @@ const makeOptions = (overrides: Partial<Parameters<typeof usePullRequestComposer
   setGitPanelMode: vi.fn(),
   setPrefillDraft: vi.fn(),
   setActiveTab: vi.fn(),
-  connectWorkspace: vi.fn().mockResolvedValue(undefined),
-  startThreadForWorkspace: vi.fn().mockResolvedValue("thread-1"),
-  sendUserMessageToThread: vi.fn().mockResolvedValue(undefined),
+  pullRequestReviewActions: reviewActions,
+  pullRequestReviewLaunching: false,
+  runPullRequestReview: vi.fn().mockResolvedValue("thread-review-1"),
+  startReview: vi.fn().mockResolvedValue(undefined),
   clearActiveImages: vi.fn(),
   handleSend: vi.fn().mockResolvedValue(undefined),
-  queueMessage: vi.fn().mockResolvedValue(undefined),
   ...overrides,
 });
 
@@ -122,35 +119,24 @@ describe("usePullRequestComposer", () => {
     });
 
     expect(options.handleSend).toHaveBeenCalledWith("Hello", []);
-    expect(options.startThreadForWorkspace).not.toHaveBeenCalled();
+    expect(options.runPullRequestReview).not.toHaveBeenCalled();
   });
 
-  it("creates a new thread and sends PR prompt when in PR mode", async () => {
-    const options = makeOptions({
-      activeWorkspace: disconnectedWorkspace,
-      selectedPullRequest: pullRequest,
-    });
+  it("runs PR review for question text in PR mode", async () => {
+    const options = makeOptions({ selectedPullRequest: pullRequest });
     const { result } = renderHook(() => usePullRequestComposer(options));
 
     await act(async () => {
       await result.current.handleComposerSend("  Question? ", ["img-1"]);
     });
 
-    expect(options.connectWorkspace).toHaveBeenCalledWith(disconnectedWorkspace);
-    expect(buildPullRequestPrompt).toHaveBeenCalledWith(
-      pullRequest,
-      diffs,
-      "Question?",
-    );
-    expect(options.startThreadForWorkspace).toHaveBeenCalledWith(
-      disconnectedWorkspace.id,
-      { activate: false },
-    );
-    expect(options.sendUserMessageToThread).toHaveBeenCalledWith(
-      disconnectedWorkspace,
-      "thread-1",
-      "Prompt text",
-      ["img-1"],
+    expect(options.runPullRequestReview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        intent: "question",
+        question: "Question?",
+        images: ["img-1"],
+        activateThread: true,
+      }),
     );
     expect(options.clearActiveImages).toHaveBeenCalled();
   });
@@ -163,8 +149,7 @@ describe("usePullRequestComposer", () => {
       await result.current.handleComposerSend("  ", []);
     });
 
-    expect(options.startThreadForWorkspace).not.toHaveBeenCalled();
-    expect(options.sendUserMessageToThread).not.toHaveBeenCalled();
+    expect(options.runPullRequestReview).not.toHaveBeenCalled();
   });
 
   it("routes slash commands to the normal composer handler in PR mode", async () => {
@@ -175,9 +160,30 @@ describe("usePullRequestComposer", () => {
       await result.current.handleComposerSend("/apps", []);
     });
 
-    expect(options.handleSend).toHaveBeenCalledWith("/apps", []);
-    expect(options.startThreadForWorkspace).not.toHaveBeenCalled();
-    expect(options.sendUserMessageToThread).not.toHaveBeenCalled();
+    expect(options.handleSend).toHaveBeenCalledWith(
+      "/apps",
+      [],
+      undefined,
+      undefined,
+    );
+    expect(options.runPullRequestReview).not.toHaveBeenCalled();
+  });
+
+  it("maps /review to PR-wide review while in PR mode", async () => {
+    const options = makeOptions({ selectedPullRequest: pullRequest });
+    const { result } = renderHook(() => usePullRequestComposer(options));
+
+    await act(async () => {
+      await result.current.handleComposerSend("/review", []);
+    });
+
+    expect(options.runPullRequestReview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        intent: "full",
+        activateThread: true,
+      }),
+    );
+    expect(options.handleSend).not.toHaveBeenCalled();
   });
 
   it("treats non-command slash-prefixed text as a PR prompt in PR mode", async () => {
@@ -189,20 +195,73 @@ describe("usePullRequestComposer", () => {
     });
 
     expect(options.handleSend).not.toHaveBeenCalled();
-    expect(buildPullRequestPrompt).toHaveBeenCalledWith(
-      pullRequest,
-      diffs,
-      "/src-tauri/something",
+    expect(options.runPullRequestReview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        intent: "question",
+        question: "/src-tauri/something",
+        activateThread: true,
+      }),
     );
-    expect(options.startThreadForWorkspace).toHaveBeenCalledWith(
-      connectedWorkspace.id,
-      { activate: false },
+  });
+
+  it("exposes composer context actions in PR mode", () => {
+    const options = makeOptions({ selectedPullRequest: pullRequest });
+    const { result } = renderHook(() => usePullRequestComposer(options));
+
+    expect(result.current.composerContextActions.length).toBeGreaterThan(0);
+  });
+
+  it("disables composer context actions while launching a PR review", () => {
+    const options = makeOptions({
+      selectedPullRequest: pullRequest,
+      pullRequestReviewLaunching: true,
+    });
+    const { result } = renderHook(() => usePullRequestComposer(options));
+
+    expect(result.current.composerContextActions.every((action) => action.disabled)).toBe(true);
+  });
+
+  it("runs composer context actions in a new active PR review thread", async () => {
+    const options = makeOptions({ selectedPullRequest: pullRequest });
+    const { result } = renderHook(() => usePullRequestComposer(options));
+
+    await act(async () => {
+      await result.current.composerContextActions[0]?.onSelect();
+    });
+
+    expect(options.runPullRequestReview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        intent: reviewActions[0]?.intent,
+        activateThread: true,
+      }),
     );
-    expect(options.sendUserMessageToThread).toHaveBeenCalledWith(
-      connectedWorkspace,
-      "thread-1",
-      "Prompt text",
-      [],
+  });
+
+  it("exposes commit review action when a commit is selected in log mode", () => {
+    const options = makeOptions({
+      selectedCommit,
+      gitPanelMode: "log",
+    });
+    const { result } = renderHook(() => usePullRequestComposer(options));
+
+    expect(result.current.composerContextActions).toHaveLength(1);
+    expect(result.current.composerContextActions[0]?.label).toBe("Review Commit");
+  });
+
+  it("runs commit review action via /review commit command", async () => {
+    const options = makeOptions({
+      selectedCommit,
+      gitPanelMode: "log",
+    });
+    const { result } = renderHook(() => usePullRequestComposer(options));
+
+    await act(async () => {
+      await result.current.composerContextActions[0]?.onSelect();
+    });
+
+    expect(options.startReview).toHaveBeenCalledWith(
+      "/review commit abcdef1234567890 Tighten sidebar commit selection",
     );
+    expect(options.runPullRequestReview).not.toHaveBeenCalled();
   });
 });

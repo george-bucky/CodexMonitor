@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { useCallback, useState } from "react";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationItem } from "../../../types";
 import { Messages } from "./Messages";
@@ -13,6 +13,9 @@ const useFileLinkOpenerMock = vi.fn(
 );
 const openFileLinkMock = vi.fn();
 const showFileLinkMenuMock = vi.fn();
+const { exportMarkdownFileMock } = vi.hoisted(() => ({
+  exportMarkdownFileMock: vi.fn(),
+}));
 
 vi.mock("../hooks/useFileLinkOpener", () => ({
   useFileLinkOpener: (
@@ -21,6 +24,16 @@ vi.mock("../hooks/useFileLinkOpener", () => ({
     selectedOpenAppId: string,
   ) => useFileLinkOpenerMock(workspacePath, openTargets, selectedOpenAppId),
 }));
+
+vi.mock("@services/tauri", async () => {
+  const actual = await vi.importActual<typeof import("@services/tauri")>(
+    "@services/tauri",
+  );
+  return {
+    ...actual,
+    exportMarkdownFile: exportMarkdownFileMock,
+  };
+});
 
 describe("Messages", () => {
   beforeAll(() => {
@@ -37,6 +50,7 @@ describe("Messages", () => {
     useFileLinkOpenerMock.mockClear();
     openFileLinkMock.mockReset();
     showFileLinkMenuMock.mockReset();
+    exportMarkdownFileMock.mockReset();
   });
 
   it("renders image grid above message text and opens lightbox", () => {
@@ -130,6 +144,75 @@ describe("Messages", () => {
     expect(markdown?.textContent ?? "").toContain("Literal [image] token");
   });
 
+  it("quotes a message into composer using markdown blockquote format", () => {
+    const onQuoteMessage = vi.fn();
+    const items: ConversationItem[] = [
+      {
+        id: "msg-quote-1",
+        kind: "message",
+        role: "assistant",
+        text: "First line\nSecond line",
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+        onQuoteMessage={onQuoteMessage}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Quote message" }));
+    expect(onQuoteMessage).toHaveBeenCalledWith("> First line\n> Second line\n\n");
+  });
+
+  it("quotes selected message fragment when text is highlighted", () => {
+    const onQuoteMessage = vi.fn();
+    const items: ConversationItem[] = [
+      {
+        id: "msg-quote-selection-1",
+        kind: "message",
+        role: "assistant",
+        text: "Alpha beta gamma",
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+        onQuoteMessage={onQuoteMessage}
+      />,
+    );
+
+    const textNode = screen.getByText("Alpha beta gamma").firstChild;
+    if (!(textNode instanceof Text)) {
+      throw new Error("Expected message text node");
+    }
+    const range = document.createRange();
+    range.setStart(textNode, 6);
+    range.setEnd(textNode, 10);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+
+    const quoteButton = screen.getByRole("button", { name: "Quote message" });
+    fireEvent.mouseDown(quoteButton);
+    fireEvent.click(quoteButton);
+
+    expect(onQuoteMessage).toHaveBeenCalledWith("> beta\n\n");
+    selection?.removeAllRanges();
+  });
+
   it("opens linked review thread when clicking thread link", () => {
     const onOpenThreadLink = vi.fn();
     const items: ConversationItem[] = [
@@ -154,7 +237,7 @@ describe("Messages", () => {
     );
 
     fireEvent.click(screen.getByText("Open review thread"));
-    expect(onOpenThreadLink).toHaveBeenCalledWith("thread-review-1");
+    expect(onOpenThreadLink).toHaveBeenCalledWith("thread-review-1", "ws-1");
   });
 
   it("renders file references as compact links and opens them", () => {
@@ -191,6 +274,272 @@ describe("Messages", () => {
     expect(openFileLinkMock).toHaveBeenCalledWith(
       "iosApp/src/views/DocumentsList/DocumentListView.swift:111",
     );
+  });
+
+  it("routes markdown href file paths through the file opener", () => {
+    const linkedPath =
+      "/Users/dimillian/Documents/Dev/CodexMonitor/src/features/messages/components/Markdown.tsx:244";
+    const items: ConversationItem[] = [
+      {
+        id: "msg-file-href-link",
+        kind: "message",
+        role: "assistant",
+        text: `Open [this file](${linkedPath})`,
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    fireEvent.click(screen.getByText("this file"));
+    expect(openFileLinkMock).toHaveBeenCalledWith(linkedPath);
+  });
+
+  it("routes absolute non-whitelisted file href paths through the file opener", () => {
+    const linkedPath = "/custom/project/src/App.tsx:12";
+    const items: ConversationItem[] = [
+      {
+        id: "msg-file-href-absolute-non-whitelisted-link",
+        kind: "message",
+        role: "assistant",
+        text: `Open [app file](${linkedPath})`,
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    fireEvent.click(screen.getByText("app file"));
+    expect(openFileLinkMock).toHaveBeenCalledWith(linkedPath);
+  });
+
+  it("decodes percent-encoded href file paths before opening", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "msg-file-href-encoded-link",
+        kind: "message",
+        role: "assistant",
+        text: "Open [guide](./docs/My%20Guide.md)",
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    fireEvent.click(screen.getByText("guide"));
+    expect(openFileLinkMock).toHaveBeenCalledWith("./docs/My Guide.md");
+  });
+
+  it("routes absolute href file paths with #L anchors through the file opener", () => {
+    const linkedPath =
+      "/Users/dimillian/Documents/Dev/CodexMonitor/src/features/messages/components/Markdown.tsx#L244";
+    const items: ConversationItem[] = [
+      {
+        id: "msg-file-href-anchor-link",
+        kind: "message",
+        role: "assistant",
+        text: `Open [this file](${linkedPath})`,
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    fireEvent.click(screen.getByText("this file"));
+    expect(openFileLinkMock).toHaveBeenCalledWith(
+      "/Users/dimillian/Documents/Dev/CodexMonitor/src/features/messages/components/Markdown.tsx:244",
+    );
+  });
+
+  it("routes dotless workspace href file paths through the file opener", () => {
+    const linkedPath = "/workspace/CodexMonitor/LICENSE";
+    const items: ConversationItem[] = [
+      {
+        id: "msg-file-href-workspace-dotless-link",
+        kind: "message",
+        role: "assistant",
+        text: `Open [license](${linkedPath})`,
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    fireEvent.click(screen.getByText("license"));
+    expect(openFileLinkMock).toHaveBeenCalledWith(linkedPath);
+  });
+
+  it("keeps non-file relative links as normal markdown links", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "msg-help-href-link",
+        kind: "message",
+        role: "assistant",
+        text: "See [Help](/help/getting-started)",
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const helpLink = screen.getByText("Help").closest("a");
+    expect(helpLink?.getAttribute("href")).toBe("/help/getting-started");
+    fireEvent.click(screen.getByText("Help"));
+    expect(openFileLinkMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps route-like absolute links as normal markdown links", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "msg-help-workspace-route-link",
+        kind: "message",
+        role: "assistant",
+        text: "See [Workspace Home](/workspace/settings)",
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const link = screen.getByText("Workspace Home").closest("a");
+    expect(link?.getAttribute("href")).toBe("/workspace/settings");
+    fireEvent.click(screen.getByText("Workspace Home"));
+    expect(openFileLinkMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps deep workspace route links as normal markdown links", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "msg-help-workspace-route-link-deep",
+        kind: "message",
+        role: "assistant",
+        text: "See [Profile](/workspace/settings/profile)",
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const link = screen.getByText("Profile").closest("a");
+    expect(link?.getAttribute("href")).toBe("/workspace/settings/profile");
+    fireEvent.click(screen.getByText("Profile"));
+    expect(openFileLinkMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps dot-relative non-file links as normal markdown links", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "msg-help-dot-relative-href-link",
+        kind: "message",
+        role: "assistant",
+        text: "See [Help](./help/getting-started)",
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const helpLink = screen.getByText("Help").closest("a");
+    expect(helpLink?.getAttribute("href")).toBe("./help/getting-started");
+    fireEvent.click(screen.getByText("Help"));
+    expect(openFileLinkMock).not.toHaveBeenCalled();
+  });
+
+  it("does not crash or navigate on malformed codex-file links", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "msg-malformed-file-link",
+        kind: "message",
+        role: "assistant",
+        text: "Bad [path](codex-file:%E0%A4%A)",
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    fireEvent.click(screen.getByText("path"));
+    expect(openFileLinkMock).not.toHaveBeenCalled();
   });
 
   it("hides file parent paths when message file path display is disabled", () => {
@@ -487,6 +836,111 @@ describe("Messages", () => {
     const workingText = container.querySelector(".working-text");
     expect(workingText?.textContent ?? "").toContain("Indexing workspace");
     expect(container.querySelector(".reasoning-inline")).toBeNull();
+  });
+
+  it("shows polling fetch countdown text instead of done duration when requested", () => {
+    vi.useFakeTimers();
+    try {
+      const items: ConversationItem[] = [
+        {
+          id: "assistant-msg-done",
+          kind: "message",
+          role: "assistant",
+          text: "Completed response",
+        },
+      ];
+
+      render(
+        <Messages
+          items={items}
+          threadId="thread-1"
+          workspaceId="ws-1"
+          isThinking={false}
+          lastDurationMs={4_000}
+          showPollingFetchStatus
+          pollingIntervalMs={12_000}
+          openTargets={[]}
+          selectedOpenAppId=""
+        />,
+      );
+
+      expect(
+        screen.getByText("New message will be fetched in 12 seconds"),
+      ).toBeTruthy();
+      act(() => {
+        vi.advanceTimersByTime(1_000);
+      });
+      expect(
+        screen.getByText("New message will be fetched in 11 seconds"),
+      ).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps done duration text when polling fetch countdown is not requested", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "assistant-msg-done-default",
+        kind: "message",
+        role: "assistant",
+        text: "Completed response",
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        lastDurationMs={4_000}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    expect(screen.getByText("Done in 0:04")).toBeTruthy();
+  });
+
+  it("renders answered user input items with preview and expandable details", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "user-input-1",
+        kind: "userInput",
+        status: "answered",
+        questions: [
+          {
+            id: "q1",
+            header: "Confirm",
+            question: "Proceed with deployment?",
+            answers: ["Yes", "user_note: after running tests"],
+          },
+        ],
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    expect(
+      screen.getByText(/Proceed with deployment\?: Yes \+1/),
+    ).toBeTruthy();
+    expect(screen.queryByText("user_note: after running tests")).toBeNull();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Toggle answered input details" }),
+    );
+
+    expect(screen.getByText("user_note: after running tests")).toBeTruthy();
   });
 
   it("merges consecutive explore items under a single explored block", async () => {
@@ -837,6 +1291,44 @@ describe("Messages", () => {
     expect(
       screen.getByRole("button", { name: "Implement this plan" }),
     ).toBeTruthy();
+  });
+
+  it("exports plan tool-call output from the conversation view", async () => {
+    exportMarkdownFileMock.mockResolvedValueOnce("/tmp/plan-7.md");
+    const items: ConversationItem[] = [
+      {
+        id: "plan-7",
+        kind: "tool",
+        toolType: "plan",
+        title: "Plan",
+        detail: "completed",
+        status: "completed",
+        output: "## Steps\n- Step 1",
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const exportButton = await screen.findByRole("button", {
+      name: "Export .md",
+    });
+    fireEvent.click(exportButton);
+
+    await waitFor(() =>
+      expect(exportMarkdownFileMock).toHaveBeenCalledWith(
+        "## Steps\n- Step 1",
+        "plan-7.md",
+      ),
+    );
   });
 
   it("hides the plan-ready follow-up once the user has replied after the plan", () => {

@@ -1,7 +1,6 @@
-import { useRef } from "react";
 import type { LaunchScriptEntry, LaunchScriptIconId } from "../../../types";
 import { PopoverSurface } from "../../design-system/components/popover/PopoverPrimitives";
-import { useDismissibleMenu } from "../hooks/useDismissibleMenu";
+import { useMenuController } from "../hooks/useMenuController";
 import { LaunchScriptIconPicker } from "./LaunchScriptIconPicker";
 import { getLaunchScriptIcon, getLaunchScriptIconLabel } from "../utils/launchScriptIcons";
 
@@ -40,22 +39,20 @@ export function LaunchScriptEntryButton({
   onSave,
   onDelete,
 }: LaunchScriptEntryButtonProps) {
-  const popoverRef = useRef<HTMLDivElement | null>(null);
+  const editorMenu = useMenuController({
+    open: editorOpen,
+    onDismiss: onCloseEditor,
+  });
+  const { containerRef: popoverRef } = editorMenu;
   const Icon = getLaunchScriptIcon(entry.icon);
   const iconLabel = getLaunchScriptIconLabel(entry.icon);
-
-  useDismissibleMenu({
-    isOpen: editorOpen,
-    containerRef: popoverRef,
-    onClose: onCloseEditor,
-  });
 
   return (
     <div className="launch-script-menu" ref={popoverRef}>
       <div className="launch-script-buttons">
         <button
           type="button"
-          className="ghost main-header-action launch-script-run"
+          className="ghost main-header-action launch-script-run ds-tooltip-trigger"
           onClick={onRun}
           onContextMenu={(event) => {
             event.preventDefault();
@@ -64,6 +61,8 @@ export function LaunchScriptEntryButton({
           data-tauri-drag-region="false"
           aria-label={entry.label?.trim() || iconLabel}
           title={entry.label?.trim() || iconLabel}
+          data-tooltip={entry.label?.trim() || iconLabel}
+          data-tooltip-placement="bottom"
         >
           <Icon size={14} aria-hidden />
         </button>

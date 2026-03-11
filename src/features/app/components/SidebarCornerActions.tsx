@@ -2,9 +2,12 @@ import ScrollText from "lucide-react/dist/esm/icons/scroll-text";
 import Settings from "lucide-react/dist/esm/icons/settings";
 import User from "lucide-react/dist/esm/icons/user";
 import X from "lucide-react/dist/esm/icons/x";
-import { useEffect, useRef, useState } from "react";
-import { PopoverSurface } from "../../design-system/components/popover/PopoverPrimitives";
-import { useDismissibleMenu } from "../hooks/useDismissibleMenu";
+import { useEffect } from "react";
+import {
+  MenuTrigger,
+  PopoverSurface,
+} from "../../design-system/components/popover/PopoverPrimitives";
+import { useMenuController } from "../hooks/useMenuController";
 
 type SidebarCornerActionsProps = {
   onOpenSettings: () => void;
@@ -33,34 +36,36 @@ export function SidebarCornerActions({
   onSwitchAccount,
   onCancelSwitchAccount,
 }: SidebarCornerActionsProps) {
-  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
-  const accountMenuRef = useRef<HTMLDivElement | null>(null);
-
-  useDismissibleMenu({
+  const accountMenu = useMenuController();
+  const {
     isOpen: accountMenuOpen,
     containerRef: accountMenuRef,
-    onClose: () => setAccountMenuOpen(false),
-  });
+    close: closeAccountMenu,
+    toggle: toggleAccountMenu,
+  } = accountMenu;
 
   useEffect(() => {
     if (!showAccountSwitcher) {
-      setAccountMenuOpen(false);
+      closeAccountMenu();
     }
-  }, [showAccountSwitcher]);
+  }, [closeAccountMenu, showAccountSwitcher]);
 
   return (
     <div className="sidebar-corner-actions">
       {showAccountSwitcher && (
         <div className="sidebar-account-menu" ref={accountMenuRef}>
-          <button
-            className="ghost sidebar-corner-button"
-            type="button"
-            onClick={() => setAccountMenuOpen((open) => !open)}
+          <MenuTrigger
+            isOpen={accountMenuOpen}
+            popupRole="dialog"
+            className="ghost sidebar-corner-button ds-tooltip-trigger"
+            onClick={toggleAccountMenu}
             aria-label="Account"
             title="Account"
+            data-tooltip="Account"
+            data-tooltip-align="start"
           >
             <User size={14} aria-hidden />
-          </button>
+          </MenuTrigger>
           {accountMenuOpen && (
             <PopoverSurface className="sidebar-account-popover" role="dialog">
               <div className="sidebar-account-title">Account</div>
@@ -98,21 +103,25 @@ export function SidebarCornerActions({
         </div>
       )}
       <button
-        className="ghost sidebar-corner-button"
+        className="ghost sidebar-corner-button ds-tooltip-trigger"
         type="button"
         onClick={onOpenSettings}
         aria-label="Open settings"
         title="Settings"
+        data-tooltip="Settings"
+        data-tooltip-align="start"
       >
         <Settings size={14} aria-hidden />
       </button>
       {showDebugButton && (
         <button
-          className="ghost sidebar-corner-button"
+          className="ghost sidebar-corner-button ds-tooltip-trigger"
           type="button"
           onClick={onOpenDebug}
           aria-label="Open debug log"
           title="Debug log"
+          data-tooltip="Debug log"
+          data-tooltip-align="start"
         >
           <ScrollText size={14} aria-hidden />
         </button>

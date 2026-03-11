@@ -6,14 +6,15 @@ import type {
   ThreadListSortKey,
   ThreadSummary,
   WorkspaceInfo,
-} from "../../../types";
+} from "@/types";
 import {
   archiveThread as archiveThreadService,
   forkThread as forkThreadService,
   listThreads as listThreadsService,
+  listWorkspaces as listWorkspacesService,
   resumeThread as resumeThreadService,
   startThread as startThreadService,
-} from "../../../services/tauri";
+} from "@services/tauri";
 import {
   buildItemsFromThread,
   getThreadCreatedTimestamp,
@@ -21,78 +22,93 @@ import {
   isReviewingFromThread,
   mergeThreadItems,
   previewThreadName,
-} from "../../../utils/threadItems";
+} from "@utils/threadItems";
+import { extractThreadCodexMetadata } from "@threads/utils/threadCodexMetadata";
 import {
   asString,
   normalizeRootPath,
-} from "../utils/threadNormalize";
-import { saveThreadActivity } from "../utils/threadStorage";
+} from "@threads/utils/threadNormalize";
+import {
+  getParentThreadIdFromThread,
+  getResumedTurnState,
+  isSubagentThreadSource,
+  shouldHideSubagentThreadFromSidebar,
+} from "@threads/utils/threadRpc";
+import { saveThreadActivity } from "@threads/utils/threadStorage";
 import type { ThreadAction, ThreadState } from "./useThreadsReducer";
 
 const THREAD_LIST_TARGET_COUNT = 20;
 const THREAD_LIST_PAGE_SIZE = 100;
-const THREAD_LIST_MAX_PAGES_WITH_ACTIVITY = 8;
-const THREAD_LIST_MAX_PAGES_WITHOUT_ACTIVITY = 3;
 const THREAD_LIST_MAX_PAGES_OLDER = 6;
+const THREAD_LIST_MAX_PAGES_DEFAULT = 6;
+const THREAD_LIST_CURSOR_PAGE_START = "__codex_monitor_page_start__";
 
-function asRecord(value: unknown): Record<string, unknown> | null {
-  if (!value || typeof value !== "object") {
-    return null;
+function isWithinWorkspaceRoot(path: string, workspaceRoot: string) {
+  if (!path || !workspaceRoot) {
+    return false;
   }
-  return value as Record<string, unknown>;
-}
-
-function getParentThreadIdFromSource(source: unknown): string | null {
-  const sourceRecord = asRecord(source);
-  if (!sourceRecord) {
-    return null;
-  }
-  const subAgent = asRecord(sourceRecord.subAgent ?? sourceRecord.sub_agent);
-  if (!subAgent) {
-    return null;
-  }
-  const threadSpawn = asRecord(subAgent.thread_spawn ?? subAgent.threadSpawn);
-  if (!threadSpawn) {
-    return null;
-  }
-  const parentId = asString(
-    threadSpawn.parent_thread_id ?? threadSpawn.parentThreadId,
+  return (
+    path === workspaceRoot ||
+    (path.length > workspaceRoot.length &&
+      path.startsWith(workspaceRoot) &&
+      path.charCodeAt(workspaceRoot.length) === 47)
   );
-  return parentId || null;
 }
 
-function normalizeTurnStatus(value: unknown): string {
-  return String(value ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/[\s_-]/g, "");
+type WorkspacePathLookup = {
+  workspaceIdsByPath: Record<string, string[]>;
+  workspacePathsSorted: string[];
+};
+
+function buildWorkspacePathLookup(workspaces: WorkspaceInfo[]): WorkspacePathLookup {
+  const workspaceIdsByPath: Record<string, string[]> = {};
+  const workspacePathsSorted: string[] = [];
+  workspaces.forEach((workspace) => {
+    const workspacePath = normalizeRootPath(workspace.path);
+    if (!workspacePath) {
+      return;
+    }
+    if (!workspaceIdsByPath[workspacePath]) {
+      workspaceIdsByPath[workspacePath] = [];
+      workspacePathsSorted.push(workspacePath);
+    }
+    workspaceIdsByPath[workspacePath].push(workspace.id);
+  });
+  workspacePathsSorted.sort((a, b) => b.length - a.length);
+  return { workspaceIdsByPath, workspacePathsSorted };
 }
 
-function getResumedActiveTurnId(thread: Record<string, unknown>): string | null {
-  const turns = Array.isArray(thread.turns)
-    ? (thread.turns as Array<Record<string, unknown>>)
-    : [];
-  for (let index = turns.length - 1; index >= 0; index -= 1) {
-    const turn = turns[index];
-    if (!turn || typeof turn !== "object") {
-      continue;
-    }
-    const status = normalizeTurnStatus(
-      turn.status ?? turn.turnStatus ?? turn.turn_status,
-    );
-    const isInProgress =
-      status === "inprogress" ||
-      status === "running" ||
-      status === "processing" ||
-      status === "pending" ||
-      status === "started";
-    if (!isInProgress) {
-      continue;
-    }
-    const turnId = asString(turn.id ?? turn.turnId ?? turn.turn_id);
-    if (turnId) {
-      return turnId;
-    }
+function resolveWorkspaceIdForThreadPath(
+  path: string,
+  lookup: WorkspacePathLookup,
+  allowedWorkspaceIds?: Set<string>,
+) {
+  const normalizedPath = normalizeRootPath(path);
+  if (!normalizedPath) {
+    return null;
+  }
+  const matchedWorkspacePath = lookup.workspacePathsSorted.find((workspacePath) =>
+    isWithinWorkspaceRoot(normalizedPath, workspacePath),
+  );
+  if (!matchedWorkspacePath) {
+    return null;
+  }
+  const workspaceIds = lookup.workspaceIdsByPath[matchedWorkspacePath] ?? [];
+  if (!allowedWorkspaceIds) {
+    return workspaceIds[0] ?? null;
+  }
+  return (
+    workspaceIds.find((workspaceId) => allowedWorkspaceIds.has(workspaceId)) ??
+    null
+  );
+}
+
+function getThreadListNextCursor(result: Record<string, unknown>): string | null {
+  if (typeof result.nextCursor === "string") {
+    return result.nextCursor;
+  }
+  if (typeof result.next_cursor === "string") {
+    return result.next_cursor;
   }
   return null;
 }
@@ -102,6 +118,8 @@ type UseThreadActionsOptions = {
   itemsByThread: ThreadState["itemsByThread"];
   threadsByWorkspace: ThreadState["threadsByWorkspace"];
   activeThreadIdByWorkspace: ThreadState["activeThreadIdByWorkspace"];
+  activeTurnIdByThread: ThreadState["activeTurnIdByThread"];
+  threadParentById: ThreadState["threadParentById"];
   threadListCursorByWorkspace: ThreadState["threadListCursorByWorkspace"];
   threadStatusById: ThreadState["threadStatusById"];
   threadSortKey: ThreadListSortKey;
@@ -111,10 +129,17 @@ type UseThreadActionsOptions = {
   loadedThreadsRef: MutableRefObject<Record<string, boolean>>;
   replaceOnResumeRef: MutableRefObject<Record<string, boolean>>;
   applyCollabThreadLinksFromThread: (
+    workspaceId: string,
     threadId: string,
     thread: Record<string, unknown>,
   ) => void;
   updateThreadParent: (parentId: string, childIds: string[]) => void;
+  onSubagentThreadDetected: (workspaceId: string, threadId: string) => void;
+  onThreadCodexMetadataDetected?: (
+    workspaceId: string,
+    threadId: string,
+    metadata: { modelId: string | null; effort: string | null },
+  ) => void;
 };
 
 export function useThreadActions({
@@ -122,6 +147,8 @@ export function useThreadActions({
   itemsByThread,
   threadsByWorkspace,
   activeThreadIdByWorkspace,
+  activeTurnIdByThread,
+  threadParentById,
   threadListCursorByWorkspace,
   threadStatusById,
   threadSortKey,
@@ -132,8 +159,14 @@ export function useThreadActions({
   replaceOnResumeRef,
   applyCollabThreadLinksFromThread,
   updateThreadParent,
+  onSubagentThreadDetected,
+  onThreadCodexMetadataDetected,
 }: UseThreadActionsOptions) {
   const resumeInFlightByThreadRef = useRef<Record<string, number>>({});
+  const threadStatusByIdRef = useRef(threadStatusById);
+  const activeTurnIdByThreadRef = useRef(activeTurnIdByThread);
+  threadStatusByIdRef.current = threadStatusById;
+  activeTurnIdByThreadRef.current = activeTurnIdByThread;
 
   const extractThreadId = useCallback((response: Record<string, any>) => {
     const thread = response.result?.thread ?? response.thread ?? null;
@@ -196,7 +229,7 @@ export function useThreadActions({
       if (!force && loadedThreadsRef.current[threadId]) {
         return threadId;
       }
-      const status = threadStatusById[threadId];
+      const status = threadStatusByIdRef.current[threadId];
       if (status?.isProcessing && loadedThreadsRef.current[threadId] && !force) {
         onDebug?.({
           id: `${Date.now()}-client-thread-resume-skipped`,
@@ -239,11 +272,16 @@ export function useThreadActions({
           | Record<string, unknown>
           | null;
         if (thread) {
+          const codexMetadata = extractThreadCodexMetadata(thread);
+          if (codexMetadata.modelId || codexMetadata.effort) {
+            onThreadCodexMetadataDetected?.(workspaceId, threadId, codexMetadata);
+          }
           dispatch({ type: "ensureThread", workspaceId, threadId });
-          applyCollabThreadLinksFromThread(threadId, thread);
-          const sourceParentId = getParentThreadIdFromSource(thread.source);
+          applyCollabThreadLinksFromThread(workspaceId, threadId, thread);
+          const sourceParentId = getParentThreadIdFromThread(thread);
           if (sourceParentId) {
             updateThreadParent(sourceParentId, [threadId]);
+            onSubagentThreadDetected(workspaceId, threadId);
           }
           const items = buildItemsFromThread(thread);
           const localItems = itemsByThread[threadId] ?? [];
@@ -256,12 +294,34 @@ export function useThreadActions({
             loadedThreadsRef.current[threadId] = true;
             return threadId;
           }
-          const resumedActiveTurnId = getResumedActiveTurnId(thread);
+          const resumedTurnState = getResumedTurnState(thread);
+          const localStatus = threadStatusByIdRef.current[threadId];
+          const localActiveTurnId =
+            activeTurnIdByThreadRef.current[threadId] ?? null;
+          const keepLocalProcessing =
+            (localStatus?.isProcessing ?? false) &&
+            !resumedTurnState.activeTurnId &&
+            !resumedTurnState.confidentNoActiveTurn;
+          const resumedActiveTurnId = keepLocalProcessing
+            ? localActiveTurnId
+            : resumedTurnState.activeTurnId;
+          const shouldMarkProcessing = keepLocalProcessing || Boolean(resumedActiveTurnId);
+          const processingTimestamp =
+            resumedTurnState.activeTurnStartedAtMs ?? Date.now();
+          if (keepLocalProcessing) {
+            onDebug?.({
+              id: `${Date.now()}-client-thread-resume-keep-processing`,
+              timestamp: Date.now(),
+              source: "client",
+              label: "thread/resume keep-processing",
+              payload: { workspaceId, threadId },
+            });
+          }
           dispatch({
             type: "markProcessing",
             threadId,
-            isProcessing: Boolean(resumedActiveTurnId),
-            timestamp: Date.now(),
+            isProcessing: shouldMarkProcessing,
+            timestamp: processingTimestamp,
           });
           dispatch({
             type: "setActiveTurnId",
@@ -347,17 +407,23 @@ export function useThreadActions({
       itemsByThread,
       loadedThreadsRef,
       onDebug,
+      onSubagentThreadDetected,
+      onThreadCodexMetadataDetected,
       replaceOnResumeRef,
-      threadStatusById,
       updateThreadParent,
     ],
   );
 
   const forkThreadForWorkspace = useCallback(
-    async (workspaceId: string, threadId: string) => {
+    async (
+      workspaceId: string,
+      threadId: string,
+      options?: { activate?: boolean },
+    ) => {
       if (!threadId) {
         return null;
       }
+      const shouldActivate = options?.activate !== false;
       onDebug?.({
         id: `${Date.now()}-client-thread-fork`,
         timestamp: Date.now(),
@@ -379,11 +445,13 @@ export function useThreadActions({
           return null;
         }
         dispatch({ type: "ensureThread", workspaceId, threadId: forkedThreadId });
-        dispatch({
-          type: "setActiveThreadId",
-          workspaceId,
-          threadId: forkedThreadId,
-        });
+        if (shouldActivate) {
+          dispatch({
+            type: "setActiveThreadId",
+            workspaceId,
+            threadId: forkedThreadId,
+          });
+        }
         loadedThreadsRef.current[forkedThreadId] = false;
         await resumeThreadForWorkspace(workspaceId, forkedThreadId, true, true);
         return forkedThreadId;
@@ -398,7 +466,13 @@ export function useThreadActions({
         return null;
       }
     },
-    [dispatch, extractThreadId, loadedThreadsRef, onDebug, resumeThreadForWorkspace],
+    [
+      dispatch,
+      extractThreadId,
+      loadedThreadsRef,
+      onDebug,
+      resumeThreadForWorkspace,
+    ],
   );
 
   const refreshThread = useCallback(
@@ -428,27 +502,72 @@ export function useThreadActions({
     [activeThreadIdByWorkspace, loadedThreadsRef, threadsByWorkspace],
   );
 
-  const listThreadsForWorkspace = useCallback(
+  const buildThreadSummary = useCallback(
+    (
+      workspaceId: string,
+      thread: Record<string, unknown>,
+      fallbackIndex: number,
+    ): ThreadSummary | null => {
+      const id = String(thread?.id ?? "");
+      if (!id) {
+        return null;
+      }
+      const preview = asString(thread?.preview ?? "").trim();
+      const customName = getCustomName(workspaceId, id);
+      const fallbackName = `Agent ${fallbackIndex + 1}`;
+      const name = customName
+        ? customName
+        : preview.length > 0
+          ? preview.length > 38
+            ? `${preview.slice(0, 38)}…`
+            : preview
+          : fallbackName;
+      const metadata = extractThreadCodexMetadata(thread);
+      if (shouldHideSubagentThreadFromSidebar(thread.source)) {
+        return null;
+      }
+      const isSubagent = isSubagentThreadSource(thread.source);
+      return {
+        id,
+        name,
+        updatedAt: getThreadTimestamp(thread),
+        createdAt: getThreadCreatedTimestamp(thread),
+        ...(metadata.modelId ? { modelId: metadata.modelId } : {}),
+        ...(metadata.effort ? { effort: metadata.effort } : {}),
+        ...(isSubagent ? { isSubagent: true } : {}),
+      };
+    },
+    [getCustomName],
+  );
+
+  const listThreadsForWorkspaces = useCallback(
     async (
-      workspace: WorkspaceInfo,
+      workspaces: WorkspaceInfo[],
       options?: {
         preserveState?: boolean;
         sortKey?: ThreadListSortKey;
+        maxPages?: number;
       },
     ) => {
+      const targets = workspaces.filter((workspace) => workspace.id);
+      if (targets.length === 0) {
+        return;
+      }
       const preserveState = options?.preserveState ?? false;
       const requestedSortKey = options?.sortKey ?? threadSortKey;
-      const workspacePath = normalizeRootPath(workspace.path);
+      const maxPages = Math.max(1, options?.maxPages ?? THREAD_LIST_MAX_PAGES_DEFAULT);
       if (!preserveState) {
-        dispatch({
-          type: "setThreadListLoading",
-          workspaceId: workspace.id,
-          isLoading: true,
-        });
-        dispatch({
-          type: "setThreadListCursor",
-          workspaceId: workspace.id,
-          cursor: null,
+        targets.forEach((workspace) => {
+          dispatch({
+            type: "setThreadListLoading",
+            workspaceId: workspace.id,
+            isLoading: true,
+          });
+          dispatch({
+            type: "setThreadListCursor",
+            workspaceId: workspace.id,
+            cursor: null,
+          });
         });
       }
       onDebug?.({
@@ -456,22 +575,43 @@ export function useThreadActions({
         timestamp: Date.now(),
         source: "client",
         label: "thread/list",
-        payload: { workspaceId: workspace.id, path: workspace.path },
+        payload: {
+          workspaceIds: targets.map((workspace) => workspace.id),
+          preserveState,
+          maxPages,
+        },
       });
       try {
-        const knownActivityByThread = threadActivityRef.current[workspace.id] ?? {};
-        const hasKnownActivity = Object.keys(knownActivityByThread).length > 0;
-        const matchingThreads: Record<string, unknown>[] = [];
-        const maxPagesWithoutMatch = hasKnownActivity
-          ? THREAD_LIST_MAX_PAGES_WITH_ACTIVITY
-          : THREAD_LIST_MAX_PAGES_WITHOUT_ACTIVITY;
+        const requester = targets.find((workspace) => workspace.connected) ?? targets[0];
+        const matchingThreadsByWorkspace: Record<string, Record<string, unknown>[]> = {};
+        let workspacePathLookup = buildWorkspacePathLookup(targets);
+        const targetWorkspaceIds = new Set(targets.map((workspace) => workspace.id));
+        try {
+          const knownWorkspaces = await listWorkspacesService();
+          if (knownWorkspaces.length > 0) {
+            workspacePathLookup = buildWorkspacePathLookup([
+              ...targets,
+              ...knownWorkspaces,
+            ]);
+          }
+        } catch {
+          workspacePathLookup = buildWorkspacePathLookup(targets);
+        }
+        const uniqueThreadIdsByWorkspace: Record<string, Set<string>> = {};
+        const resumeCursorByWorkspace: Record<string, string | null> = {};
+        targets.forEach((workspace) => {
+          matchingThreadsByWorkspace[workspace.id] = [];
+          uniqueThreadIdsByWorkspace[workspace.id] = new Set<string>();
+          resumeCursorByWorkspace[workspace.id] = null;
+        });
         let pagesFetched = 0;
         let cursor: string | null = null;
         do {
+          const pageCursor = cursor;
           pagesFetched += 1;
           const response =
             (await listThreadsService(
-              workspace.id,
+              requester.id,
               cursor,
               THREAD_LIST_PAGE_SIZE,
               requestedSortKey,
@@ -487,123 +627,183 @@ export function useThreadActions({
           const data = Array.isArray(result?.data)
             ? (result.data as Record<string, unknown>[])
             : [];
-          const nextCursor =
-            (result?.nextCursor ?? result?.next_cursor ?? null) as string | null;
-          matchingThreads.push(
-            ...data.filter(
-              (thread) =>
-                normalizeRootPath(String(thread?.cwd ?? "")) === workspacePath,
-            ),
-          );
-          cursor = nextCursor;
-          if (matchingThreads.length === 0 && pagesFetched >= maxPagesWithoutMatch) {
-            break;
-          }
-          if (pagesFetched >= THREAD_LIST_MAX_PAGES_WITH_ACTIVITY) {
-            break;
-          }
-        } while (cursor && matchingThreads.length < THREAD_LIST_TARGET_COUNT);
-
-        const uniqueById = new Map<string, Record<string, unknown>>();
-        matchingThreads.forEach((thread) => {
-          const id = String(thread?.id ?? "");
-          if (id && !uniqueById.has(id)) {
-            uniqueById.set(id, thread);
-          }
-        });
-        const uniqueThreads = Array.from(uniqueById.values());
-        const activityByThread = threadActivityRef.current[workspace.id] ?? {};
-        const nextActivityByThread = { ...activityByThread };
-        let didChangeActivity = false;
-        uniqueThreads.forEach((thread) => {
-          const threadId = String(thread?.id ?? "");
-          if (!threadId) {
-            return;
-          }
-          const sourceParentId = getParentThreadIdFromSource(thread.source);
-          if (sourceParentId) {
-            updateThreadParent(sourceParentId, [threadId]);
-          }
-          const timestamp = getThreadTimestamp(thread);
-          if (timestamp > (nextActivityByThread[threadId] ?? 0)) {
-            nextActivityByThread[threadId] = timestamp;
-            didChangeActivity = true;
-          }
-        });
-        if (didChangeActivity) {
-          const next = {
-            ...threadActivityRef.current,
-            [workspace.id]: nextActivityByThread,
-          };
-          threadActivityRef.current = next;
-          saveThreadActivity(next);
-        }
-        if (requestedSortKey === "updated_at") {
-          uniqueThreads.sort((a, b) => {
-            const aId = String(a?.id ?? "");
-            const bId = String(b?.id ?? "");
-            const aCreated = getThreadTimestamp(a);
-            const bCreated = getThreadTimestamp(b);
-            const aActivity = Math.max(nextActivityByThread[aId] ?? 0, aCreated);
-            const bActivity = Math.max(nextActivityByThread[bId] ?? 0, bCreated);
-            return bActivity - aActivity;
-          });
-        } else {
-          uniqueThreads.sort((a, b) => {
-            const delta = getThreadCreatedTimestamp(b) - getThreadCreatedTimestamp(a);
-            if (delta !== 0) {
-              return delta;
+          const nextCursor = getThreadListNextCursor(result);
+          data.forEach((thread) => {
+            const workspaceId = resolveWorkspaceIdForThreadPath(
+              String(thread?.cwd ?? ""),
+              workspacePathLookup,
+              targetWorkspaceIds,
+            );
+            if (!workspaceId) {
+              return;
             }
-            const aId = String(a?.id ?? "");
-            const bId = String(b?.id ?? "");
-            return aId.localeCompare(bId);
+            const threadId = String(thread?.id ?? "");
+            if (threadId && shouldHideSubagentThreadFromSidebar(thread.source)) {
+              dispatch({ type: "hideThread", workspaceId, threadId });
+              return;
+            }
+            matchingThreadsByWorkspace[workspaceId]?.push(thread);
+            if (!threadId) {
+              return;
+            }
+            const uniqueThreadIds = uniqueThreadIdsByWorkspace[workspaceId];
+            if (!uniqueThreadIds || uniqueThreadIds.has(threadId)) {
+              return;
+            }
+            uniqueThreadIds.add(threadId);
+            if (
+              uniqueThreadIds.size > THREAD_LIST_TARGET_COUNT &&
+              resumeCursorByWorkspace[workspaceId] === null
+            ) {
+              resumeCursorByWorkspace[workspaceId] =
+                pageCursor ?? THREAD_LIST_CURSOR_PAGE_START;
+            }
           });
-        }
-        const summaries = uniqueThreads
-          .slice(0, THREAD_LIST_TARGET_COUNT)
-          .map((thread, index) => {
-            const id = String(thread?.id ?? "");
-            const preview = asString(thread?.preview ?? "").trim();
-            const customName = getCustomName(workspace.id, id);
-            const fallbackName = `Agent ${index + 1}`;
-            const name = customName
-              ? customName
-              : preview.length > 0
-                ? preview.length > 38
-                  ? `${preview.slice(0, 38)}…`
-                  : preview
-                : fallbackName;
-            return {
-              id,
-              name,
-              updatedAt: getThreadTimestamp(thread),
-            };
-          })
-          .filter((entry) => entry.id);
-        dispatch({
-          type: "setThreads",
-          workspaceId: workspace.id,
-          threads: summaries,
-          sortKey: requestedSortKey,
-        });
-        dispatch({
-          type: "setThreadListCursor",
-          workspaceId: workspace.id,
-          cursor,
-        });
-        uniqueThreads.forEach((thread) => {
-          const threadId = String(thread?.id ?? "");
-          const preview = asString(thread?.preview ?? "").trim();
-          if (!threadId || !preview) {
-            return;
+          cursor = nextCursor;
+          if (pagesFetched >= maxPages) {
+            break;
           }
+        } while (cursor);
+
+        const nextThreadActivity = { ...threadActivityRef.current };
+        let didChangeAnyActivity = false;
+        targets.forEach((workspace) => {
+          const matchingThreads = matchingThreadsByWorkspace[workspace.id] ?? [];
+          const uniqueById = new Map<string, Record<string, unknown>>();
+          matchingThreads.forEach((thread) => {
+            const id = String(thread?.id ?? "");
+            if (id && !uniqueById.has(id)) {
+              uniqueById.set(id, thread);
+            }
+          });
+          const uniqueThreads = Array.from(uniqueById.values());
+          const activityByThread = nextThreadActivity[workspace.id] ?? {};
+          const nextActivityByThread = { ...activityByThread };
+          let didChangeActivity = false;
+          uniqueThreads.forEach((thread) => {
+            const threadId = String(thread?.id ?? "");
+            if (!threadId) {
+              return;
+            }
+            const codexMetadata = extractThreadCodexMetadata(thread);
+            if (codexMetadata.modelId || codexMetadata.effort) {
+              onThreadCodexMetadataDetected?.(workspace.id, threadId, codexMetadata);
+            }
+            const sourceParentId = getParentThreadIdFromThread(thread);
+            if (sourceParentId) {
+              updateThreadParent(sourceParentId, [threadId]);
+              onSubagentThreadDetected(workspace.id, threadId);
+            }
+            const timestamp = getThreadTimestamp(thread);
+            if (timestamp > (nextActivityByThread[threadId] ?? 0)) {
+              nextActivityByThread[threadId] = timestamp;
+              didChangeActivity = true;
+            }
+          });
+          if (didChangeActivity) {
+            nextThreadActivity[workspace.id] = nextActivityByThread;
+            didChangeAnyActivity = true;
+          }
+          if (requestedSortKey === "updated_at") {
+            uniqueThreads.sort((a, b) => {
+              const aId = String(a?.id ?? "");
+              const bId = String(b?.id ?? "");
+              const aCreated = getThreadTimestamp(a);
+              const bCreated = getThreadTimestamp(b);
+              const aActivity = Math.max(nextActivityByThread[aId] ?? 0, aCreated);
+              const bActivity = Math.max(nextActivityByThread[bId] ?? 0, bCreated);
+              return bActivity - aActivity;
+            });
+          } else {
+            uniqueThreads.sort((a, b) => {
+              const delta =
+                getThreadCreatedTimestamp(b) - getThreadCreatedTimestamp(a);
+              if (delta !== 0) {
+                return delta;
+              }
+              const aId = String(a?.id ?? "");
+              const bId = String(b?.id ?? "");
+              return aId.localeCompare(bId);
+            });
+          }
+          const summaryById = new Map<string, ThreadSummary>();
+          uniqueThreads.forEach((thread, index) => {
+            const summary = buildThreadSummary(workspace.id, thread, index);
+            if (!summary) {
+              return;
+            }
+            summaryById.set(summary.id, summary);
+          });
+          const summaries = uniqueThreads
+            .slice(0, THREAD_LIST_TARGET_COUNT)
+            .map((thread) => summaryById.get(String(thread?.id ?? "")) ?? null)
+            .filter((entry): entry is ThreadSummary => Boolean(entry));
+          const includedIds = new Set(summaries.map((thread) => thread.id));
+          const appendFreshAnchor = (threadId: string | null | undefined) => {
+            if (!threadId || includedIds.has(threadId)) {
+              return;
+            }
+            const summary = summaryById.get(threadId);
+            if (!summary) {
+              return;
+            }
+            summaries.push(summary);
+            includedIds.add(threadId);
+          };
+          appendFreshAnchor(activeThreadIdByWorkspace[workspace.id]);
+          const workspaceThreadIds = new Set<string>([
+            ...Array.from(summaryById.keys()),
+            ...(threadsByWorkspace[workspace.id] ?? []).map((thread) => thread.id),
+          ]);
+          const activeThreadId = activeThreadIdByWorkspace[workspace.id];
+          if (activeThreadId) {
+            workspaceThreadIds.add(activeThreadId);
+          }
+          workspaceThreadIds.forEach((threadId) => {
+            if (threadStatusById[threadId]?.isProcessing) {
+              appendFreshAnchor(threadId);
+            }
+          });
+          const seedThreadIds = [...includedIds];
+          seedThreadIds.forEach((threadId) => {
+            const visited = new Set<string>([threadId]);
+            let parentId = threadParentById[threadId];
+            while (parentId && !visited.has(parentId)) {
+              visited.add(parentId);
+              appendFreshAnchor(parentId);
+              parentId = threadParentById[parentId];
+            }
+          });
           dispatch({
-            type: "setLastAgentMessage",
-            threadId,
-            text: preview,
-            timestamp: getThreadTimestamp(thread),
+            type: "setThreads",
+            workspaceId: workspace.id,
+            threads: summaries,
+            sortKey: requestedSortKey,
+            preserveAnchors: true,
+          });
+          dispatch({
+            type: "setThreadListCursor",
+            workspaceId: workspace.id,
+            cursor: resumeCursorByWorkspace[workspace.id] ?? cursor,
+          });
+          uniqueThreads.forEach((thread) => {
+            const threadId = String(thread?.id ?? "");
+            const preview = asString(thread?.preview ?? "").trim();
+            if (!threadId || !preview) {
+              return;
+            }
+            dispatch({
+              type: "setLastAgentMessage",
+              threadId,
+              text: preview,
+              timestamp: getThreadTimestamp(thread),
+            });
           });
         });
+        if (didChangeAnyActivity) {
+          threadActivityRef.current = nextThreadActivity;
+          saveThreadActivity(nextThreadActivity);
+        }
       } catch (error) {
         onDebug?.({
           id: `${Date.now()}-client-thread-list-error`,
@@ -614,32 +814,57 @@ export function useThreadActions({
         });
       } finally {
         if (!preserveState) {
-          dispatch({
-            type: "setThreadListLoading",
-            workspaceId: workspace.id,
-            isLoading: false,
+          targets.forEach((workspace) => {
+            dispatch({
+              type: "setThreadListLoading",
+              workspaceId: workspace.id,
+              isLoading: false,
+            });
           });
         }
       }
     },
     [
+      buildThreadSummary,
       dispatch,
-      getCustomName,
       onDebug,
+      onSubagentThreadDetected,
+      onThreadCodexMetadataDetected,
+      activeThreadIdByWorkspace,
+      threadParentById,
       threadActivityRef,
+      threadStatusById,
       threadSortKey,
+      threadsByWorkspace,
       updateThreadParent,
     ],
+  );
+
+  const listThreadsForWorkspace = useCallback(
+    async (
+      workspace: WorkspaceInfo,
+      options?: {
+        preserveState?: boolean;
+        sortKey?: ThreadListSortKey;
+        maxPages?: number;
+      },
+    ) => {
+      await listThreadsForWorkspaces([workspace], options);
+    },
+    [listThreadsForWorkspaces],
   );
 
   const loadOlderThreadsForWorkspace = useCallback(
     async (workspace: WorkspaceInfo) => {
       const requestedSortKey = threadSortKey;
-      const nextCursor = threadListCursorByWorkspace[workspace.id] ?? null;
-      if (!nextCursor) {
+      const cursorValue = threadListCursorByWorkspace[workspace.id] ?? null;
+      if (!cursorValue) {
         return;
       }
-      const workspacePath = normalizeRootPath(workspace.path);
+      const nextCursor =
+        cursorValue === THREAD_LIST_CURSOR_PAGE_START ? null : cursorValue;
+      let workspacePathLookup = buildWorkspacePathLookup([workspace]);
+      const allowedWorkspaceIds = new Set([workspace.id]);
       const existing = threadsByWorkspace[workspace.id] ?? [];
       dispatch({
         type: "setThreadListPaging",
@@ -651,9 +876,20 @@ export function useThreadActions({
         timestamp: Date.now(),
         source: "client",
         label: "thread/list older",
-        payload: { workspaceId: workspace.id, cursor: nextCursor },
+        payload: { workspaceId: workspace.id, cursor: cursorValue },
       });
       try {
+        try {
+          const knownWorkspaces = await listWorkspacesService();
+          if (knownWorkspaces.length > 0) {
+            workspacePathLookup = buildWorkspacePathLookup([
+              workspace,
+              ...knownWorkspaces,
+            ]);
+          }
+        } catch {
+          workspacePathLookup = buildWorkspacePathLookup([workspace]);
+        }
         const matchingThreads: Record<string, unknown>[] = [];
         const maxPagesWithoutMatch = THREAD_LIST_MAX_PAGES_OLDER;
         let pagesFetched = 0;
@@ -678,12 +914,25 @@ export function useThreadActions({
           const data = Array.isArray(result?.data)
             ? (result.data as Record<string, unknown>[])
             : [];
-          const next =
-            (result?.nextCursor ?? result?.next_cursor ?? null) as string | null;
+          const next = getThreadListNextCursor(result);
           matchingThreads.push(
             ...data.filter(
-              (thread) =>
-                normalizeRootPath(String(thread?.cwd ?? "")) === workspacePath,
+              (thread) => {
+                const workspaceId = resolveWorkspaceIdForThreadPath(
+                  String(thread?.cwd ?? ""),
+                  workspacePathLookup,
+                  allowedWorkspaceIds,
+                );
+                if (workspaceId !== workspace.id) {
+                  return false;
+                }
+                const threadId = String(thread?.id ?? "");
+                if (threadId && shouldHideSubagentThreadFromSidebar(thread.source)) {
+                  dispatch({ type: "hideThread", workspaceId, threadId });
+                  return false;
+                }
+                return true;
+              },
             ),
           );
           cursor = next;
@@ -702,21 +951,23 @@ export function useThreadActions({
           if (!id || existingIds.has(id)) {
             return;
           }
-          const sourceParentId = getParentThreadIdFromSource(thread.source);
+          const codexMetadata = extractThreadCodexMetadata(thread);
+          if (codexMetadata.modelId || codexMetadata.effort) {
+            onThreadCodexMetadataDetected?.(workspace.id, id, codexMetadata);
+          }
+          const sourceParentId = getParentThreadIdFromThread(thread);
           if (sourceParentId) {
             updateThreadParent(sourceParentId, [id]);
           }
-          const preview = asString(thread?.preview ?? "").trim();
-          const customName = getCustomName(workspace.id, id);
-          const fallbackName = `Agent ${existing.length + additions.length + 1}`;
-          const name = customName
-            ? customName
-            : preview.length > 0
-              ? preview.length > 38
-                ? `${preview.slice(0, 38)}…`
-                : preview
-              : fallbackName;
-          additions.push({ id, name, updatedAt: getThreadTimestamp(thread) });
+          const summary = buildThreadSummary(
+            workspace.id,
+            thread,
+            existing.length + additions.length,
+          );
+          if (!summary) {
+            return;
+          }
+          additions.push(summary);
           existingIds.add(id);
         });
 
@@ -763,13 +1014,14 @@ export function useThreadActions({
       }
     },
     [
+      buildThreadSummary,
       dispatch,
-      getCustomName,
       onDebug,
       threadListCursorByWorkspace,
       threadsByWorkspace,
       threadSortKey,
       updateThreadParent,
+      onThreadCodexMetadataDetected,
     ],
   );
 
@@ -796,6 +1048,7 @@ export function useThreadActions({
     resumeThreadForWorkspace,
     refreshThread,
     resetWorkspaceThreads,
+    listThreadsForWorkspaces,
     listThreadsForWorkspace,
     loadOlderThreadsForWorkspace,
     archiveThread,

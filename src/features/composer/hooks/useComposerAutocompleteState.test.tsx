@@ -101,6 +101,7 @@ describe("useComposerAutocompleteState slash commands", () => {
       expect.arrayContaining([
         "apps",
         "compact",
+        "fast",
         "fork",
         "mcp",
         "new",
@@ -109,9 +110,10 @@ describe("useComposerAutocompleteState slash commands", () => {
         "status",
       ]),
     );
-    expect(labels.slice(0, 8)).toEqual([
+    expect(labels.slice(0, 9)).toEqual([
       "apps",
       "compact",
+      "fast",
       "fork",
       "mcp",
       "new",
@@ -148,7 +150,16 @@ describe("useComposerAutocompleteState slash commands", () => {
 
     const labels = result.current.autocompleteMatches.map((item) => item.label);
     expect(labels).not.toContain("apps");
-    expect(labels).toEqual(["compact", "fork", "mcp", "new", "resume", "review", "status"]);
+    expect(labels).toEqual([
+      "compact",
+      "fast",
+      "fork",
+      "mcp",
+      "new",
+      "resume",
+      "review",
+      "status",
+    ]);
   });
 });
 
@@ -174,8 +185,8 @@ describe("useComposerAutocompleteState $ completions", () => {
         ],
         apps: [
           {
-            id: "calendar",
-            name: "Calendar",
+            id: "connector_calendar",
+            name: "Calendar App",
             description: "Calendar app",
             isAccessible: true,
             installUrl: null,
@@ -201,11 +212,12 @@ describe("useComposerAutocompleteState $ completions", () => {
     const ids = result.current.autocompleteMatches.map((item) => item.id);
     const groups = result.current.autocompleteMatches.map((item) => item.group);
     const appSuggestion = result.current.autocompleteMatches.find(
-      (item) => item.id === "app:calendar",
+      (item) => item.id === "app:connector_calendar",
     );
-    expect(ids).toEqual(["skill:skill-a", "skill:skill-b", "app:calendar"]);
+    expect(ids).toEqual(["skill:skill-a", "skill:skill-b", "app:connector_calendar"]);
     expect(groups).toEqual(["Skills", "Skills", "Apps"]);
     expect(ids).not.toContain("app:not-ready");
-    expect(appSuggestion?.insertText).toBe("calendar");
+    expect(appSuggestion?.insertText).toBe("calendar-app");
+    expect(appSuggestion?.mentionPath).toBe("app://connector_calendar");
   });
 });

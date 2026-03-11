@@ -8,7 +8,9 @@ use super::worktree::{
     build_clone_destination_path, sanitize_clone_dir_name, sanitize_worktree_name,
 };
 use crate::backend::app_server::WorkspaceSession;
-use crate::shared::workspaces_core::rename_worktree_core;
+use crate::shared::workspaces_core::{
+    remove_workspace_core, remove_worktree_core, rename_worktree_core,
+};
 use crate::storage::{read_workspaces, write_workspaces};
 use crate::types::{
     AppSettings, WorkspaceEntry, WorkspaceInfo, WorkspaceKind, WorkspaceSettings, WorktreeInfo,
@@ -42,7 +44,6 @@ fn workspace_with_id_and_kind(
         name: name.to_string(),
         path: "/tmp".to_string(),
         connected: false,
-        codex_bin: None,
         kind,
         parent_id,
         worktree,
@@ -50,9 +51,8 @@ fn workspace_with_id_and_kind(
             sidebar_collapsed: false,
             sort_order,
             group_id: None,
+            clone_source_workspace_id: None,
             git_root: None,
-            codex_home: None,
-            codex_args: None,
             launch_script: None,
             launch_scripts: None,
             worktree_setup_script: None,
@@ -203,7 +203,6 @@ fn update_workspace_settings_persists_sort_and_group() {
         id: id.clone(),
         name: "Workspace".to_string(),
         path: "/tmp".to_string(),
-        codex_bin: None,
         kind: WorkspaceKind::Main,
         parent_id: None,
         worktree: None,
@@ -269,7 +268,6 @@ fn rename_worktree_preserves_custom_name() {
             id: "parent".to_string(),
             name: "Parent".to_string(),
             path: repo_path.to_string_lossy().to_string(),
-            codex_bin: None,
             kind: WorkspaceKind::Main,
             parent_id: None,
             worktree: None,
@@ -279,7 +277,6 @@ fn rename_worktree_preserves_custom_name() {
             id: "wt-1".to_string(),
             name: "Custom label".to_string(),
             path: worktree_path.to_string_lossy().to_string(),
-            codex_bin: None,
             kind: WorkspaceKind::Worktree,
             parent_id: Some(parent.id.clone()),
             worktree: Some(WorktreeInfo {
@@ -342,7 +339,6 @@ fn rename_worktree_updates_name_when_unmodified() {
             id: "parent".to_string(),
             name: "Parent".to_string(),
             path: repo_path.to_string_lossy().to_string(),
-            codex_bin: None,
             kind: WorkspaceKind::Main,
             parent_id: None,
             worktree: None,
@@ -352,7 +348,6 @@ fn rename_worktree_updates_name_when_unmodified() {
             id: "wt-2".to_string(),
             name: "feature/old".to_string(),
             path: worktree_path.to_string_lossy().to_string(),
-            codex_bin: None,
             kind: WorkspaceKind::Worktree,
             parent_id: Some(parent.id.clone()),
             worktree: Some(WorktreeInfo {
@@ -392,5 +387,118 @@ fn rename_worktree_updates_name_when_unmodified() {
         .expect("rename worktree");
 
         assert_eq!(updated.name, "feature/new");
+    });
+}
+
+#[test]
+fn remove_workspace_succeeds_when_parent_repo_folder_is_missing() {
+    run_async(async {
+        let temp_dir = std::env::temp_dir().join(format!("codex-monitor-test-{}", Uuid::new_v4()));
+        let parent_repo_path = temp_dir.join("deleted-parent-repo");
+        let child_path = temp_dir.join("worktrees").join("parent").join("feature-a");
+        std::fs::create_dir_all(&child_path).expect("create child path");
+
+        let parent = WorkspaceEntry {
+            id: "parent".to_string(),
+            name: "Parent".to_string(),
+            path: parent_repo_path.to_string_lossy().to_string(),
+            kind: WorkspaceKind::Main,
+            parent_id: None,
+            worktree: None,
+            settings: WorkspaceSettings::default(),
+        };
+        let child = WorkspaceEntry {
+            id: "wt-missing-parent".to_string(),
+            name: "feature-a".to_string(),
+            path: child_path.to_string_lossy().to_string(),
+            kind: WorkspaceKind::Worktree,
+            parent_id: Some(parent.id.clone()),
+            worktree: Some(WorktreeInfo {
+                branch: "feature-a".to_string(),
+            }),
+            settings: WorkspaceSettings::default(),
+        };
+        let workspaces = Mutex::new(HashMap::from([
+            (parent.id.clone(), parent.clone()),
+            (child.id.clone(), child.clone()),
+        ]));
+        let sessions: Mutex<HashMap<String, Arc<WorkspaceSession>>> = Mutex::new(HashMap::new());
+        let storage_path = temp_dir.join("workspaces.json");
+
+        remove_workspace_core(
+            parent.id.clone(),
+            &workspaces,
+            &sessions,
+            &storage_path,
+            |_root, _args| async move {
+                panic!("git should not run when parent repo folder is missing");
+            },
+            |_error| false,
+            |path| std::fs::remove_dir_all(path).map_err(|err| err.to_string()),
+            true,
+            true,
+        )
+        .await
+        .expect("remove workspace");
+
+        assert!(!child_path.exists());
+        let workspaces_guard = workspaces.lock().await;
+        assert!(workspaces_guard.is_empty());
+    });
+}
+
+#[test]
+fn remove_worktree_succeeds_when_parent_repo_folder_is_missing() {
+    run_async(async {
+        let temp_dir = std::env::temp_dir().join(format!("codex-monitor-test-{}", Uuid::new_v4()));
+        let parent_repo_path = temp_dir.join("deleted-parent-repo");
+        let child_path = temp_dir.join("worktrees").join("parent").join("feature-b");
+        std::fs::create_dir_all(&child_path).expect("create child path");
+
+        let parent = WorkspaceEntry {
+            id: "parent".to_string(),
+            name: "Parent".to_string(),
+            path: parent_repo_path.to_string_lossy().to_string(),
+            kind: WorkspaceKind::Main,
+            parent_id: None,
+            worktree: None,
+            settings: WorkspaceSettings::default(),
+        };
+        let child = WorkspaceEntry {
+            id: "wt-remove-only".to_string(),
+            name: "feature-b".to_string(),
+            path: child_path.to_string_lossy().to_string(),
+            kind: WorkspaceKind::Worktree,
+            parent_id: Some(parent.id.clone()),
+            worktree: Some(WorktreeInfo {
+                branch: "feature-b".to_string(),
+            }),
+            settings: WorkspaceSettings::default(),
+        };
+        let workspaces = Mutex::new(HashMap::from([
+            (parent.id.clone(), parent.clone()),
+            (child.id.clone(), child.clone()),
+        ]));
+        let sessions: Mutex<HashMap<String, Arc<WorkspaceSession>>> = Mutex::new(HashMap::new());
+        let storage_path = temp_dir.join("workspaces.json");
+
+        remove_worktree_core(
+            child.id.clone(),
+            &workspaces,
+            &sessions,
+            &storage_path,
+            |_root, _args| async move {
+                panic!("git should not run when parent repo folder is missing");
+            },
+            |_error| false,
+            |path| std::fs::remove_dir_all(path).map_err(|err| err.to_string()),
+        )
+        .await
+        .expect("remove worktree");
+
+        assert!(!child_path.exists());
+        let workspaces_guard = workspaces.lock().await;
+        assert!(workspaces_guard.contains_key(&parent.id));
+        assert!(!workspaces_guard.contains_key(&child.id));
     });
 }

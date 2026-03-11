@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ConversationItem, ThreadSummary } from "../../../types";
+import type { ConversationItem, ThreadSummary } from "@/types";
 import { initialState, threadReducer } from "./useThreadsReducer";
 import type { ThreadState } from "./useThreadsReducer";
 
@@ -571,4 +571,159 @@ describe("threadReducer", () => {
     expect(ids).toContain("thread-visible");
     expect(ids).not.toContain("thread-bg");
   });
+
+  it("preserves active, processing, and ancestor anchors on partial setThreads payloads", () => {
+    const base: ThreadState = {
+      ...initialState,
+      threadsByWorkspace: {
+        "ws-1": [
+          { id: "thread-parent", name: "Parent (stale)", updatedAt: 10 },
+          { id: "thread-child", name: "Child (stale)", updatedAt: 11 },
+          { id: "thread-active", name: "Active", updatedAt: 12 },
+          { id: "thread-processing", name: "Processing", updatedAt: 13 },
+        ],
+      },
+      activeThreadIdByWorkspace: { "ws-1": "thread-active" },
+      threadParentById: {
+        "thread-child": "thread-parent",
+      },
+      threadStatusById: {
+        "thread-processing": {
+          isProcessing: true,
+          hasUnread: false,
+          isReviewing: false,
+          processingStartedAt: null,
+          lastDurationMs: null,
+        },
+      },
+      lastAgentMessageByThread: {
+        "thread-parent": {
+          text: "Parent fresh preview",
+          timestamp: 300,
+        },
+      },
+    };
+
+    const next = threadReducer(base, {
+      type: "setThreads",
+      workspaceId: "ws-1",
+      sortKey: "updated_at",
+      preserveAnchors: true,
+      threads: [
+        { id: "thread-child", name: "Child (fresh)", updatedAt: 200 },
+        { id: "thread-new", name: "New", updatedAt: 199 },
+      ],
+    });
+
+    expect(next.threadsByWorkspace["ws-1"]?.map((thread) => thread.id)).toEqual([
+      "thread-child",
+      "thread-new",
+      "thread-active",
+      "thread-processing",
+      "thread-parent",
+    ]);
+    expect(
+      next.threadsByWorkspace["ws-1"]?.find((thread) => thread.id === "thread-child")
+        ?.name,
+    ).toBe("Child (fresh)");
+    expect(
+      next.threadsByWorkspace["ws-1"]?.find((thread) => thread.id === "thread-parent")
+        ?.updatedAt,
+    ).toBe(300);
+  });
+
+  it("does not resurrect hidden anchors on partial setThreads payloads", () => {
+    const base: ThreadState = {
+      ...initialState,
+      threadsByWorkspace: {
+        "ws-1": [
+          { id: "thread-parent", name: "Parent", updatedAt: 10 },
+          { id: "thread-child", name: "Child", updatedAt: 11 },
+          { id: "thread-active", name: "Active", updatedAt: 12 },
+          { id: "thread-processing", name: "Processing", updatedAt: 13 },
+        ],
+      },
+      activeThreadIdByWorkspace: { "ws-1": "thread-active" },
+      hiddenThreadIdsByWorkspace: {
+        "ws-1": {
+          "thread-parent": true,
+          "thread-active": true,
+          "thread-processing": true,
+        },
+      },
+      threadParentById: {
+        "thread-child": "thread-parent",
+      },
+      threadStatusById: {
+        "thread-processing": {
+          isProcessing: true,
+          hasUnread: false,
+          isReviewing: false,
+          processingStartedAt: null,
+          lastDurationMs: null,
+        },
+      },
+    };
+
+    const next = threadReducer(base, {
+      type: "setThreads",
+      workspaceId: "ws-1",
+      sortKey: "updated_at",
+      preserveAnchors: true,
+      threads: [{ id: "thread-child", name: "Child", updatedAt: 210 }],
+    });
+
+    expect(next.threadsByWorkspace["ws-1"]?.map((thread) => thread.id)).toEqual([
+      "thread-child",
+    ]);
+  });
+
+  it("drops stale active anchors on complete setThreads payloads", () => {
+    const base: ThreadState = {
+      ...initialState,
+      threadsByWorkspace: {
+        "ws-1": [
+          { id: "thread-old", name: "Old", updatedAt: 10 },
+          { id: "thread-stale", name: "Stale", updatedAt: 9 },
+        ],
+      },
+      activeThreadIdByWorkspace: { "ws-1": "thread-old" },
+    };
+
+    const next = threadReducer(base, {
+      type: "setThreads",
+      workspaceId: "ws-1",
+      sortKey: "updated_at",
+      threads: [{ id: "thread-fresh", name: "Fresh", updatedAt: 210 }],
+    });
+
+    expect(next.threadsByWorkspace["ws-1"]?.map((thread) => thread.id)).toEqual([
+      "thread-fresh",
+    ]);
+    expect(next.activeThreadIdByWorkspace["ws-1"]).toBe("thread-fresh");
+  });
+
+  it("trims existing items when maxItemsPerThread is reduced", () => {
+    const items: ConversationItem[] = Array.from({ length: 5 }, (_, index) => ({
+      id: `msg-${index}`,
+      kind: "message",
+      role: "assistant",
+      text: `message ${index}`,
+    }));
+
+    const withItems = threadReducer(initialState, {
+      type: "setThreadItems",
+      threadId: "thread-1",
+      items,
+    });
+    expect(withItems.itemsByThread["thread-1"]).toHaveLength(5);
+
+    const trimmed = threadReducer(withItems, {
+      type: "setMaxItemsPerThread",
+      maxItemsPerThread: 3,
+    });
+    expect(trimmed.itemsByThread["thread-1"]).toHaveLength(3);
+    expect(trimmed.itemsByThread["thread-1"]?.[0]?.id).toBe("msg-2");
+  });
+
 });

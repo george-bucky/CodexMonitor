@@ -24,7 +24,7 @@ export type MessageImage = {
 
 export type ToolGroupItem = Extract<
   ConversationItem,
-  { kind: "tool" | "reasoning" | "explore" }
+  { kind: "tool" | "reasoning" | "explore" | "userInput" }
 >;
 
 export type ToolGroup = {
@@ -75,6 +75,64 @@ function firstStringField(
     }
   }
   return "";
+}
+
+function formatCollabAgentLabel(agent: {
+  threadId: string;
+  nickname?: string;
+  role?: string;
+}) {
+  const nickname = agent.nickname?.trim();
+  const role = agent.role?.trim();
+  if (nickname && role) {
+    return `${nickname} [${role}]`;
+  }
+  if (nickname) {
+    return nickname;
+  }
+  if (role) {
+    return `${agent.threadId} [${role}]`;
+  }
+  return agent.threadId;
+}
+
+function summarizeCollabLabel(title: string, status?: string) {
+  const tool = title.replace(/^collab:\s*/i, "").trim().toLowerCase();
+  const tone = statusToneFromText(status);
+  if (tool.includes("wait")) {
+    return tone === "processing" ? "waiting for" : "waited for";
+  }
+  if (tool.includes("resume")) {
+    return tone === "processing" ? "resuming" : "resumed";
+  }
+  if (tool.includes("close")) {
+    return tone === "processing" ? "closing" : "closed";
+  }
+  if (tool.includes("spawn")) {
+    return tone === "processing" ? "spawning" : "spawned";
+  }
+  if (tool.includes("send") || tool.includes("interaction")) {
+    return tone === "processing" ? "sending to" : "sent to";
+  }
+  return "sub-agent";
+}
+
+function summarizeCollabReceiver(
+  item: Extract<ConversationItem, { kind: "tool" }>,
+) {
+  const receivers =
+    item.collabReceivers && item.collabReceivers.length > 0
+      ? item.collabReceivers
+      : item.collabReceiver
+        ? [item.collabReceiver]
+        : [];
+  if (receivers.length === 0) {
+    return item.title || "";
+  }
+  if (receivers.length === 1) {
+    return formatCollabAgentLabel(receivers[0]);
+  }
+  return `${formatCollabAgentLabel(receivers[0])} +${receivers.length - 1}`;
 }
 
 export function toolNameFromTitle(title: string) {
@@ -162,7 +220,12 @@ export function normalizeMessageImageSrc(path: string) {
 }
 
 function isToolGroupItem(item: ConversationItem): item is ToolGroupItem {
-  return item.kind === "tool" || item.kind === "reasoning" || item.kind === "explore";
+  return (
+    item.kind === "tool" ||
+    item.kind === "reasoning" ||
+    item.kind === "explore" ||
+    item.kind === "userInput"
+  );
 }
 
 function mergeExploreItems(
@@ -289,8 +352,8 @@ export function buildToolSummary(
 
   if (item.toolType === "webSearch") {
     return {
-      label: "searched",
-      value: item.detail || "",
+      label: statusToneFromText(item.status) === "processing" ? "searching" : "searched",
+      value: item.detail || "the web",
     };
   }
 
@@ -302,12 +365,21 @@ export function buildToolSummary(
     };
   }
 
+  if (item.toolType === "collabToolCall") {
+    return {
+      label: summarizeCollabLabel(item.title, item.status),
+      value: summarizeCollabReceiver(item),
+      detail: item.detail || "",
+      output: item.output || "",
+    };
+  }
+
   if (item.toolType === "mcpToolCall") {
     const toolName = toolNameFromTitle(item.title);
     const args = parseToolArgs(item.detail);
     if (toolName.toLowerCase().includes("search")) {
       return {
-        label: "searched",
+        label: statusToneFromText(item.status) === "processing" ? "searching" : "searched",
         value:
           firstStringField(args, ["query", "pattern", "text"]) || item.detail,
       };
@@ -353,7 +425,7 @@ export function statusToneFromText(status?: string): StatusTone {
   if (/(fail|error)/.test(normalized)) {
     return "failed";
   }
-  if (/(pending|running|processing|started|in_progress)/.test(normalized)) {
+  if (/(pending|running|processing|started|in[_\s-]?progress)/.test(normalized)) {
     return "processing";
   }
   if (/(complete|completed|success|done)/.test(normalized)) {
@@ -376,6 +448,72 @@ export function toolStatusTone(
   return "processing";
 }
 
+
+export type PlanFollowupState = {
+  shouldShow: boolean;
+  planItemId: string | null;
+};
+
+export function computePlanFollowupState({
+  threadId,
+  items,
+  isThinking,
+  hasVisibleUserInputRequest,
+}: {
+  threadId: string | null;
+  items: ConversationItem[];
+  isThinking: boolean;
+  hasVisibleUserInputRequest: boolean;
+}): PlanFollowupState {
+  if (!threadId) {
+    return { shouldShow: false, planItemId: null };
+  }
+  if (hasVisibleUserInputRequest) {
+    return { shouldShow: false, planItemId: null };
+  }
+
+  let planIndex = -1;
+  let planItem: Extract<ConversationItem, { kind: "tool" }> | null = null;
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item.kind === "tool" && item.toolType === "plan") {
+      planIndex = index;
+      planItem = item;
+      break;
+    }
+  }
+
+  if (!planItem) {
+    return { shouldShow: false, planItemId: null };
+  }
+
+  const planItemId = planItem.id;
+
+  if (!(planItem.output ?? "").trim()) {
+    return { shouldShow: false, planItemId };
+  }
+
+  const planTone = toolStatusTone(planItem, false);
+  if (planTone === "failed") {
+    return { shouldShow: false, planItemId };
+  }
+
+  // Some backends stream plan output deltas without a final status update. As
+  // soon as the turn stops thinking, treat the latest plan output as ready.
+  if (isThinking && planTone !== "completed") {
+    return { shouldShow: false, planItemId };
+  }
+
+  for (let index = planIndex + 1; index < items.length; index += 1) {
+    const item = items[index];
+    if (item.kind === "message" && item.role === "user") {
+      return { shouldShow: false, planItemId };
+    }
+  }
+
+  return { shouldShow: true, planItemId };
+}
+
 export function scrollKeyForItems(items: ConversationItem[]) {
   if (!items.length) {
     return "empty";
@@ -384,6 +522,8 @@ export function scrollKeyForItems(items: ConversationItem[]) {
   switch (last.kind) {
     case "message":
       return `${last.id}-${last.text.length}`;
+    case "userInput":
+      return `${last.id}-${last.status}-${last.questions.length}`;
     case "reasoning":
       return `${last.id}-${last.summary.length}-${last.content.length}`;
     case "explore":

@@ -49,6 +49,10 @@ describe("useAppServerEvents", () => {
       onWorkspaceConnected: vi.fn(),
       onThreadStarted: vi.fn(),
       onThreadNameUpdated: vi.fn(),
+      onThreadStatusChanged: vi.fn(),
+      onThreadClosed: vi.fn(),
+      onThreadArchived: vi.fn(),
+      onThreadUnarchived: vi.fn(),
       onBackgroundThreadAction: vi.fn(),
       onAgentMessageDelta: vi.fn(),
       onReasoningSummaryBoundary: vi.fn(),
@@ -57,6 +61,7 @@ describe("useAppServerEvents", () => {
       onRequestUserInput: vi.fn(),
       onItemCompleted: vi.fn(),
       onAgentMessageCompleted: vi.fn(),
+      onAccountRateLimitsUpdated: vi.fn(),
       onAccountUpdated: vi.fn(),
       onAccountLoginCompleted: vi.fn(),
     };
@@ -148,6 +153,54 @@ describe("useAppServerEvents", () => {
       listener?.({
         workspace_id: "ws-1",
         message: {
+          method: "thread/status/changed",
+          params: { threadId: "thread-2", status: { type: "active" } },
+        },
+      });
+    });
+    expect(handlers.onThreadStatusChanged).toHaveBeenCalledWith(
+      "ws-1",
+      "thread-2",
+      { type: "active" },
+    );
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "thread/closed",
+          params: { threadId: "thread-2" },
+        },
+      });
+    });
+    expect(handlers.onThreadClosed).toHaveBeenCalledWith("ws-1", "thread-2");
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "thread/archived",
+          params: { thread_id: "thread-2" },
+        },
+      });
+    });
+    expect(handlers.onThreadArchived).toHaveBeenCalledWith("ws-1", "thread-2");
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "thread/unarchived",
+          params: { threadId: "thread-2" },
+        },
+      });
+    });
+    expect(handlers.onThreadUnarchived).toHaveBeenCalledWith("ws-1", "thread-2");
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
           method: "codex/backgroundThread",
           params: { threadId: "thread-2", action: "hide" },
         },
@@ -163,17 +216,17 @@ describe("useAppServerEvents", () => {
       listener?.({
         workspace_id: "ws-1",
         message: {
-          method: "workspace/requestApproval",
+          method: "item/permissions/requestApproval",
           id: 7,
-          params: { mode: "full" },
+          params: { mode: "full", threadId: "thread-2" },
         },
       });
     });
     expect(handlers.onApprovalRequest).toHaveBeenCalledWith({
       workspace_id: "ws-1",
       request_id: 7,
-      method: "workspace/requestApproval",
-      params: { mode: "full" },
+      method: "item/permissions/requestApproval",
+      params: { mode: "full", threadId: "thread-2" },
     });
 
     act(() => {
@@ -245,6 +298,36 @@ describe("useAppServerEvents", () => {
       threadId: "thread-1",
       itemId: "item-2",
       text: "Done",
+    });
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "account/rateLimits/updated",
+          params: {
+            rateLimits: { primary: { usedPercent: 25 } },
+          },
+        },
+      });
+    });
+    expect(handlers.onAccountRateLimitsUpdated).toHaveBeenCalledWith("ws-1", {
+      primary: { usedPercent: 25 },
+    });
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "account/rateLimits/updated",
+          params: {
+            rate_limits: { primary: { used_percent: 30 } },
+          },
+        },
+      });
+    });
+    expect(handlers.onAccountRateLimitsUpdated).toHaveBeenCalledWith("ws-1", {
+      primary: { used_percent: 30 },
     });
 
     act(() => {
@@ -383,6 +466,33 @@ describe("useAppServerEvents", () => {
     });
 
     expect(handlers.onAgentMessageDelta).not.toHaveBeenCalled();
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("coerces string thread status payloads to object form", async () => {
+    const handlers: Handlers = {
+      onThreadStatusChanged: vi.fn(),
+    };
+    const { root } = await mount(handlers);
+
+    act(() => {
+      listener?.({
+        workspace_id: "ws-1",
+        message: {
+          method: "thread/status/changed",
+          params: { thread_id: "thread-1", status: "idle" },
+        },
+      });
+    });
+
+    expect(handlers.onThreadStatusChanged).toHaveBeenCalledWith(
+      "ws-1",
+      "thread-1",
+      { type: "idle" },
+    );
 
     await act(async () => {
       root.unmount();

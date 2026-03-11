@@ -18,9 +18,13 @@ export function useLayoutController({
   toggleTerminalShortcut: string | null;
 }) {
   const {
+    appRef,
+    isResizing,
     sidebarWidth,
     rightPanelWidth,
+    chatDiffSplitPositionPercent,
     onSidebarResizeStart,
+    onChatDiffSplitPositionResizeStart,
     onRightPanelResizeStart,
     planPanelHeight,
     onPlanPanelResizeStart,
@@ -65,16 +69,20 @@ export function useLayoutController({
   });
 
   return {
+    appRef,
+    isResizing,
     layoutMode,
     isCompact,
     isTablet,
     isPhone,
     sidebarWidth,
     rightPanelWidth,
+    chatDiffSplitPositionPercent,
     planPanelHeight,
     terminalPanelHeight,
     debugPanelHeight,
     onSidebarResizeStart,
+    onChatDiffSplitPositionResizeStart,
     onRightPanelResizeStart,
     onPlanPanelResizeStart,
     onTerminalPanelResizeStart,

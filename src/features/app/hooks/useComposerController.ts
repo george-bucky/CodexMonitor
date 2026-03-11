@@ -1,5 +1,12 @@
 import { useCallback, useMemo, useState } from "react";
-import type { QueuedMessage, WorkspaceInfo } from "../../../types";
+import type {
+  AppMention,
+  ComposerSendIntent,
+  FollowUpMessageBehavior,
+  QueuedMessage,
+  SendMessageResult,
+  WorkspaceInfo,
+} from "../../../types";
 import { useComposerImages } from "../../composer/hooks/useComposerImages";
 import { useQueuedSend } from "../../threads/hooks/useQueuedSend";
 
@@ -10,7 +17,9 @@ export function useComposerController({
   activeWorkspace,
   isProcessing,
   isReviewing,
+  queueFlushPaused = false,
   steerEnabled,
+  followUpMessageBehavior,
   appsEnabled,
   connectWorkspace,
   startThreadForWorkspace,
@@ -22,6 +31,7 @@ export function useComposerController({
   startCompact,
   startApps,
   startMcp,
+  startFast,
   startStatus,
 }: {
   activeThreadId: string | null;
@@ -30,26 +40,34 @@ export function useComposerController({
   activeWorkspace: WorkspaceInfo | null;
   isProcessing: boolean;
   isReviewing: boolean;
+  queueFlushPaused?: boolean;
   steerEnabled: boolean;
+  followUpMessageBehavior: FollowUpMessageBehavior;
   appsEnabled: boolean;
   connectWorkspace: (workspace: WorkspaceInfo) => Promise<void>;
   startThreadForWorkspace: (
     workspaceId: string,
     options?: { activate?: boolean },
   ) => Promise<string | null>;
-  sendUserMessage: (text: string, images?: string[]) => Promise<void>;
+  sendUserMessage: (
+    text: string,
+    images?: string[],
+    appMentions?: AppMention[],
+    options?: { sendIntent?: ComposerSendIntent },
+  ) => Promise<{ status: "sent" | "blocked" | "steer_failed" }>;
   sendUserMessageToThread: (
     workspace: WorkspaceInfo,
     threadId: string,
     text: string,
     images?: string[],
-  ) => Promise<void>;
+  ) => Promise<void | SendMessageResult>;
   startFork: (text: string) => Promise<void>;
   startReview: (text: string) => Promise<void>;
   startResume: (text: string) => Promise<void>;
   startCompact: (text: string) => Promise<void>;
   startApps: (text: string) => Promise<void>;
   startMcp: (text: string) => Promise<void>;
+  startFast: (text: string) => Promise<void>;
   startStatus: (text: string) => Promise<void>;
 }) {
   const [composerDraftsByThread, setComposerDraftsByThread] = useState<
@@ -80,7 +98,9 @@ export function useComposerController({
     activeTurnId,
     isProcessing,
     isReviewing,
+    queueFlushPaused,
     steerEnabled,
+    followUpMessageBehavior,
     appsEnabled,
     activeWorkspace,
     connectWorkspace,
@@ -93,6 +113,7 @@ export function useComposerController({
     startCompact,
     startApps,
     startMcp,
+    startFast,
     startStatus,
     clearActiveImages,
   });
@@ -117,11 +138,11 @@ export function useComposerController({
   );
 
   const handleSendPrompt = useCallback(
-    (text: string) => {
+    (text: string, appMentions?: AppMention[]) => {
       if (!text.trim()) {
         return;
       }
-      void handleSend(text, []);
+      void handleSend(text, [], appMentions);
     },
     [handleSend],
   );

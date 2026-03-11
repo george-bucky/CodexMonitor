@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import type { RefObject } from "react";
 
 type UseComposerInsertArgs = {
@@ -14,13 +14,20 @@ export function useComposerInsert({
   onDraftChange,
   textareaRef,
 }: UseComposerInsertArgs) {
+  // Keep insert callback stable so message list memoization is not invalidated on each keystroke.
+  const draftTextRef = useRef(draftText);
+
+  useEffect(() => {
+    draftTextRef.current = draftText;
+  }, [draftText]);
+
   return useCallback(
     (insertText: string) => {
       if (!isEnabled) {
         return;
       }
       const textarea = textareaRef.current;
-      const currentText = draftText ?? "";
+      const currentText = draftTextRef.current ?? "";
       const start = textarea?.selectionStart ?? currentText.length;
       const end = textarea?.selectionEnd ?? start;
       const before = currentText.slice(0, start);
@@ -30,22 +37,28 @@ export function useComposerInsert({
       const prefix = needsSpaceBefore ? " " : "";
       const suffix = needsSpaceAfter ? " " : "";
       const nextText = `${before}${prefix}${insertText}${suffix}${after}`;
-      onDraftChange(nextText);
-      requestAnimationFrame(() => {
+      const cursor =
+        before.length +
+        prefix.length +
+        insertText.length +
+        (needsSpaceAfter ? 1 : 0);
+      const focusComposer = () => {
         const node = textareaRef.current;
         if (!node) {
           return;
         }
-        const cursor =
-          before.length +
-          prefix.length +
-          insertText.length +
-          (needsSpaceAfter ? 1 : 0);
         node.focus();
         node.setSelectionRange(cursor, cursor);
         node.dispatchEvent(new Event("select", { bubbles: true }));
+      };
+
+      // Keep focus transfer in the same user gesture for mobile Safari.
+      focusComposer();
+      onDraftChange(nextText);
+      requestAnimationFrame(() => {
+        focusComposer();
       });
     },
-    [isEnabled, draftText, onDraftChange, textareaRef],
+    [isEnabled, onDraftChange, textareaRef],
   );
 }

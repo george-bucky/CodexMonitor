@@ -62,38 +62,33 @@ mod files {
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use ignore::WalkBuilder;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
-use tokio::time::sleep;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
 
 use backend::app_server::{spawn_workspace_session, WorkspaceSession};
 use backend::events::{AppServerEvent, EventSink, TerminalExit, TerminalOutput};
 use shared::codex_core::CodexLoginCancelState;
+use shared::process_core::kill_child_process_tree;
 use shared::prompts_core::{self, CustomPromptEntry};
 use shared::{
-    codex_aux_core, codex_core, files_core, git_core, git_ui_core, local_usage_core, settings_core,
-    workspaces_core, worktree_core,
+    agents_config_core, codex_aux_core, codex_core, files_core, git_core, git_ui_core,
+    local_usage_core, settings_core, workspaces_core, worktree_core,
 };
 use storage::{read_settings, read_workspaces};
 use types::{
     AppSettings, GitCommitDiff, GitFileDiff, GitHubIssuesResponse, GitHubPullRequestComment,
     GitHubPullRequestDiff, GitHubPullRequestsResponse, GitLogResponse, LocalUsageSnapshot,
-    OrbitConnectTestResult, OrbitDeviceCodeStart, OrbitSignInPollResult, OrbitSignInStatus,
-    OrbitSignOutResult, WorkspaceEntry, WorkspaceInfo, WorkspaceSettings, WorktreeSetupStatus,
+    WorkspaceEntry, WorkspaceInfo, WorkspaceSettings, WorktreeSetupStatus,
 };
 use workspace_settings::apply_workspace_settings_update;
 
@@ -151,10 +146,6 @@ struct DaemonConfig {
     listen: SocketAddr,
     token: Option<String>,
     data_dir: PathBuf,
-    orbit_url: Option<String>,
-    orbit_token: Option<String>,
-    orbit_auth_url: Option<String>,
-    orbit_runner_name: Option<String>,
 }
 
 struct DaemonState {
@@ -166,7 +157,6 @@ struct DaemonState {
     app_settings: Mutex<AppSettings>,
     event_sink: DaemonEventSink,
     codex_login_cancels: Mutex<HashMap<String, CodexLoginCancelState>>,
-    daemon_mode: String,
     daemon_binary_path: Option<String>,
 }
 
@@ -182,11 +172,6 @@ impl DaemonState {
         let settings_path = config.data_dir.join("settings.json");
         let workspaces = read_workspaces(&storage_path).unwrap_or_default();
         let app_settings = read_settings(&settings_path).unwrap_or_default();
-        let daemon_mode = if config.orbit_url.is_some() {
-            "orbit".to_string()
-        } else {
-            "tcp".to_string()
-        };
         let daemon_binary_path = std::env::current_exe()
             .ok()
             .and_then(|path| path.to_str().map(str::to_string));
@@ -199,7 +184,6 @@ impl DaemonState {
             app_settings: Mutex::new(app_settings),
             event_sink,
             codex_login_cancels: Mutex::new(HashMap::new()),
-            daemon_mode,
             daemon_binary_path,
         }
     }
@@ -209,12 +193,53 @@ impl DaemonState {
             "name": DAEMON_NAME,
             "version": env!("CARGO_PKG_VERSION"),
             "pid": std::process::id(),
-            "mode": self.daemon_mode,
+            "mode": "tcp",
             "binaryPath": self.daemon_binary_path,
         })
     }
 
+    async fn sync_workspaces_from_storage(&self) {
+        let stored = match read_workspaces(&self.storage_path) {
+            Ok(stored) => stored,
+            Err(err) => {
+                eprintln!(
+                    "daemon: failed to read workspaces from {}: {err}",
+                    self.storage_path.display()
+                );
+                return;
+            }
+        };
+        let workspace_ids: HashSet<String> = stored.keys().cloned().collect();
+        {
+            let mut workspaces = self.workspaces.lock().await;
+            *workspaces = stored;
+        }
+
+        let stale_sessions: Vec<(String, Arc<WorkspaceSession>)> = {
+            let mut sessions = self.sessions.lock().await;
+            sessions
+                .keys()
+                .filter(|id| !workspace_ids.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter_map(|workspace_id| {
+                    sessions
+                        .remove(&workspace_id)
+                        .map(|session| (workspace_id, session))
+                })
+                .collect()
+        };
+
+        for (workspace_id, session) in stale_sessions {
+            let mut child = session.child.lock().await;
+            kill_child_process_tree(&mut child).await;
+            eprintln!("daemon: pruned stale session for removed workspace {workspace_id}");
+        }
+    }
+
     async fn list_workspaces(&self) -> Vec<WorkspaceInfo> {
+        self.sync_workspaces_from_storage().await;
         workspaces_core::list_workspaces_core(&self.workspaces, &self.sessions).await
     }
 
@@ -225,13 +250,41 @@ impl DaemonState {
     async fn add_workspace(
         &self,
         path: String,
-        codex_bin: Option<String>,
         client_version: String,
     ) -> Result<WorkspaceInfo, String> {
         let client_version = client_version.clone();
         workspaces_core::add_workspace_core(
             path,
-            codex_bin,
+            &self.workspaces,
+            &self.sessions,
+            &self.app_settings,
+            &self.storage_path,
+            move |entry, default_bin, codex_args, codex_home| {
+                spawn_with_client(
+                    self.event_sink.clone(),
+                    client_version.clone(),
+                    entry,
+                    default_bin,
+                    codex_args,
+                    codex_home,
+                )
+            },
+        )
+        .await
+    }
+
+    async fn add_workspace_from_git_url(
+        &self,
+        url: String,
+        destination_path: String,
+        target_folder_name: Option<String>,
+        client_version: String,
+    ) -> Result<WorkspaceInfo, String> {
+        let client_version = client_version.clone();
+        workspaces_core::add_workspace_from_git_url_core(
+            url,
+            destination_path,
+            target_folder_name,
             &self.workspaces,
             &self.sessions,
             &self.app_settings,
@@ -472,21 +525,6 @@ impl DaemonState {
         .await
     }
 
-    async fn update_workspace_codex_bin(
-        &self,
-        id: String,
-        codex_bin: Option<String>,
-    ) -> Result<WorkspaceInfo, String> {
-        workspaces_core::update_workspace_codex_bin_core(
-            id,
-            codex_bin,
-            &self.workspaces,
-            &self.sessions,
-            &self.storage_path,
-        )
-        .await
-    }
-
     async fn connect_workspace(&self, id: String, client_version: String) -> Result<(), String> {
         {
             let sessions = self.sessions.lock().await;
@@ -515,6 +553,32 @@ impl DaemonState {
         .await
     }
 
+    async fn set_workspace_runtime_codex_args(
+        &self,
+        workspace_id: String,
+        codex_args: Option<String>,
+        client_version: String,
+    ) -> Result<workspaces_core::WorkspaceRuntimeCodexArgsResult, String> {
+        workspaces_core::set_workspace_runtime_codex_args_core(
+            workspace_id,
+            codex_args,
+            &self.workspaces,
+            &self.sessions,
+            &self.app_settings,
+            move |entry, default_bin, next_args, codex_home| {
+                spawn_with_client(
+                    self.event_sink.clone(),
+                    client_version.clone(),
+                    entry,
+                    default_bin,
+                    next_args,
+                    codex_home,
+                )
+            },
+        )
+        .await
+    }
+
     async fn get_app_settings(&self) -> AppSettings {
         settings_core::get_app_settings_core(&self.app_settings).await
     }
@@ -524,73 +588,56 @@ impl DaemonState {
             .await
     }
 
-    async fn orbit_connect_test(&self) -> Result<OrbitConnectTestResult, String> {
-        let settings = self.app_settings.lock().await.clone();
-        let ws_url = shared::orbit_core::orbit_ws_url_from_settings(&settings)?;
-        shared::orbit_core::orbit_connect_test_core(
-            &ws_url,
-            settings.remote_backend_token.as_deref(),
-        )
-        .await
-    }
-
-    async fn orbit_sign_in_start(&self) -> Result<OrbitDeviceCodeStart, String> {
-        let settings = self.app_settings.lock().await.clone();
-        let auth_url = shared::orbit_core::orbit_auth_url_from_settings(&settings)?;
-        shared::orbit_core::orbit_sign_in_start_core(
-            &auth_url,
-            settings.orbit_runner_name.as_deref(),
-        )
-        .await
-    }
-
-    async fn orbit_sign_in_poll(
+    async fn set_codex_feature_flag(
         &self,
-        device_code: String,
-    ) -> Result<OrbitSignInPollResult, String> {
-        let auth_url = {
-            let settings = self.app_settings.lock().await.clone();
-            shared::orbit_core::orbit_auth_url_from_settings(&settings)?
-        };
-        let result = shared::orbit_core::orbit_sign_in_poll_core(&auth_url, &device_code).await?;
-
-        if matches!(result.status, OrbitSignInStatus::Authorized) {
-            if let Some(token) = result.token.as_ref() {
-                let _ = settings_core::update_remote_backend_token_core(
-                    &self.app_settings,
-                    &self.settings_path,
-                    Some(token),
-                )
-                .await?;
-            }
-        }
-
-        Ok(result)
+        feature_key: String,
+        enabled: bool,
+    ) -> Result<(), String> {
+        codex_config::write_feature_enabled(feature_key.as_str(), enabled)
     }
 
-    async fn orbit_sign_out(&self) -> Result<OrbitSignOutResult, String> {
-        let settings = self.app_settings.lock().await.clone();
-        let auth_url = shared::orbit_core::orbit_auth_url_optional(&settings);
-        let token = shared::orbit_core::remote_backend_token_optional(&settings);
+    async fn get_agents_settings(&self) -> Result<agents_config_core::AgentsSettingsDto, String> {
+        agents_config_core::get_agents_settings_core()
+    }
 
-        let mut logout_error: Option<String> = None;
-        if let (Some(auth_url), Some(token)) = (auth_url.as_ref(), token.as_ref()) {
-            if let Err(err) = shared::orbit_core::orbit_sign_out_core(auth_url, token).await {
-                logout_error = Some(err);
-            }
-        }
+    async fn set_agents_core_settings(
+        &self,
+        input: agents_config_core::SetAgentsCoreInput,
+    ) -> Result<agents_config_core::AgentsSettingsDto, String> {
+        agents_config_core::set_agents_core_settings_core(input)
+    }
 
-        let _ = settings_core::update_remote_backend_token_core(
-            &self.app_settings,
-            &self.settings_path,
-            None,
-        )
-        .await?;
+    async fn create_agent(
+        &self,
+        input: agents_config_core::CreateAgentInput,
+    ) -> Result<agents_config_core::AgentsSettingsDto, String> {
+        agents_config_core::create_agent_core(input)
+    }
 
-        Ok(OrbitSignOutResult {
-            success: logout_error.is_none(),
-            message: logout_error,
-        })
+    async fn update_agent(
+        &self,
+        input: agents_config_core::UpdateAgentInput,
+    ) -> Result<agents_config_core::AgentsSettingsDto, String> {
+        agents_config_core::update_agent_core(input)
+    }
+
+    async fn delete_agent(
+        &self,
+        input: agents_config_core::DeleteAgentInput,
+    ) -> Result<agents_config_core::AgentsSettingsDto, String> {
+        agents_config_core::delete_agent_core(input)
+    }
+
+    async fn read_agent_config_toml(&self, agent_name: String) -> Result<String, String> {
+        agents_config_core::read_agent_config_toml_core(agent_name.as_str())
+    }
+
+    async fn write_agent_config_toml(
+        &self,
+        agent_name: String,
+        content: String,
+    ) -> Result<(), String> {
+        agents_config_core::write_agent_config_toml_core(agent_name.as_str(), content.as_str())
     }
 
     async fn list_workspace_files(&self, workspace_id: String) -> Result<Vec<String>, String> {
@@ -634,7 +681,7 @@ impl DaemonState {
     }
 
     async fn start_thread(&self, workspace_id: String) -> Result<Value, String> {
-        codex_core::start_thread_core(&self.sessions, workspace_id).await
+        codex_core::start_thread_core(&self.sessions, &self.workspaces, workspace_id).await
     }
 
     async fn resume_thread(
@@ -643,6 +690,60 @@ impl DaemonState {
         thread_id: String,
     ) -> Result<Value, String> {
         codex_core::resume_thread_core(&self.sessions, workspace_id, thread_id).await
+    }
+
+    async fn thread_live_subscribe(
+        &self,
+        workspace_id: String,
+        thread_id: String,
+    ) -> Result<Value, String> {
+        codex_core::thread_live_subscribe_core(
+            &self.sessions,
+            workspace_id.clone(),
+            thread_id.clone(),
+        )
+        .await?;
+        let subscription_id = format!("{}:{}", workspace_id, thread_id);
+        self.event_sink.emit_app_server_event(AppServerEvent {
+            workspace_id: workspace_id.clone(),
+            message: json!({
+                "method": "thread/live_attached",
+                "params": {
+                    "workspaceId": workspace_id,
+                    "threadId": thread_id,
+                    "subscriptionId": subscription_id,
+                }
+            }),
+        });
+        Ok(json!({
+            "subscriptionId": subscription_id,
+            "state": "live",
+        }))
+    }
+
+    async fn thread_live_unsubscribe(
+        &self,
+        workspace_id: String,
+        thread_id: String,
+    ) -> Result<Value, String> {
+        codex_core::thread_live_unsubscribe_core(
+            &self.sessions,
+            workspace_id.clone(),
+            thread_id.clone(),
+        )
+        .await?;
+        self.event_sink.emit_app_server_event(AppServerEvent {
+            workspace_id: workspace_id.clone(),
+            message: json!({
+                "method": "thread/live_detached",
+                "params": {
+                    "workspaceId": workspace_id,
+                    "threadId": thread_id,
+                    "reason": "manual",
+                }
+            }),
+        });
+        Ok(json!({ "ok": true }))
     }
 
     async fn fork_thread(&self, workspace_id: String, thread_id: String) -> Result<Value, String> {
@@ -656,7 +757,8 @@ impl DaemonState {
         limit: Option<u32>,
         sort_key: Option<String>,
     ) -> Result<Value, String> {
-        codex_core::list_threads_core(&self.sessions, workspace_id, cursor, limit, sort_key).await
+        codex_core::list_threads_core(&self.sessions, workspace_id, cursor, limit, sort_key)
+            .await
     }
 
     async fn list_mcp_server_status(
@@ -700,19 +802,24 @@ impl DaemonState {
         text: String,
         model: Option<String>,
         effort: Option<String>,
+        service_tier: Option<Option<String>>,
         access_mode: Option<String>,
         images: Option<Vec<String>>,
+        app_mentions: Option<Vec<Value>>,
         collaboration_mode: Option<Value>,
     ) -> Result<Value, String> {
         codex_core::send_user_message_core(
             &self.sessions,
+            &self.workspaces,
             workspace_id,
             thread_id,
             text,
             model,
             effort,
+            service_tier,
             access_mode,
             images,
+            app_mentions,
             collaboration_mode,
         )
         .await
@@ -725,6 +832,7 @@ impl DaemonState {
         turn_id: String,
         text: String,
         images: Option<Vec<String>>,
+        app_mentions: Option<Vec<Value>>,
     ) -> Result<Value, String> {
         codex_core::turn_steer_core(
             &self.sessions,
@@ -733,6 +841,7 @@ impl DaemonState {
             turn_id,
             text,
             images,
+            app_mentions,
         )
         .await
     }
@@ -761,6 +870,16 @@ impl DaemonState {
         codex_core::model_list_core(&self.sessions, workspace_id).await
     }
 
+    async fn experimental_feature_list(
+        &self,
+        workspace_id: String,
+        cursor: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<Value, String> {
+        codex_core::experimental_feature_list_core(&self.sessions, workspace_id, cursor, limit)
+            .await
+    }
+
     async fn collaboration_mode_list(&self, workspace_id: String) -> Result<Value, String> {
         codex_core::collaboration_mode_list_core(&self.sessions, workspace_id).await
     }
@@ -783,7 +902,7 @@ impl DaemonState {
     }
 
     async fn skills_list(&self, workspace_id: String) -> Result<Value, String> {
-        codex_core::skills_list_core(&self.sessions, workspace_id).await
+        codex_core::skills_list_core(&self.sessions, &self.workspaces, workspace_id).await
     }
 
     async fn apps_list(
@@ -791,8 +910,9 @@ impl DaemonState {
         workspace_id: String,
         cursor: Option<String>,
         limit: Option<u32>,
+        thread_id: Option<String>,
     ) -> Result<Value, String> {
-        codex_core::apps_list_core(&self.sessions, workspace_id, cursor, limit).await
+        codex_core::apps_list_core(&self.sessions, workspace_id, cursor, limit, thread_id).await
     }
 
     async fn respond_to_server_request(
@@ -862,8 +982,10 @@ impl DaemonState {
         app: Option<String>,
         args: Vec<String>,
         command: Option<String>,
+        line: Option<u32>,
+        column: Option<u32>,
     ) -> Result<(), String> {
-        workspaces_core::open_workspace_in_core(path, app, args, command).await
+        workspaces_core::open_workspace_in_core(path, app, args, command, line, column).await
     }
 
     async fn get_open_app_icon(&self, app_name: String) -> Result<Option<String>, String> {
@@ -883,6 +1005,32 @@ impl DaemonState {
 
     async fn get_git_status(&self, workspace_id: String) -> Result<Value, String> {
         git_ui_core::get_git_status_core(&self.workspaces, workspace_id).await
+    }
+
+    async fn init_git_repo(
+        &self,
+        workspace_id: String,
+        branch: String,
+        force: bool,
+    ) -> Result<Value, String> {
+        git_ui_core::init_git_repo_core(&self.workspaces, workspace_id, branch, force).await
+    }
+
+    async fn create_github_repo(
+        &self,
+        workspace_id: String,
+        repo: String,
+        visibility: String,
+        branch: Option<String>,
+    ) -> Result<Value, String> {
+        git_ui_core::create_github_repo_core(
+            &self.workspaces,
+            workspace_id,
+            repo,
+            visibility,
+            branch,
+        )
+        .await
     }
 
     async fn list_git_roots(
@@ -999,6 +1147,15 @@ impl DaemonState {
         .await
     }
 
+    async fn checkout_github_pull_request(
+        &self,
+        workspace_id: String,
+        pr_number: u64,
+    ) -> Result<(), String> {
+        git_ui_core::checkout_github_pull_request_core(&self.workspaces, workspace_id, pr_number)
+            .await
+    }
+
     async fn list_git_branches(&self, workspace_id: String) -> Result<Value, String> {
         git_ui_core::list_git_branches_core(&self.workspaces, workspace_id).await
     }
@@ -1101,45 +1258,33 @@ impl DaemonState {
         codex_aux_core::codex_doctor_core(&self.app_settings, codex_bin, codex_args).await
     }
 
-    async fn get_commit_message_prompt(&self, workspace_id: String) -> Result<String, String> {
-        let repo_root =
-            git_ui_core::resolve_repo_root_for_workspace_core(&self.workspaces, workspace_id)
-                .await?;
-        let diff = git_ui_core::collect_workspace_diff_core(&repo_root)?;
-        if diff.trim().is_empty() {
-            return Err("No changes to generate commit message for".to_string());
-        }
-        Ok(codex_aux_core::build_commit_message_prompt(&diff))
-    }
-
-    async fn generate_commit_message(&self, workspace_id: String) -> Result<String, String> {
+    async fn generate_commit_message(
+        &self,
+        workspace_id: String,
+        commit_message_model_id: Option<String>,
+    ) -> Result<String, String> {
         let repo_root = git_ui_core::resolve_repo_root_for_workspace_core(
             &self.workspaces,
             workspace_id.clone(),
         )
         .await?;
         let diff = git_ui_core::collect_workspace_diff_core(&repo_root)?;
-        if diff.trim().is_empty() {
-            return Err("No changes to generate commit message for".to_string());
-        }
-        let prompt = codex_aux_core::build_commit_message_prompt(&diff);
-        let response = codex_aux_core::run_background_prompt_core(
+        let commit_message_prompt = {
+            let settings = self.app_settings.lock().await;
+            settings.commit_message_prompt.clone()
+        };
+        codex_aux_core::generate_commit_message_core(
             &self.sessions,
+            &self.workspaces,
             workspace_id,
-            prompt,
+            &diff,
+            &commit_message_prompt,
+            commit_message_model_id.as_deref(),
             |workspace_id, thread_id| {
                 emit_background_thread_hide(&self.event_sink, workspace_id, thread_id);
             },
-            "Timeout waiting for commit message generation",
-            "Unknown error during commit message generation",
         )
-        .await?;
-
-        let trimmed = response.trim().to_string();
-        if trimmed.is_empty() {
-            return Err("No commit message was generated".to_string());
-        }
-        Ok(trimmed)
+        .await
     }
 
     async fn generate_run_metadata(
@@ -1147,47 +1292,33 @@ impl DaemonState {
         workspace_id: String,
         prompt: String,
     ) -> Result<Value, String> {
-        let cleaned_prompt = prompt.trim();
-        if cleaned_prompt.is_empty() {
-            return Err("Prompt is required.".to_string());
-        }
-
-        let title_prompt = codex_aux_core::build_run_metadata_prompt(cleaned_prompt);
-        let response_text = codex_aux_core::run_background_prompt_core(
+        codex_aux_core::generate_run_metadata_core(
             &self.sessions,
+            &self.workspaces,
             workspace_id,
-            title_prompt,
+            &prompt,
             |workspace_id, thread_id| {
                 emit_background_thread_hide(&self.event_sink, workspace_id, thread_id);
             },
-            "Timeout waiting for metadata generation",
-            "Unknown error during metadata generation",
         )
-        .await?;
+        .await
+    }
 
-        let trimmed = response_text.trim();
-        if trimmed.is_empty() {
-            return Err("No metadata was generated".to_string());
-        }
-        let json_value = codex_aux_core::extract_json_value(trimmed)
-            .ok_or_else(|| "Failed to parse metadata JSON".to_string())?;
-        let title = json_value
-            .get("title")
-            .and_then(|v| v.as_str())
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| "Missing title in metadata".to_string())?;
-        let worktree_name = json_value
-            .get("worktreeName")
-            .or_else(|| json_value.get("worktree_name"))
-            .and_then(|v| v.as_str())
-            .map(codex_aux_core::sanitize_run_worktree_name)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| "Missing worktree name in metadata".to_string())?;
-        Ok(json!({
-            "title": title,
-            "worktreeName": worktree_name
-        }))
+    async fn generate_agent_description(
+        &self,
+        workspace_id: String,
+        description: String,
+    ) -> Result<codex_aux_core::GeneratedAgentConfiguration, String> {
+        codex_aux_core::generate_agent_description_core(
+            &self.sessions,
+            &self.workspaces,
+            workspace_id,
+            &description,
+            |workspace_id, thread_id| {
+                emit_background_thread_hide(&self.event_sink, workspace_id, thread_id);
+            },
+        )
+        .await
     }
 
     async fn local_usage_snapshot(
@@ -1221,13 +1352,6 @@ fn should_skip_dir(name: &str) -> bool {
 
 fn normalize_git_path(path: &str) -> String {
     path.replace('\\', "/")
-}
-
-fn parse_optional_u64(value: &Value, key: &str) -> Option<u64> {
-    match value {
-        Value::Object(map) => map.get(key).and_then(|value| value.as_u64()),
-        _ => None,
-    }
 }
 
 fn emit_background_thread_hide(event_sink: &DaemonEventSink, workspace_id: &str, thread_id: &str) {
@@ -1367,8 +1491,8 @@ fn default_data_dir() -> PathBuf {
 fn usage() -> String {
     format!(
         "\
-USAGE:\n  codex-monitor-daemon [--listen <addr>] [--data-dir <path>] [--token <token> | --insecure-no-auth]\n  codex-monitor-daemon --orbit-url <ws-url> [--orbit-token <token>] [--orbit-auth-url <url>] [--orbit-runner-name <name>] [--data-dir <path>]\n\n\
-OPTIONS:\n  --listen <addr>          Bind address (default: {DEFAULT_LISTEN_ADDR})\n  --data-dir <path>        Data dir holding workspaces.json/settings.json\n  --token <token>          Shared token required by TCP clients\n  --insecure-no-auth       Disable TCP auth (dev only)\n  --orbit-url <ws-url>     Run in Orbit runner mode and connect outbound to this WS URL\n  --orbit-token <token>    Orbit auth token (optional if URL already includes token)\n  --orbit-auth-url <url>   Orbit auth base URL (metadata only, optional)\n  --orbit-runner-name <n>  Runner display name (metadata only, optional)\n  -h, --help               Show this help\n"
+USAGE:\n  codex-monitor-daemon [--listen <addr>] [--data-dir <path>] [--token <token> | --insecure-no-auth]\n\n\
+OPTIONS:\n  --listen <addr>          Bind address (default: {DEFAULT_LISTEN_ADDR})\n  --data-dir <path>        Data dir holding workspaces.json/settings.json\n  --token <token>          Shared token required by TCP clients\n  --insecure-no-auth       Disable TCP auth (dev only)\n  -h, --help               Show this help\n"
     )
 }
 
@@ -1382,19 +1506,6 @@ fn parse_args() -> Result<DaemonConfig, String> {
         .filter(|value| !value.is_empty());
     let mut insecure_no_auth = false;
     let mut data_dir: Option<PathBuf> = None;
-    let mut orbit_url: Option<String> = None;
-    let mut orbit_token: Option<String> = env::var("CODEX_MONITOR_ORBIT_TOKEN")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let mut orbit_auth_url: Option<String> = env::var("CODEX_MONITOR_ORBIT_AUTH_URL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let mut orbit_runner_name: Option<String> = env::var("CODEX_MONITOR_ORBIT_RUNNER_NAME")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -1427,44 +1538,11 @@ fn parse_args() -> Result<DaemonConfig, String> {
                 insecure_no_auth = true;
                 token = None;
             }
-            "--orbit-url" => {
-                let value = args.next().ok_or("--orbit-url requires a value")?;
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    return Err("--orbit-url requires a non-empty value".to_string());
-                }
-                orbit_url = Some(trimmed.to_string());
-            }
-            "--orbit-token" => {
-                let value = args.next().ok_or("--orbit-token requires a value")?;
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    return Err("--orbit-token requires a non-empty value".to_string());
-                }
-                orbit_token = Some(trimmed.to_string());
-            }
-            "--orbit-auth-url" => {
-                let value = args.next().ok_or("--orbit-auth-url requires a value")?;
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    return Err("--orbit-auth-url requires a non-empty value".to_string());
-                }
-                orbit_auth_url = Some(trimmed.to_string());
-            }
-            "--orbit-runner-name" => {
-                let value = args.next().ok_or("--orbit-runner-name requires a value")?;
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    return Err("--orbit-runner-name requires a non-empty value".to_string());
-                }
-                orbit_runner_name = Some(trimmed.to_string());
-            }
             _ => return Err(format!("Unknown argument: {arg}")),
         }
     }
 
-    let is_orbit_mode = orbit_url.is_some();
-    if !is_orbit_mode && token.is_none() && !insecure_no_auth {
+    if token.is_none() && !insecure_no_auth {
         return Err(
             "Missing --token (or set CODEX_MONITOR_DAEMON_TOKEN). Use --insecure-no-auth for local dev only."
                 .to_string(),
@@ -1475,21 +1553,23 @@ fn parse_args() -> Result<DaemonConfig, String> {
         listen,
         token,
         data_dir: data_dir.unwrap_or_else(default_data_dir),
-        orbit_url,
-        orbit_token,
-        orbit_auth_url,
-        orbit_runner_name,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::process_core::kill_child_process_tree;
+    use crate::storage::write_workspaces;
     use crate::types::WorkspaceKind;
     use serde_json::json;
     use std::future::Future;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::process::Stdio;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::process::Command;
 
     fn run_async_test<F>(future: F)
     where
@@ -1526,7 +1606,6 @@ mod tests {
             app_settings: Mutex::new(AppSettings::default()),
             event_sink: DaemonEventSink { tx },
             codex_login_cancels: Mutex::new(HashMap::new()),
-            daemon_mode: "tcp".to_string(),
             daemon_binary_path: Some("/tmp/codex-monitor-daemon".to_string()),
         }
     }
@@ -1536,12 +1615,10 @@ mod tests {
             id: workspace_id.to_string(),
             name: "Workspace".to_string(),
             path: workspace_path.to_string(),
-            codex_bin: None,
             kind: WorkspaceKind::Main,
             parent_id: None,
             worktree: None,
             settings: WorkspaceSettings {
-                codex_home: Some(format!("{workspace_path}/.codex-home")),
                 ..WorkspaceSettings::default()
             },
         };
@@ -1550,6 +1627,53 @@ mod tests {
             .lock()
             .await
             .insert(workspace_id.to_string(), entry);
+    }
+
+    fn make_workspace_entry(workspace_id: &str, workspace_path: &str) -> WorkspaceEntry {
+        WorkspaceEntry {
+            id: workspace_id.to_string(),
+            name: workspace_id.to_string(),
+            path: workspace_path.to_string(),
+            kind: WorkspaceKind::Main,
+            parent_id: None,
+            worktree: None,
+            settings: WorkspaceSettings::default(),
+        }
+    }
+
+    fn make_session(entry: WorkspaceEntry) -> Arc<WorkspaceSession> {
+        let owner_workspace_id = entry.id;
+        let mut cmd = if cfg!(windows) {
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", "more"]);
+            cmd
+        } else {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "cat"]);
+            cmd
+        };
+
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut child = cmd.spawn().expect("spawn dummy child");
+        let stdin = child.stdin.take().expect("dummy child stdin");
+
+        Arc::new(WorkspaceSession {
+            codex_args: None,
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            pending: Mutex::new(HashMap::new()),
+            request_context: Mutex::new(HashMap::new()),
+            thread_workspace: Mutex::new(HashMap::new()),
+            hidden_thread_ids: Mutex::new(HashSet::new()),
+            next_id: AtomicU64::new(0),
+            background_thread_callbacks: Mutex::new(HashMap::new()),
+            workspace_ids: Mutex::new(HashSet::from([owner_workspace_id.clone()])),
+            workspace_roots: Mutex::new(HashMap::new()),
+            owner_workspace_id,
+        })
     }
 
     #[test]
@@ -1662,6 +1786,120 @@ mod tests {
             let _ = std::fs::remove_dir_all(&tmp);
         });
     }
+    #[test]
+    fn list_workspaces_syncs_from_storage_file() {
+        run_async_test(async {
+            let tmp = make_temp_dir("list-workspaces-sync");
+            let state = test_state(&tmp);
+
+            let persisted = vec![WorkspaceEntry {
+                id: "ws-sync".to_string(),
+                name: "Synced Workspace".to_string(),
+                path: tmp.join("workspace").to_string_lossy().to_string(),
+                kind: WorkspaceKind::Main,
+                parent_id: None,
+                worktree: None,
+                settings: WorkspaceSettings::default(),
+            }];
+            write_workspaces(&state.storage_path, &persisted).expect("write workspaces");
+
+            let listed = state.list_workspaces().await;
+            assert!(
+                listed.iter().any(|workspace| workspace.id == "ws-sync"),
+                "expected daemon list_workspaces to include workspace added on disk"
+            );
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
+
+    #[test]
+    fn list_workspaces_sync_prunes_stale_sessions() {
+        run_async_test(async {
+            let tmp = make_temp_dir("list-workspaces-sync-prune");
+            let state = test_state(&tmp);
+            let keep_path = tmp.join("workspace-keep");
+            let stale_path = tmp.join("workspace-stale");
+
+            let persisted = vec![make_workspace_entry(
+                "ws-keep",
+                &keep_path.to_string_lossy(),
+            )];
+            write_workspaces(&state.storage_path, &persisted).expect("write workspaces");
+
+            let keep_session = make_session(make_workspace_entry(
+                "ws-keep",
+                &keep_path.to_string_lossy(),
+            ));
+            let stale_session = make_session(make_workspace_entry(
+                "ws-stale",
+                &stale_path.to_string_lossy(),
+            ));
+            {
+                let mut sessions = state.sessions.lock().await;
+                sessions.insert("ws-keep".to_string(), keep_session);
+                sessions.insert("ws-stale".to_string(), stale_session.clone());
+            }
+
+            let listed = state.list_workspaces().await;
+            assert!(
+                listed.iter().any(|workspace| workspace.id == "ws-keep"),
+                "expected daemon list_workspaces to include persisted workspace"
+            );
+
+            {
+                let sessions = state.sessions.lock().await;
+                assert!(
+                    sessions.contains_key("ws-keep"),
+                    "expected connected persisted workspace session to remain"
+                );
+                assert!(
+                    !sessions.contains_key("ws-stale"),
+                    "expected stale session to be removed"
+                );
+            }
+
+            let stale_session_exited = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let exited = stale_session
+                        .child
+                        .lock()
+                        .await
+                        .try_wait()
+                        .expect("query stale session child");
+                    if exited.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .is_ok();
+            assert!(
+                stale_session_exited,
+                "expected stale session child process to terminate"
+            );
+
+            if let Some(keep_session) = state.sessions.lock().await.remove("ws-keep") {
+                let mut child = keep_session.child.lock().await;
+                kill_child_process_tree(&mut child).await;
+            }
+
+            if stale_session
+                .child
+                .lock()
+                .await
+                .try_wait()
+                .expect("query stale session child")
+                .is_none()
+            {
+                let mut child = stale_session.child.lock().await;
+                kill_child_process_tree(&mut child).await;
+            }
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        });
+    }
 }
 
 fn main() {
@@ -1685,19 +1923,6 @@ fn main() {
         };
         let state = Arc::new(DaemonState::load(&config, event_sink));
         let config = Arc::new(config);
-
-        if config.orbit_url.is_some() {
-            eprintln!(
-                "codex-monitor-daemon orbit mode (data dir: {})",
-                state
-                    .storage_path
-                    .parent()
-                    .unwrap_or(&state.storage_path)
-                    .display()
-            );
-            transport::run_orbit_mode(config, state, events_tx).await;
-            return;
-        }
 
         let listener = match TcpListener::bind(config.listen).await {
             Ok(listener) => listener,

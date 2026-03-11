@@ -1,6 +1,7 @@
 import type { CSSProperties } from "react";
-import { BrainCog } from "lucide-react";
-import type { AccessMode, ThreadTokenUsage } from "../../../types";
+import { BrainCog, SlidersHorizontal, Zap } from "lucide-react";
+import type { AccessMode, ServiceTier, ThreadTokenUsage } from "../../../types";
+import type { CodexArgsOption } from "../../threads/utils/codexArgsProfiles";
 
 type ComposerMetaBarProps = {
   disabled: boolean;
@@ -13,9 +14,13 @@ type ComposerMetaBarProps = {
   reasoningOptions: string[];
   selectedEffort: string | null;
   onSelectEffort: (effort: string) => void;
+  selectedServiceTier: ServiceTier | null;
   reasoningSupported: boolean;
   accessMode: AccessMode;
   onSelectAccessMode: (mode: AccessMode) => void;
+  codexArgsOptions?: CodexArgsOption[];
+  selectedCodexArgsOverride?: string | null;
+  onSelectCodexArgsOverride?: (value: string | null) => void;
   contextUsage?: ThreadTokenUsage | null;
 };
 
@@ -30,9 +35,13 @@ export function ComposerMetaBar({
   reasoningOptions,
   selectedEffort,
   onSelectEffort,
+  selectedServiceTier,
   reasoningSupported,
   accessMode,
   onSelectAccessMode,
+  codexArgsOptions = [],
+  selectedCodexArgsOverride = null,
+  onSelectCodexArgsOverride,
   contextUsage = null,
 }: ComposerMetaBarProps) {
   const contextWindow = contextUsage?.modelContextWindow ?? null;
@@ -170,6 +179,16 @@ export function ComposerMetaBar({
               </option>
             ))}
           </select>
+          {selectedServiceTier === "fast" && (
+            <span
+              className="composer-fast-indicator"
+              role="status"
+              aria-label="Fast mode enabled"
+              title="Fast mode enabled"
+            >
+              <Zap size={12} strokeWidth={1.8} />
+            </span>
+          )}
         </div>
         <div className="composer-select-wrap composer-select-wrap--effort">
           <span className="composer-icon composer-icon--effort" aria-hidden>
@@ -190,6 +209,28 @@ export function ComposerMetaBar({
             ))}
           </select>
         </div>
+        {codexArgsOptions.length > 1 && onSelectCodexArgsOverride && (
+          <div className="composer-select-wrap">
+            <span className="composer-icon" aria-hidden>
+              <SlidersHorizontal size={14} strokeWidth={1.8} />
+            </span>
+            <select
+              className="composer-select composer-select--approval"
+              aria-label="Codex args profile"
+              disabled={disabled}
+              value={selectedCodexArgsOverride ?? ""}
+              onChange={(event) =>
+                onSelectCodexArgsOverride(event.target.value || null)
+              }
+            >
+              {codexArgsOptions.map((option) => (
+                <option key={option.value || "default"} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         <div className="composer-select-wrap">
           <span className="composer-icon" aria-hidden>
             <svg viewBox="0 0 24 24" fill="none">

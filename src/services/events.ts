@@ -1,5 +1,10 @@
 import { listen } from "@tauri-apps/api/event";
-import type { AppServerEvent, DictationEvent, DictationModelStatus } from "../types";
+import type {
+  AppServerEvent,
+  DictationEvent,
+  DictationModelStatus,
+  TrayOpenThreadPayload,
+} from "../types";
 
 export type Unsubscribe = () => void;
 
@@ -87,10 +92,12 @@ const dictationEventHub = createEventHub<DictationEvent>("dictation-event");
 const terminalOutputHub = createEventHub<TerminalOutputEvent>("terminal-output");
 const terminalExitHub = createEventHub<TerminalExitEvent>("terminal-exit");
 const updaterCheckHub = createEventHub<void>("updater-check");
+const trayOpenThreadHub = createEventHub<TrayOpenThreadPayload>("tray-open-thread");
 const menuNewAgentHub = createEventHub<void>("menu-new-agent");
 const menuNewWorktreeAgentHub = createEventHub<void>("menu-new-worktree-agent");
 const menuNewCloneAgentHub = createEventHub<void>("menu-new-clone-agent");
 const menuAddWorkspaceHub = createEventHub<void>("menu-add-workspace");
+const menuAddWorkspaceFromUrlHub = createEventHub<void>("menu-add-workspace-from-url");
 const menuOpenSettingsHub = createEventHub<void>("menu-open-settings");
 const menuToggleProjectsSidebarHub = createEventHub<void>("menu-toggle-projects-sidebar");
 const menuToggleGitSidebarHub = createEventHub<void>("menu-toggle-git-sidebar");
@@ -155,6 +162,15 @@ export function subscribeUpdaterCheck(
   }, options);
 }
 
+export function subscribeTrayOpenThread(
+  onEvent: (payload: TrayOpenThreadPayload) => void,
+  options?: SubscriptionOptions,
+): Unsubscribe {
+  return trayOpenThreadHub.subscribe((payload) => {
+    onEvent(payload);
+  }, options);
+}
+
 export function subscribeMenuNewAgent(
   onEvent: () => void,
   options?: SubscriptionOptions,
@@ -178,6 +194,15 @@ export function subscribeMenuNewCloneAgent(
   options?: SubscriptionOptions,
 ): Unsubscribe {
   return menuNewCloneAgentHub.subscribe(() => {
+    onEvent();
+  }, options);
+}
+
+export function subscribeMenuAddWorkspaceFromUrl(
+  onEvent: () => void,
+  options?: SubscriptionOptions,
+): Unsubscribe {
+  return menuAddWorkspaceFromUrlHub.subscribe(() => {
     onEvent();
   }, options);
 }

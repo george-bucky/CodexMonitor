@@ -25,12 +25,13 @@ function ComposerHarness({ initialText = "", editorSettings }: HarnessProps) {
   return (
     <Composer
       onSend={() => {}}
-      onQueue={() => {}}
       onStop={() => {}}
       canStop={false}
       isProcessing={false}
       appsEnabled={true}
-      steerEnabled={false}
+      steerAvailable={false}
+      followUpMessageBehavior="queue"
+      composerFollowUpHintEnabled={true}
       collaborationModes={[]}
       selectedCollaborationModeId={null}
       onSelectCollaborationMode={() => {}}
@@ -40,6 +41,7 @@ function ComposerHarness({ initialText = "", editorSettings }: HarnessProps) {
       reasoningOptions={[]}
       selectedEffort={null}
       onSelectEffort={() => {}}
+      selectedServiceTier={null}
       reasoningSupported={false}
       accessMode="current"
       onSelectAccessMode={() => {}}

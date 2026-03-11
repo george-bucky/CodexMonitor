@@ -13,9 +13,23 @@ pub(crate) use crate::backend::app_server::WorkspaceSession;
 use crate::backend::events::AppServerEvent;
 use crate::event_sink::TauriEventSink;
 use crate::remote_backend;
-use crate::shared::codex_core;
+use crate::shared::agents_config_core;
+use crate::shared::codex_core::{self, insert_optional_nullable_string};
 use crate::state::AppState;
 use crate::types::WorkspaceEntry;
+
+fn emit_thread_live_event(app: &AppHandle, workspace_id: &str, method: &str, params: Value) {
+    let _ = app.emit(
+        "app-server-event",
+        AppServerEvent {
+            workspace_id: workspace_id.to_string(),
+            message: json!({
+                "method": method,
+                "params": params,
+            }),
+        },
+    );
+}
 
 pub(crate) async fn spawn_workspace_session(
     entry: WorkspaceEntry,
@@ -73,7 +87,7 @@ pub(crate) async fn start_thread(
         .await;
     }
 
-    codex_core::start_thread_core(&state.sessions, workspace_id).await
+    codex_core::start_thread_core(&state.sessions, &state.workspaces, workspace_id).await
 }
 
 #[tauri::command]
@@ -94,6 +108,82 @@ pub(crate) async fn resume_thread(
     }
 
     codex_core::resume_thread_core(&state.sessions, workspace_id, thread_id).await
+}
+
+#[tauri::command]
+pub(crate) async fn thread_live_subscribe(
+    workspace_id: String,
+    thread_id: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "thread_live_subscribe",
+            json!({ "workspaceId": workspace_id, "threadId": thread_id }),
+        )
+        .await;
+    }
+
+    codex_core::thread_live_subscribe_core(
+        &state.sessions,
+        workspace_id.clone(),
+        thread_id.clone(),
+    )
+    .await?;
+    let subscription_id = format!("{}:{}", workspace_id, thread_id);
+    emit_thread_live_event(
+        &app,
+        &workspace_id,
+        "thread/live_attached",
+        json!({
+            "workspaceId": workspace_id,
+            "threadId": thread_id,
+            "subscriptionId": subscription_id,
+        }),
+    );
+    Ok(json!({
+        "subscriptionId": subscription_id,
+        "state": "live",
+    }))
+}
+
+#[tauri::command]
+pub(crate) async fn thread_live_unsubscribe(
+    workspace_id: String,
+    thread_id: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "thread_live_unsubscribe",
+            json!({ "workspaceId": workspace_id, "threadId": thread_id }),
+        )
+        .await;
+    }
+
+    codex_core::thread_live_unsubscribe_core(
+        &state.sessions,
+        workspace_id.clone(),
+        thread_id.clone(),
+    )
+    .await?;
+    emit_thread_live_event(
+        &app,
+        &workspace_id,
+        "thread/live_detached",
+        json!({
+            "workspaceId": workspace_id,
+            "threadId": thread_id,
+            "reason": "manual",
+        }),
+    );
+    Ok(json!({ "ok": true }))
 }
 
 #[tauri::command]
@@ -232,8 +322,10 @@ pub(crate) async fn send_user_message(
     text: String,
     model: Option<String>,
     effort: Option<String>,
+    service_tier: Option<Option<String>>,
     access_mode: Option<String>,
     images: Option<Vec<String>>,
+    app_mentions: Option<Vec<Value>>,
     collaboration_mode: Option<Value>,
     state: State<'_, AppState>,
     app: AppHandle,
@@ -251,8 +343,10 @@ pub(crate) async fn send_user_message(
         payload.insert("text".to_string(), json!(text));
         payload.insert("model".to_string(), json!(model));
         payload.insert("effort".to_string(), json!(effort));
+        insert_optional_nullable_string(&mut payload, "serviceTier", service_tier);
         payload.insert("accessMode".to_string(), json!(access_mode));
         payload.insert("images".to_string(), json!(images));
+        payload.insert("appMentions".to_string(), json!(app_mentions));
         if let Some(mode) = collaboration_mode {
             if !mode.is_null() {
                 payload.insert("collaborationMode".to_string(), mode);
@@ -269,13 +363,16 @@ pub(crate) async fn send_user_message(
 
     codex_core::send_user_message_core(
         &state.sessions,
+        &state.workspaces,
         workspace_id,
         thread_id,
         text,
         model,
         effort,
+        service_tier,
         access_mode,
         images,
+        app_mentions,
         collaboration_mode,
     )
     .await
@@ -288,6 +385,7 @@ pub(crate) async fn turn_steer(
     turn_id: String,
     text: String,
     images: Option<Vec<String>>,
+    app_mentions: Option<Vec<Value>>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<Value, String> {
@@ -308,6 +406,7 @@ pub(crate) async fn turn_steer(
                 "turnId": turn_id,
                 "text": text,
                 "images": images,
+                "appMentions": app_mentions,
             }),
         )
         .await;
@@ -320,6 +419,7 @@ pub(crate) async fn turn_steer(
         turn_id,
         text,
         images,
+        app_mentions,
     )
     .await
 }
@@ -388,7 +488,14 @@ pub(crate) async fn start_review(
         .await;
     }
 
-    codex_core::start_review_core(&state.sessions, workspace_id, thread_id, target, delivery).await
+    codex_core::start_review_core(
+        &state.sessions,
+        workspace_id,
+        thread_id,
+        target,
+        delivery,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -408,6 +515,181 @@ pub(crate) async fn model_list(
     }
 
     codex_core::model_list_core(&state.sessions, workspace_id).await
+}
+
+#[tauri::command]
+pub(crate) async fn experimental_feature_list(
+    workspace_id: String,
+    cursor: Option<String>,
+    limit: Option<u32>,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "experimental_feature_list",
+            json!({
+                "workspaceId": workspace_id,
+                "cursor": cursor,
+                "limit": limit
+            }),
+        )
+        .await;
+    }
+
+    codex_core::experimental_feature_list_core(&state.sessions, workspace_id, cursor, limit).await
+}
+
+#[tauri::command]
+pub(crate) async fn set_codex_feature_flag(
+    feature_key: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        remote_backend::call_remote(
+            &*state,
+            app,
+            "set_codex_feature_flag",
+            json!({
+                "featureKey": feature_key,
+                "enabled": enabled
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    config::write_feature_enabled(feature_key.as_str(), enabled)
+}
+
+#[tauri::command]
+pub(crate) async fn get_agents_settings(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<agents_config_core::AgentsSettingsDto, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        let response =
+            remote_backend::call_remote(&*state, app, "get_agents_settings", json!({})).await?;
+        return serde_json::from_value(response).map_err(|err| err.to_string());
+    }
+
+    agents_config_core::get_agents_settings_core()
+}
+
+#[tauri::command]
+pub(crate) async fn set_agents_core_settings(
+    input: agents_config_core::SetAgentsCoreInput,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<agents_config_core::AgentsSettingsDto, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        let response = remote_backend::call_remote(
+            &*state,
+            app,
+            "set_agents_core_settings",
+            json!({ "input": input }),
+        )
+        .await?;
+        return serde_json::from_value(response).map_err(|err| err.to_string());
+    }
+
+    agents_config_core::set_agents_core_settings_core(input)
+}
+
+#[tauri::command]
+pub(crate) async fn create_agent(
+    input: agents_config_core::CreateAgentInput,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<agents_config_core::AgentsSettingsDto, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        let response =
+            remote_backend::call_remote(&*state, app, "create_agent", json!({ "input": input }))
+                .await?;
+        return serde_json::from_value(response).map_err(|err| err.to_string());
+    }
+
+    agents_config_core::create_agent_core(input)
+}
+
+#[tauri::command]
+pub(crate) async fn update_agent(
+    input: agents_config_core::UpdateAgentInput,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<agents_config_core::AgentsSettingsDto, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        let response =
+            remote_backend::call_remote(&*state, app, "update_agent", json!({ "input": input }))
+                .await?;
+        return serde_json::from_value(response).map_err(|err| err.to_string());
+    }
+
+    agents_config_core::update_agent_core(input)
+}
+
+#[tauri::command]
+pub(crate) async fn delete_agent(
+    input: agents_config_core::DeleteAgentInput,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<agents_config_core::AgentsSettingsDto, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        let response =
+            remote_backend::call_remote(&*state, app, "delete_agent", json!({ "input": input }))
+                .await?;
+        return serde_json::from_value(response).map_err(|err| err.to_string());
+    }
+
+    agents_config_core::delete_agent_core(input)
+}
+
+#[tauri::command]
+pub(crate) async fn read_agent_config_toml(
+    agent_name: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        let response = remote_backend::call_remote(
+            &*state,
+            app,
+            "read_agent_config_toml",
+            json!({ "agentName": agent_name }),
+        )
+        .await?;
+        return serde_json::from_value(response).map_err(|err| err.to_string());
+    }
+
+    agents_config_core::read_agent_config_toml_core(agent_name.as_str())
+}
+
+#[tauri::command]
+pub(crate) async fn write_agent_config_toml(
+    agent_name: String,
+    content: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        remote_backend::call_remote(
+            &*state,
+            app,
+            "write_agent_config_toml",
+            json!({
+                "agentName": agent_name,
+                "content": content,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    agents_config_core::write_agent_config_toml_core(agent_name.as_str(), content.as_str())
 }
 
 #[tauri::command]
@@ -503,7 +785,7 @@ pub(crate) async fn skills_list(
         .await;
     }
 
-    codex_core::skills_list_core(&state.sessions, workspace_id).await
+    codex_core::skills_list_core(&state.sessions, &state.workspaces, workspace_id).await
 }
 
 #[tauri::command]
@@ -511,6 +793,7 @@ pub(crate) async fn apps_list(
     workspace_id: String,
     cursor: Option<String>,
     limit: Option<u32>,
+    thread_id: Option<String>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<Value, String> {
@@ -519,12 +802,17 @@ pub(crate) async fn apps_list(
             &*state,
             app,
             "apps_list",
-            json!({ "workspaceId": workspace_id, "cursor": cursor, "limit": limit }),
+            json!({
+                "workspaceId": workspace_id,
+                "cursor": cursor,
+                "limit": limit,
+                "threadId": thread_id
+            }),
         )
         .await;
     }
 
-    codex_core::apps_list_core(&state.sessions, workspace_id, cursor, limit).await
+    codex_core::apps_list_core(&state.sessions, workspace_id, cursor, limit, thread_id).await
 }
 
 #[tauri::command]
@@ -548,36 +836,6 @@ pub(crate) async fn respond_to_server_request(
 
     codex_core::respond_to_server_request_core(&state.sessions, workspace_id, request_id, result)
         .await
-}
-
-/// Gets the diff content for commit message generation
-#[tauri::command]
-pub(crate) async fn get_commit_message_prompt(
-    workspace_id: String,
-    state: State<'_, AppState>,
-    app: AppHandle,
-) -> Result<String, String> {
-    if remote_backend::is_remote_mode(&*state).await {
-        let value = remote_backend::call_remote(
-            &*state,
-            app,
-            "get_commit_message_prompt",
-            json!({ "workspaceId": workspace_id }),
-        )
-        .await?;
-        return serde_json::from_value(value).map_err(|err| err.to_string());
-    }
-
-    // Get the diff from git
-    let diff = crate::git::get_workspace_diff(&workspace_id, &state).await?;
-
-    if diff.trim().is_empty() {
-        return Err("No changes to generate commit message for".to_string());
-    }
-
-    Ok(crate::shared::codex_aux_core::build_commit_message_prompt(
-        &diff,
-    ))
 }
 
 #[tauri::command]
@@ -612,6 +870,7 @@ pub(crate) async fn get_config_model(
 #[tauri::command]
 pub(crate) async fn generate_commit_message(
     workspace_id: String,
+    commit_message_model_id: Option<String>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<String, String> {
@@ -620,7 +879,10 @@ pub(crate) async fn generate_commit_message(
             &*state,
             app,
             "generate_commit_message",
-            json!({ "workspaceId": workspace_id }),
+            json!({
+                "workspaceId": workspace_id,
+                "commitMessageModelId": commit_message_model_id,
+            }),
         )
         .await?;
         return serde_json::from_value(value).map_err(|err| err.to_string());
@@ -628,15 +890,17 @@ pub(crate) async fn generate_commit_message(
 
     let diff = crate::git::get_workspace_diff(&workspace_id, &state).await?;
 
-    if diff.trim().is_empty() {
-        return Err("No changes to generate commit message for".to_string());
-    }
-
-    let prompt = crate::shared::codex_aux_core::build_commit_message_prompt(&diff);
-    let response = crate::shared::codex_aux_core::run_background_prompt_core(
+    let commit_message_prompt = {
+        let settings = state.app_settings.lock().await;
+        settings.commit_message_prompt.clone()
+    };
+    crate::shared::codex_aux_core::generate_commit_message_core(
         &state.sessions,
+        &state.workspaces,
         workspace_id,
-        prompt,
+        &diff,
+        &commit_message_prompt,
+        commit_message_model_id.as_deref(),
         |workspace_id, thread_id| {
             let _ = app.emit(
                 "app-server-event",
@@ -652,17 +916,8 @@ pub(crate) async fn generate_commit_message(
                 },
             );
         },
-        "Timeout waiting for commit message generation",
-        "Unknown error during commit message generation",
     )
-    .await?;
-
-    let trimmed = response.trim().to_string();
-    if trimmed.is_empty() {
-        return Err("No commit message was generated".to_string());
-    }
-
-    Ok(trimmed)
+    .await
 }
 
 #[tauri::command]
@@ -682,16 +937,11 @@ pub(crate) async fn generate_run_metadata(
         .await;
     }
 
-    let cleaned_prompt = prompt.trim();
-    if cleaned_prompt.is_empty() {
-        return Err("Prompt is required.".to_string());
-    }
-
-    let title_prompt = crate::shared::codex_aux_core::build_run_metadata_prompt(cleaned_prompt);
-    let response_text = crate::shared::codex_aux_core::run_background_prompt_core(
+    crate::shared::codex_aux_core::generate_run_metadata_core(
         &state.sessions,
+        &state.workspaces,
         workspace_id,
-        title_prompt,
+        &prompt,
         |workspace_id, thread_id| {
             let _ = app.emit(
                 "app-server-event",
@@ -707,34 +957,48 @@ pub(crate) async fn generate_run_metadata(
                 },
             );
         },
-        "Timeout waiting for metadata generation",
-        "Unknown error during metadata generation",
     )
-    .await?;
+    .await
+}
 
-    let trimmed = response_text.trim();
-    if trimmed.is_empty() {
-        return Err("No metadata was generated".to_string());
+#[tauri::command]
+pub(crate) async fn generate_agent_description(
+    workspace_id: String,
+    description: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<crate::shared::codex_aux_core::GeneratedAgentConfiguration, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        let value = remote_backend::call_remote(
+            &*state,
+            app,
+            "generate_agent_description",
+            json!({ "workspaceId": workspace_id, "description": description }),
+        )
+        .await?;
+        return serde_json::from_value(value).map_err(|err| err.to_string());
     }
 
-    let json_value = crate::shared::codex_aux_core::extract_json_value(trimmed)
-        .ok_or_else(|| "Failed to parse metadata JSON".to_string())?;
-    let title = json_value
-        .get("title")
-        .and_then(|v| v.as_str())
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| "Missing title in metadata".to_string())?;
-    let worktree_name = json_value
-        .get("worktreeName")
-        .or_else(|| json_value.get("worktree_name"))
-        .and_then(|v| v.as_str())
-        .map(crate::shared::codex_aux_core::sanitize_run_worktree_name)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| "Missing worktree name in metadata".to_string())?;
-
-    Ok(json!({
-        "title": title,
-        "worktreeName": worktree_name
-    }))
+    crate::shared::codex_aux_core::generate_agent_description_core(
+        &state.sessions,
+        &state.workspaces,
+        workspace_id,
+        &description,
+        |workspace_id, thread_id| {
+            let _ = app.emit(
+                "app-server-event",
+                AppServerEvent {
+                    workspace_id: workspace_id.to_string(),
+                    message: json!({
+                        "method": "codex/backgroundThread",
+                        "params": {
+                            "threadId": thread_id,
+                            "action": "hide"
+                        }
+                    }),
+                },
+            );
+        },
+    )
+    .await
 }

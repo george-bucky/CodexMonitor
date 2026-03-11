@@ -10,8 +10,8 @@ import {
   getAppsList as getAppsListService,
   listMcpServerStatus as listMcpServerStatusService,
   compactThread as compactThreadService,
-} from "../../../services/tauri";
-import type { WorkspaceInfo } from "../../../types";
+} from "@services/tauri";
+import type { WorkspaceInfo } from "@/types";
 import { useThreadMessaging } from "./useThreadMessaging";
 
 vi.mock("@sentry/react", () => ({
@@ -20,7 +20,7 @@ vi.mock("@sentry/react", () => ({
   },
 }));
 
-vi.mock("../../../services/tauri", () => ({
+vi.mock("@services/tauri", () => ({
   sendUserMessage: vi.fn(),
   steerTurn: vi.fn(),
   startReview: vi.fn(),
@@ -98,6 +98,7 @@ describe("useThreadMessaging telemetry", () => {
   });
 
   it("records prompt_sent once for one message send", async () => {
+    const ensureWorkspaceRuntimeCodexArgs = vi.fn(async () => undefined);
     const { result } = renderHook(() =>
       useThreadMessaging({
         activeWorkspace: workspace,
@@ -109,6 +110,7 @@ describe("useThreadMessaging telemetry", () => {
         reviewDeliveryMode: "inline",
         steerEnabled: false,
         customPrompts: [],
+        ensureWorkspaceRuntimeCodexArgs,
         threadStatusById: {},
         activeTurnIdByThread: {},
         rateLimitsByWorkspace: {},
@@ -152,9 +154,253 @@ describe("useThreadMessaging telemetry", () => {
         }),
       }),
     );
+    expect(ensureWorkspaceRuntimeCodexArgs).toHaveBeenCalledTimes(1);
+    expect(ensureWorkspaceRuntimeCodexArgs).toHaveBeenCalledWith("ws-1", "thread-1");
+  });
+
+  it("forwards explicit app mentions to turn/start", async () => {
+    const { result } = renderHook(() =>
+      useThreadMessaging({
+        activeWorkspace: workspace,
+        activeThreadId: "thread-1",
+        accessMode: "current",
+        model: null,
+        effort: null,
+        collaborationMode: null,
+        reviewDeliveryMode: "inline",
+        steerEnabled: false,
+        customPrompts: [],
+        threadStatusById: {},
+        activeTurnIdByThread: {},
+        rateLimitsByWorkspace: {},
+        pendingInterruptsRef: { current: new Set<string>() },
+        dispatch: vi.fn(),
+        getCustomName: vi.fn(() => undefined),
+        markProcessing: vi.fn(),
+        markReviewing: vi.fn(),
+        setActiveTurnId: vi.fn(),
+        recordThreadActivity: vi.fn(),
+        safeMessageActivity: vi.fn(),
+        onDebug: vi.fn(),
+        pushThreadErrorMessage: vi.fn(),
+        ensureThreadForActiveWorkspace: vi.fn(async () => "thread-1"),
+        ensureThreadForWorkspace: vi.fn(async () => "thread-1"),
+        refreshThread: vi.fn(async () => null),
+        forkThreadForWorkspace: vi.fn(async () => null),
+        updateThreadParent: vi.fn(),
+      }),
+    );
+
+    await act(async () => {
+      await result.current.sendUserMessage("hello $calendar", [], [
+        { name: "Calendar App", path: "app://connector_calendar" },
+      ]);
+    });
+
+    expect(sendUserMessageService).toHaveBeenCalledWith(
+      "ws-1",
+      "thread-1",
+      "hello $calendar",
+      expect.objectContaining({
+        appMentions: [{ name: "Calendar App", path: "app://connector_calendar" }],
+      }),
+    );
+  });
+
+  it("forwards the selected service tier to turn/start", async () => {
+    const { result } = renderHook(() =>
+      useThreadMessaging({
+        activeWorkspace: workspace,
+        activeThreadId: "thread-1",
+        accessMode: "current",
+        model: null,
+        effort: null,
+        serviceTier: "fast",
+        collaborationMode: null,
+        reviewDeliveryMode: "inline",
+        steerEnabled: false,
+        customPrompts: [],
+        threadStatusById: {},
+        activeTurnIdByThread: {},
+        rateLimitsByWorkspace: {},
+        pendingInterruptsRef: { current: new Set<string>() },
+        dispatch: vi.fn(),
+        getCustomName: vi.fn(() => undefined),
+        markProcessing: vi.fn(),
+        markReviewing: vi.fn(),
+        setActiveTurnId: vi.fn(),
+        recordThreadActivity: vi.fn(),
+        safeMessageActivity: vi.fn(),
+        onDebug: vi.fn(),
+        pushThreadErrorMessage: vi.fn(),
+        ensureThreadForActiveWorkspace: vi.fn(async () => "thread-1"),
+        ensureThreadForWorkspace: vi.fn(async () => "thread-1"),
+        refreshThread: vi.fn(async () => null),
+        forkThreadForWorkspace: vi.fn(async () => null),
+        updateThreadParent: vi.fn(),
+      }),
+    );
+
+    await act(async () => {
+      await result.current.sendUserMessage("hello");
+    });
+
+    expect(sendUserMessageService).toHaveBeenCalledWith(
+      "ws-1",
+      "thread-1",
+      "hello",
+      expect.objectContaining({
+        serviceTier: "fast",
+      }),
+    );
+  });
+
+  it("omits service tier when no override is selected", async () => {
+    const { result } = renderHook(() =>
+      useThreadMessaging({
+        activeWorkspace: workspace,
+        activeThreadId: "thread-1",
+        accessMode: "current",
+        model: null,
+        effort: null,
+        serviceTier: undefined,
+        collaborationMode: null,
+        reviewDeliveryMode: "inline",
+        steerEnabled: false,
+        customPrompts: [],
+        threadStatusById: {},
+        activeTurnIdByThread: {},
+        rateLimitsByWorkspace: {},
+        pendingInterruptsRef: { current: new Set<string>() },
+        dispatch: vi.fn(),
+        getCustomName: vi.fn(() => undefined),
+        markProcessing: vi.fn(),
+        markReviewing: vi.fn(),
+        setActiveTurnId: vi.fn(),
+        recordThreadActivity: vi.fn(),
+        safeMessageActivity: vi.fn(),
+        onDebug: vi.fn(),
+        pushThreadErrorMessage: vi.fn(),
+        ensureThreadForActiveWorkspace: vi.fn(async () => "thread-1"),
+        ensureThreadForWorkspace: vi.fn(async () => "thread-1"),
+        refreshThread: vi.fn(async () => null),
+        forkThreadForWorkspace: vi.fn(async () => null),
+        updateThreadParent: vi.fn(),
+      }),
+    );
+
+    await act(async () => {
+      await result.current.sendUserMessage("hello");
+    });
+
+    expect(sendUserMessageService).toHaveBeenCalledWith(
+      "ws-1",
+      "thread-1",
+      "hello",
+      expect.not.objectContaining({
+        serviceTier: expect.anything(),
+      }),
+    );
+  });
+
+  it("does not forward service tier to review/start", async () => {
+    const { result } = renderHook(() =>
+      useThreadMessaging({
+        activeWorkspace: workspace,
+        activeThreadId: "thread-1",
+        accessMode: "current",
+        model: null,
+        effort: null,
+        serviceTier: "fast",
+        collaborationMode: null,
+        reviewDeliveryMode: "inline",
+        steerEnabled: false,
+        customPrompts: [],
+        threadStatusById: {},
+        activeTurnIdByThread: {},
+        rateLimitsByWorkspace: {},
+        pendingInterruptsRef: { current: new Set<string>() },
+        dispatch: vi.fn(),
+        getCustomName: vi.fn(() => undefined),
+        markProcessing: vi.fn(),
+        markReviewing: vi.fn(),
+        setActiveTurnId: vi.fn(),
+        recordThreadActivity: vi.fn(),
+        safeMessageActivity: vi.fn(),
+        onDebug: vi.fn(),
+        pushThreadErrorMessage: vi.fn(),
+        ensureThreadForActiveWorkspace: vi.fn(async () => "thread-1"),
+        ensureThreadForWorkspace: vi.fn(async () => "thread-1"),
+        refreshThread: vi.fn(async () => null),
+        forkThreadForWorkspace: vi.fn(async () => null),
+        updateThreadParent: vi.fn(),
+      }),
+    );
+
+    await act(async () => {
+      await result.current.startUncommittedReview();
+    });
+
+    expect(startReviewService).toHaveBeenCalledWith(
+      "ws-1",
+      "thread-1",
+      { type: "uncommittedChanges" },
+      "inline",
+    );
+  });
+
+  it("toggles fast mode through the built-in handler", async () => {
+    const dispatch = vi.fn();
+    const onSelectServiceTier = vi.fn();
+    const { result } = renderHook(() =>
+      useThreadMessaging({
+        activeWorkspace: workspace,
+        activeThreadId: "thread-1",
+        accessMode: "current",
+        model: null,
+        effort: null,
+        serviceTier: null,
+        collaborationMode: null,
+        onSelectServiceTier,
+        reviewDeliveryMode: "inline",
+        steerEnabled: false,
+        customPrompts: [],
+        threadStatusById: {},
+        activeTurnIdByThread: {},
+        rateLimitsByWorkspace: {},
+        pendingInterruptsRef: { current: new Set<string>() },
+        dispatch,
+        getCustomName: vi.fn(() => undefined),
+        markProcessing: vi.fn(),
+        markReviewing: vi.fn(),
+        setActiveTurnId: vi.fn(),
+        recordThreadActivity: vi.fn(),
+        safeMessageActivity: vi.fn(),
+        onDebug: vi.fn(),
+        pushThreadErrorMessage: vi.fn(),
+        ensureThreadForActiveWorkspace: vi.fn(async () => "thread-1"),
+        ensureThreadForWorkspace: vi.fn(async () => "thread-1"),
+        refreshThread: vi.fn(async () => null),
+        forkThreadForWorkspace: vi.fn(async () => null),
+        updateThreadParent: vi.fn(),
+      }),
+    );
+
+    await act(async () => {
+      await result.current.startFast("/fast on");
+    });
+
+    expect(onSelectServiceTier).toHaveBeenCalledWith("fast");
+    expect(dispatch).toHaveBeenCalledWith({
+      type: "addAssistantMessage",
+      threadId: "thread-1",
+      text: "Fast mode enabled.",
+    });
   });
 
   it("uses turn/steer when steer mode is enabled and an active turn is present", async () => {
+    const dispatch = vi.fn();
+    const ensureWorkspaceRuntimeCodexArgs = vi.fn(async () => undefined);
     const { result } = renderHook(() =>
       useThreadMessaging({
         activeWorkspace: workspace,
@@ -166,6 +412,7 @@ describe("useThreadMessaging telemetry", () => {
         reviewDeliveryMode: "inline",
         steerEnabled: true,
         customPrompts: [],
+        ensureWorkspaceRuntimeCodexArgs,
         threadStatusById: {
           "thread-1": {
             isProcessing: true,
@@ -180,7 +427,7 @@ describe("useThreadMessaging telemetry", () => {
         },
         rateLimitsByWorkspace: {},
         pendingInterruptsRef: { current: new Set<string>() },
-        dispatch: vi.fn(),
+        dispatch,
         getCustomName: vi.fn(() => undefined),
         markProcessing: vi.fn(),
         markReviewing: vi.fn(),
@@ -214,14 +461,18 @@ describe("useThreadMessaging telemetry", () => {
       [],
     );
     expect(sendUserMessageService).not.toHaveBeenCalled();
+    expect(ensureWorkspaceRuntimeCodexArgs).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "upsertItem" }),
+    );
   });
 
-  it("falls back to turn/start when turn/steer is unsupported and remembers fallback", async () => {
+  it("resets stale processing state when turn/steer reports no active turn", async () => {
+    const pushThreadErrorMessage = vi.fn();
+    const markProcessing = vi.fn();
+    const setActiveTurnId = vi.fn();
     vi.mocked(steerTurnService).mockResolvedValueOnce({
-      error: {
-        message:
-          "Invalid request: unknown variant `turn/steer`, expected one of `turn/start`, `turn/interrupt`",
-      },
+      error: { message: "no active turn to steer" },
     } as unknown as Awaited<ReturnType<typeof steerTurnService>>);
 
     const { result } = renderHook(() =>
@@ -251,13 +502,13 @@ describe("useThreadMessaging telemetry", () => {
         pendingInterruptsRef: { current: new Set<string>() },
         dispatch: vi.fn(),
         getCustomName: vi.fn(() => undefined),
-        markProcessing: vi.fn(),
+        markProcessing,
         markReviewing: vi.fn(),
-        setActiveTurnId: vi.fn(),
+        setActiveTurnId,
         recordThreadActivity: vi.fn(),
         safeMessageActivity: vi.fn(),
         onDebug: vi.fn(),
-        pushThreadErrorMessage: vi.fn(),
+        pushThreadErrorMessage,
         ensureThreadForActiveWorkspace: vi.fn(async () => "thread-1"),
         ensureThreadForWorkspace: vi.fn(async () => "thread-1"),
         refreshThread: vi.fn(async () => null),
@@ -267,43 +518,103 @@ describe("useThreadMessaging telemetry", () => {
     );
 
     await act(async () => {
-      await result.current.sendUserMessageToThread(
+      const sendResult = await result.current.sendUserMessageToThread(
         workspace,
         "thread-1",
-        "fallback once",
+        "steer should fail",
         [],
       );
-    });
-    await act(async () => {
-      await result.current.sendUserMessageToThread(
-        workspace,
-        "thread-1",
-        "fallback twice",
-        [],
-      );
+      expect(sendResult).toEqual({ status: "steer_failed" });
     });
 
     expect(steerTurnService).toHaveBeenCalledTimes(1);
-    expect(sendUserMessageService).toHaveBeenCalledTimes(2);
-    expect(sendUserMessageService).toHaveBeenNthCalledWith(
-      1,
-      "ws-1",
+    expect(sendUserMessageService).not.toHaveBeenCalled();
+    expect(markProcessing).toHaveBeenCalledWith("thread-1", true);
+    expect(markProcessing).toHaveBeenCalledWith("thread-1", false);
+    expect(setActiveTurnId).toHaveBeenCalledWith("thread-1", null);
+    expect(pushThreadErrorMessage).toHaveBeenCalledWith(
       "thread-1",
-      "fallback once",
-      expect.any(Object),
-    );
-    expect(sendUserMessageService).toHaveBeenNthCalledWith(
-      2,
-      "ws-1",
-      "thread-1",
-      "fallback twice",
-      expect.any(Object),
+      "Turn steer failed: no active turn to steer",
     );
   });
 
-  it("falls back to turn/start when remote reports unknown method turn_steer", async () => {
+  it("keeps processing state for non-stale turn/steer rpc errors", async () => {
+    const pushThreadErrorMessage = vi.fn();
+    const markProcessing = vi.fn();
+    const setActiveTurnId = vi.fn();
+    vi.mocked(steerTurnService).mockResolvedValueOnce({
+      error: { message: "steer request timed out" },
+    } as unknown as Awaited<ReturnType<typeof steerTurnService>>);
+
+    const { result } = renderHook(() =>
+      useThreadMessaging({
+        activeWorkspace: workspace,
+        activeThreadId: "thread-1",
+        accessMode: "current",
+        model: null,
+        effort: null,
+        collaborationMode: null,
+        reviewDeliveryMode: "inline",
+        steerEnabled: true,
+        customPrompts: [],
+        threadStatusById: {
+          "thread-1": {
+            isProcessing: true,
+            isReviewing: false,
+            hasUnread: false,
+            processingStartedAt: 0,
+            lastDurationMs: null,
+          },
+        },
+        activeTurnIdByThread: {
+          "thread-1": "turn-1",
+        },
+        rateLimitsByWorkspace: {},
+        pendingInterruptsRef: { current: new Set<string>() },
+        dispatch: vi.fn(),
+        getCustomName: vi.fn(() => undefined),
+        markProcessing,
+        markReviewing: vi.fn(),
+        setActiveTurnId,
+        recordThreadActivity: vi.fn(),
+        safeMessageActivity: vi.fn(),
+        onDebug: vi.fn(),
+        pushThreadErrorMessage,
+        ensureThreadForActiveWorkspace: vi.fn(async () => "thread-1"),
+        ensureThreadForWorkspace: vi.fn(async () => "thread-1"),
+        refreshThread: vi.fn(async () => null),
+        forkThreadForWorkspace: vi.fn(async () => null),
+        updateThreadParent: vi.fn(),
+      }),
+    );
+
+    await act(async () => {
+      const sendResult = await result.current.sendUserMessageToThread(
+        workspace,
+        "thread-1",
+        "steer timeout",
+        [],
+      );
+      expect(sendResult).toEqual({ status: "steer_failed" });
+    });
+
+    expect(steerTurnService).toHaveBeenCalledTimes(1);
+    expect(sendUserMessageService).not.toHaveBeenCalled();
+    expect(markProcessing).toHaveBeenCalledWith("thread-1", true);
+    expect(markProcessing).not.toHaveBeenCalledWith("thread-1", false);
+    expect(setActiveTurnId).not.toHaveBeenCalledWith("thread-1", null);
+    expect(pushThreadErrorMessage).toHaveBeenCalledWith(
+      "thread-1",
+      "Turn steer failed: steer request timed out",
+    );
+  });
+
+  it("returns steer_failed and keeps processing state when turn/steer throws", async () => {
+    const pushThreadErrorMessage = vi.fn();
+    const markProcessing = vi.fn();
+    const setActiveTurnId = vi.fn();
     vi.mocked(steerTurnService).mockRejectedValueOnce(
-      new Error("unknown method: turn_steer"),
+      new Error("steer network failure"),
     );
 
     const { result } = renderHook(() =>
@@ -333,13 +644,13 @@ describe("useThreadMessaging telemetry", () => {
         pendingInterruptsRef: { current: new Set<string>() },
         dispatch: vi.fn(),
         getCustomName: vi.fn(() => undefined),
-        markProcessing: vi.fn(),
+        markProcessing,
         markReviewing: vi.fn(),
-        setActiveTurnId: vi.fn(),
+        setActiveTurnId,
         recordThreadActivity: vi.fn(),
         safeMessageActivity: vi.fn(),
         onDebug: vi.fn(),
-        pushThreadErrorMessage: vi.fn(),
+        pushThreadErrorMessage,
         ensureThreadForActiveWorkspace: vi.fn(async () => "thread-1"),
         ensureThreadForWorkspace: vi.fn(async () => "thread-1"),
         refreshThread: vi.fn(async () => null),
@@ -349,21 +660,126 @@ describe("useThreadMessaging telemetry", () => {
     );
 
     await act(async () => {
-      await result.current.sendUserMessageToThread(
+      const sendResult = await result.current.sendUserMessageToThread(
         workspace,
         "thread-1",
-        "fallback remote method",
+        "steer exception",
         [],
+      );
+      expect(sendResult).toEqual({ status: "steer_failed" });
+    });
+
+    expect(sendUserMessageService).not.toHaveBeenCalled();
+    expect(markProcessing).toHaveBeenCalledWith("thread-1", true);
+    expect(markProcessing).not.toHaveBeenCalledWith("thread-1", false);
+    expect(setActiveTurnId).not.toHaveBeenCalledWith("thread-1", null);
+    expect(pushThreadErrorMessage).toHaveBeenCalledWith(
+      "thread-1",
+      "Turn steer failed: steer network failure",
+    );
+  });
+
+  it("routes uncommitted review to an explicit workspace override", async () => {
+    const ensureThreadForActiveWorkspace = vi.fn(async () => "thread-active");
+    const ensureThreadForWorkspace = vi.fn(async () => "thread-override");
+
+    const { result } = renderHook(() =>
+      useThreadMessaging({
+        activeWorkspace: workspace,
+        activeThreadId: "thread-active",
+        accessMode: "current",
+        model: null,
+        effort: null,
+        collaborationMode: null,
+        reviewDeliveryMode: "detached",
+        steerEnabled: false,
+        customPrompts: [],
+        threadStatusById: {},
+        activeTurnIdByThread: {},
+        rateLimitsByWorkspace: {},
+        pendingInterruptsRef: { current: new Set<string>() },
+        dispatch: vi.fn(),
+        getCustomName: vi.fn(() => undefined),
+        markProcessing: vi.fn(),
+        markReviewing: vi.fn(),
+        setActiveTurnId: vi.fn(),
+        recordThreadActivity: vi.fn(),
+        safeMessageActivity: vi.fn(),
+        onDebug: vi.fn(),
+        pushThreadErrorMessage: vi.fn(),
+        ensureThreadForActiveWorkspace,
+        ensureThreadForWorkspace,
+        refreshThread: vi.fn(async () => null),
+        forkThreadForWorkspace: vi.fn(async () => null),
+        updateThreadParent: vi.fn(),
+      }),
+    );
+
+    await act(async () => {
+      await result.current.startUncommittedReview("ws-2");
+    });
+
+    expect(ensureThreadForActiveWorkspace).not.toHaveBeenCalled();
+    expect(ensureThreadForWorkspace).toHaveBeenCalledWith("ws-2");
+    expect(startReviewService).toHaveBeenCalledWith(
+      "ws-2",
+      "thread-override",
+      { type: "uncommittedChanges" },
+      "detached",
+    );
+  });
+
+  it("names detached commit review child threads from commit context", async () => {
+    vi.mocked(startReviewService).mockResolvedValueOnce({
+      result: {
+        review_thread_id: "thread-review-1",
+      },
+    } as unknown as Awaited<ReturnType<typeof startReviewService>>);
+    const renameThread = vi.fn();
+
+    const { result } = renderHook(() =>
+      useThreadMessaging({
+        activeWorkspace: workspace,
+        activeThreadId: "thread-parent",
+        accessMode: "current",
+        model: null,
+        effort: null,
+        collaborationMode: null,
+        reviewDeliveryMode: "detached",
+        steerEnabled: false,
+        customPrompts: [],
+        threadStatusById: {},
+        activeTurnIdByThread: {},
+        rateLimitsByWorkspace: {},
+        pendingInterruptsRef: { current: new Set<string>() },
+        dispatch: vi.fn(),
+        getCustomName: vi.fn(() => undefined),
+        markProcessing: vi.fn(),
+        markReviewing: vi.fn(),
+        setActiveTurnId: vi.fn(),
+        recordThreadActivity: vi.fn(),
+        safeMessageActivity: vi.fn(),
+        onDebug: vi.fn(),
+        pushThreadErrorMessage: vi.fn(),
+        ensureThreadForActiveWorkspace: vi.fn(async () => "thread-parent"),
+        ensureThreadForWorkspace: vi.fn(async () => "thread-parent"),
+        refreshThread: vi.fn(async () => null),
+        forkThreadForWorkspace: vi.fn(async () => null),
+        updateThreadParent: vi.fn(),
+        renameThread,
+      }),
+    );
+
+    await act(async () => {
+      await result.current.startReview(
+        "/review commit abcdef1234567890 Tighten sidebar commit selection",
       );
     });
 
-    expect(steerTurnService).toHaveBeenCalledTimes(1);
-    expect(sendUserMessageService).toHaveBeenCalledTimes(1);
-    expect(sendUserMessageService).toHaveBeenCalledWith(
+    expect(renameThread).toHaveBeenCalledWith(
       "ws-1",
-      "thread-1",
-      "fallback remote method",
-      expect.any(Object),
+      "thread-review-1",
+      "Review abcdef1: Tighten sidebar commit…",
     );
   });
 });

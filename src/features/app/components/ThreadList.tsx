@@ -1,21 +1,19 @@
-import type { CSSProperties, MouseEvent } from "react";
+import { useMemo, useState, type MouseEvent } from "react";
 
 import type { ThreadSummary } from "../../../types";
+import type { ThreadStatusById } from "../../../utils/threadStatus";
+import { ThreadRow } from "./ThreadRow";
+import { buildThreadRowVisibility } from "./threadRowVisibility";
 
-type ThreadStatusMap = Record<
-  string,
-  { isProcessing: boolean; hasUnread: boolean; isReviewing: boolean }
->;
-
-type ThreadRow = {
+type ThreadListRow = {
   thread: ThreadSummary;
   depth: number;
 };
 
 type ThreadListProps = {
   workspaceId: string;
-  pinnedRows: ThreadRow[];
-  unpinnedRows: ThreadRow[];
+  pinnedRows: ThreadListRow[];
+  unpinnedRows: ThreadListRow[];
   totalThreadRoots: number;
   isExpanded: boolean;
   nextCursor: string | null;
@@ -24,8 +22,10 @@ type ThreadListProps = {
   showLoadOlder?: boolean;
   activeWorkspaceId: string | null;
   activeThreadId: string | null;
-  threadStatusById: ThreadStatusMap;
+  threadStatusById: ThreadStatusById;
+  pendingUserInputKeys?: Set<string>;
   getThreadTime: (thread: ThreadSummary) => string | null;
+  getThreadArgsBadge?: (workspaceId: string, threadId: string) => string | null;
   isThreadPinned: (workspaceId: string, threadId: string) => boolean;
   onToggleExpanded: (workspaceId: string) => void;
   onLoadOlderThreads: (workspaceId: string) => void;
@@ -51,7 +51,9 @@ export function ThreadList({
   activeWorkspaceId,
   activeThreadId,
   threadStatusById,
+  pendingUserInputKeys,
   getThreadTime,
+  getThreadArgsBadge,
   isThreadPinned,
   onToggleExpanded,
   onLoadOlderThreads,
@@ -59,65 +61,85 @@ export function ThreadList({
   onShowThreadMenu,
 }: ThreadListProps) {
   const indentUnit = nested ? 10 : 14;
-  const renderThreadRow = ({ thread, depth }: ThreadRow) => {
-    const relativeTime = getThreadTime(thread);
-    const indentStyle =
-      depth > 0
-        ? ({ "--thread-indent": `${depth * indentUnit}px` } as CSSProperties)
-        : undefined;
-    const status = threadStatusById[thread.id];
-    const statusClass = status?.isReviewing
-      ? "reviewing"
-      : status?.isProcessing
-        ? "processing"
-        : status?.hasUnread
-          ? "unread"
-          : "ready";
-    const canPin = depth === 0;
-    const isPinned = canPin && isThreadPinned(workspaceId, thread.id);
+  const [collapsedThreadKeys, setCollapsedThreadKeys] = useState<Set<string>>(new Set());
 
-    return (
-      <div
-        key={thread.id}
-        className={`thread-row ${
-          workspaceId === activeWorkspaceId && thread.id === activeThreadId
-            ? "active"
-            : ""
-        }`}
-        style={indentStyle}
-        onClick={() => onSelectThread(workspaceId, thread.id)}
-        onContextMenu={(event) =>
-          onShowThreadMenu(event, workspaceId, thread.id, canPin)
-        }
-        role="button"
-        tabIndex={0}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            onSelectThread(workspaceId, thread.id);
-          }
-        }}
-      >
-        <span className={`thread-status ${statusClass}`} aria-hidden />
-        {isPinned && <span className="thread-pin-icon" aria-label="Pinned">📌</span>}
-        <span className="thread-name">{thread.name}</span>
-        <div className="thread-meta">
-          {relativeTime && <span className="thread-time">{relativeTime}</span>}
-          <div className="thread-menu">
-            <div className="thread-menu-trigger" aria-hidden="true" />
-          </div>
-        </div>
-      </div>
-    );
+  const toggleThreadSubagents = (threadId: string) => {
+    const threadKey = `${workspaceId}:${threadId}`;
+    setCollapsedThreadKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(threadKey)) {
+        next.delete(threadKey);
+      } else {
+        next.add(threadKey);
+      }
+      return next;
+    });
   };
+
+  const pinnedVisibility = useMemo(
+    () =>
+      buildThreadRowVisibility(
+        pinnedRows,
+        (row) => collapsedThreadKeys.has(`${workspaceId}:${row.thread.id}`),
+      ),
+    [collapsedThreadKeys, pinnedRows, workspaceId],
+  );
+  const unpinnedVisibility = useMemo(
+    () =>
+      buildThreadRowVisibility(
+        unpinnedRows,
+        (row) => collapsedThreadKeys.has(`${workspaceId}:${row.thread.id}`),
+      ),
+    [collapsedThreadKeys, unpinnedRows, workspaceId],
+  );
 
   return (
     <div className={`thread-list${nested ? " thread-list-nested" : ""}`}>
-      {pinnedRows.map((row) => renderThreadRow(row))}
-      {pinnedRows.length > 0 && unpinnedRows.length > 0 && (
+      {pinnedVisibility.visibleRows.map((row) => (
+        <ThreadRow
+          key={row.thread.id}
+          thread={row.thread}
+          depth={row.depth}
+          workspaceId={workspaceId}
+          indentUnit={indentUnit}
+          activeWorkspaceId={activeWorkspaceId}
+          activeThreadId={activeThreadId}
+          threadStatusById={threadStatusById}
+          pendingUserInputKeys={pendingUserInputKeys}
+          getThreadTime={getThreadTime}
+          getThreadArgsBadge={getThreadArgsBadge}
+          isThreadPinned={isThreadPinned}
+          onSelectThread={onSelectThread}
+          onShowThreadMenu={onShowThreadMenu}
+          hasSubagentChildren={pinnedVisibility.rowsWithChildren.has(row)}
+          subagentsExpanded={!collapsedThreadKeys.has(`${workspaceId}:${row.thread.id}`)}
+          onToggleSubagents={(_, threadId) => toggleThreadSubagents(threadId)}
+        />
+      ))}
+      {pinnedVisibility.visibleRows.length > 0 && unpinnedVisibility.visibleRows.length > 0 && (
         <div className="thread-list-separator" aria-hidden="true" />
       )}
-      {unpinnedRows.map((row) => renderThreadRow(row))}
+      {unpinnedVisibility.visibleRows.map((row) => (
+        <ThreadRow
+          key={row.thread.id}
+          thread={row.thread}
+          depth={row.depth}
+          workspaceId={workspaceId}
+          indentUnit={indentUnit}
+          activeWorkspaceId={activeWorkspaceId}
+          activeThreadId={activeThreadId}
+          threadStatusById={threadStatusById}
+          pendingUserInputKeys={pendingUserInputKeys}
+          getThreadTime={getThreadTime}
+          getThreadArgsBadge={getThreadArgsBadge}
+          isThreadPinned={isThreadPinned}
+          onSelectThread={onSelectThread}
+          onShowThreadMenu={onShowThreadMenu}
+          hasSubagentChildren={unpinnedVisibility.rowsWithChildren.has(row)}
+          subagentsExpanded={!collapsedThreadKeys.has(`${workspaceId}:${row.thread.id}`)}
+          onToggleSubagents={(_, threadId) => toggleThreadSubagents(threadId)}
+        />
+      ))}
       {totalThreadRoots > 3 && (
         <button
           className="thread-more"

@@ -4,6 +4,12 @@ import { useRef, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isMobilePlatform } from "../../../utils/platformPaths";
 import { Composer } from "./Composer";
+import type {
+  AppOption,
+  AppMention,
+  ComposerSendIntent,
+  FollowUpMessageBehavior,
+} from "../../../types";
 
 vi.mock("../../../services/dragDrop", () => ({
   subscribeWindowDragDrop: vi.fn(() => () => {}),
@@ -24,22 +30,40 @@ vi.mock("../../../utils/platformPaths", async () => {
 });
 
 type HarnessProps = {
-  onSend: (text: string, images: string[]) => void;
+  onSend: (
+    text: string,
+    images: string[],
+    appMentions?: AppMention[],
+    submitIntent?: ComposerSendIntent,
+  ) => void;
+  apps?: AppOption[];
+  isProcessing?: boolean;
+  followUpMessageBehavior?: FollowUpMessageBehavior;
+  steerAvailable?: boolean;
+  selectedServiceTier?: "fast" | "flex" | null;
 };
 
-function ComposerHarness({ onSend }: HarnessProps) {
+function ComposerHarness({
+  onSend,
+  apps = [],
+  isProcessing = false,
+  followUpMessageBehavior = "queue",
+  steerAvailable = false,
+  selectedServiceTier = null,
+}: HarnessProps) {
   const [draftText, setDraftText] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   return (
     <Composer
       onSend={onSend}
-      onQueue={() => {}}
       onStop={() => {}}
       canStop={false}
-      isProcessing={false}
+      isProcessing={isProcessing}
       appsEnabled={true}
-      steerEnabled={false}
+      steerAvailable={steerAvailable}
+      followUpMessageBehavior={followUpMessageBehavior}
+      composerFollowUpHintEnabled={true}
       collaborationModes={[]}
       selectedCollaborationModeId={null}
       onSelectCollaborationMode={() => {}}
@@ -49,11 +73,12 @@ function ComposerHarness({ onSend }: HarnessProps) {
       reasoningOptions={[]}
       selectedEffort={null}
       onSelectEffort={() => {}}
+      selectedServiceTier={selectedServiceTier}
       reasoningSupported={false}
       accessMode="current"
       onSelectAccessMode={() => {}}
       skills={[]}
-      apps={[]}
+      apps={apps}
       prompts={[]}
       files={[]}
       draftText={draftText}
@@ -80,7 +105,7 @@ describe("Composer send triggers", () => {
     fireEvent.keyDown(textarea, { key: "Enter" });
 
     expect(onSend).toHaveBeenCalledTimes(1);
-    expect(onSend).toHaveBeenCalledWith("hello world", []);
+    expect(onSend).toHaveBeenCalledWith("hello world", [], undefined, "default");
   });
 
   it("sends once on send-button click", () => {
@@ -92,7 +117,14 @@ describe("Composer send triggers", () => {
     fireEvent.click(screen.getByLabelText("Send"));
 
     expect(onSend).toHaveBeenCalledTimes(1);
-    expect(onSend).toHaveBeenCalledWith("from button", []);
+    expect(onSend).toHaveBeenCalledWith("from button", [], undefined, "default");
+  });
+
+  it("shows the fast-mode indicator when enabled", () => {
+    const onSend = vi.fn();
+    render(<ComposerHarness onSend={onSend} selectedServiceTier="fast" />);
+
+    expect(screen.getByLabelText("Fast mode enabled")).toBeTruthy();
   });
 
   it("blurs the textarea after Enter send on mobile", () => {
@@ -106,7 +138,146 @@ describe("Composer send triggers", () => {
     fireEvent.keyDown(textarea, { key: "Enter" });
 
     expect(onSend).toHaveBeenCalledTimes(1);
-    expect(onSend).toHaveBeenCalledWith("dismiss keyboard", []);
+    expect(onSend).toHaveBeenCalledWith(
+      "dismiss keyboard",
+      [],
+      undefined,
+      "default",
+    );
     expect(blurSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends explicit app mentions when an app autocomplete item is selected", () => {
+    const onSend = vi.fn();
+    render(
+      <ComposerHarness
+        onSend={onSend}
+        apps={[
+          {
+            id: "connector_calendar",
+            name: "Calendar App",
+            description: "Calendar integration",
+            isAccessible: true,
+          },
+        ]}
+      />,
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "$cal" } });
+    fireEvent.keyDown(textarea, { key: "Tab" });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith(
+      "$calendar-app",
+      [],
+      [{ name: "Calendar App", path: "app://connector_calendar" }],
+      "default",
+    );
+  });
+
+  it("uses queue by default while processing when follow-up behavior is queue", () => {
+    const onSend = vi.fn();
+    render(
+      <ComposerHarness
+        onSend={onSend}
+        isProcessing={true}
+        followUpMessageBehavior="queue"
+        steerAvailable={true}
+      />,
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "queue this" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith("queue this", [], undefined, "queue");
+  });
+
+  it("uses opposite follow-up behavior on Shift+Ctrl+Enter while processing", () => {
+    const onSend = vi.fn();
+    render(
+      <ComposerHarness
+        onSend={onSend}
+        isProcessing={true}
+        followUpMessageBehavior="queue"
+        steerAvailable={true}
+      />,
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "steer this" } });
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: true, ctrlKey: true });
+
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith("steer this", [], undefined, "steer");
+  });
+
+  it("falls back to queue when steer is selected but unavailable", () => {
+    const onSend = vi.fn();
+    render(
+      <ComposerHarness
+        onSend={onSend}
+        isProcessing={true}
+        followUpMessageBehavior="steer"
+        steerAvailable={false}
+      />,
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "queue fallback" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    expect(
+      screen.getByText(
+        "Default: Queue (Steer unavailable). Both Enter and Shift+Ctrl+Enter will queue this message.",
+      ),
+    ).toBeTruthy();
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith("queue fallback", [], undefined, "queue");
+  });
+
+  it("treats Shift+Ctrl+Enter like normal send when not processing", () => {
+    const onSend = vi.fn();
+    render(
+      <ComposerHarness
+        onSend={onSend}
+        isProcessing={false}
+        followUpMessageBehavior="queue"
+        steerAvailable={true}
+      />,
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "normal shortcut send" } });
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: true, ctrlKey: true });
+
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend).toHaveBeenCalledWith(
+      "normal shortcut send",
+      [],
+      undefined,
+      "default",
+    );
+  });
+
+  it("does not queue on Tab while processing", () => {
+    const onSend = vi.fn();
+    render(
+      <ComposerHarness
+        onSend={onSend}
+        isProcessing={true}
+        followUpMessageBehavior="queue"
+        steerAvailable={true}
+      />,
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "tab no send" } });
+    fireEvent.keyDown(textarea, { key: "Tab" });
+
+    expect(onSend).not.toHaveBeenCalled();
   });
 });

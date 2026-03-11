@@ -1,8 +1,7 @@
-import { useRef } from "react";
 import Play from "lucide-react/dist/esm/icons/play";
 import type { LaunchScriptIconId } from "../../../types";
 import { PopoverSurface } from "../../design-system/components/popover/PopoverPrimitives";
-import { useDismissibleMenu } from "../hooks/useDismissibleMenu";
+import { useMenuController } from "../hooks/useMenuController";
 import { LaunchScriptIconPicker } from "./LaunchScriptIconPicker";
 import { DEFAULT_LAUNCH_SCRIPT_ICON } from "../utils/launchScriptIcons";
 
@@ -55,24 +54,22 @@ export function LaunchScriptButton({
   onNewDraftLabelChange,
   onCreateNew,
 }: LaunchScriptButtonProps) {
-  const popoverRef = useRef<HTMLDivElement | null>(null);
-  const hasLaunchScript = Boolean(launchScript?.trim());
-
-  useDismissibleMenu({
-    isOpen: editorOpen,
-    containerRef: popoverRef,
-    onClose: () => {
+  const editorMenu = useMenuController({
+    open: editorOpen,
+    onDismiss: () => {
       onCloseEditor();
       onCloseNew?.();
     },
   });
+  const { containerRef: popoverRef } = editorMenu;
+  const hasLaunchScript = Boolean(launchScript?.trim());
 
   return (
     <div className="launch-script-menu" ref={popoverRef}>
       <div className="launch-script-buttons">
         <button
           type="button"
-          className="ghost main-header-action launch-script-run"
+          className="ghost main-header-action launch-script-run ds-tooltip-trigger"
           onClick={onRun}
           onContextMenu={(event) => {
             event.preventDefault();
@@ -81,6 +78,8 @@ export function LaunchScriptButton({
           data-tauri-drag-region="false"
           aria-label={hasLaunchScript ? "Run launch script" : "Set launch script"}
           title={hasLaunchScript ? "Run launch script" : "Set launch script"}
+          data-tooltip={hasLaunchScript ? "Run launch script" : "Set launch script"}
+          data-tooltip-placement="bottom"
         >
           <Play size={14} aria-hidden />
         </button>

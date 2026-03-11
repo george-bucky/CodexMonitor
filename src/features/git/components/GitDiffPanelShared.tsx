@@ -6,6 +6,7 @@ import Plus from "lucide-react/dist/esm/icons/plus";
 import RotateCcw from "lucide-react/dist/esm/icons/rotate-ccw";
 import Upload from "lucide-react/dist/esm/icons/upload";
 import X from "lucide-react/dist/esm/icons/x";
+import { MagicSparkleIcon } from "../../shared/components/MagicSparkleIcon";
 import { formatRelativeTime } from "../../../utils/time";
 import {
   getStatusClass,
@@ -206,12 +207,13 @@ function DiffFileRow({
           {showStage && (
             <button
               type="button"
-              className="diff-row-action diff-row-action--stage"
+              className="diff-row-action diff-row-action--stage ds-tooltip-trigger"
               onClick={(event) => {
                 event.stopPropagation();
                 void onStageFile?.(file.path);
               }}
               data-tooltip="Stage Changes"
+              data-tooltip-align="end"
               aria-label="Stage file"
             >
               <Plus size={12} aria-hidden />
@@ -220,12 +222,13 @@ function DiffFileRow({
           {showUnstage && (
             <button
               type="button"
-              className="diff-row-action diff-row-action--unstage"
+              className="diff-row-action diff-row-action--unstage ds-tooltip-trigger"
               onClick={(event) => {
                 event.stopPropagation();
                 void onUnstageFile?.(file.path);
               }}
               data-tooltip="Unstage Changes"
+              data-tooltip-align="end"
               aria-label="Unstage file"
             >
               <Minus size={12} aria-hidden />
@@ -234,12 +237,13 @@ function DiffFileRow({
           {showDiscard && (
             <button
               type="button"
-              className="diff-row-action diff-row-action--discard"
+              className="diff-row-action diff-row-action--discard ds-tooltip-trigger"
               onClick={(event) => {
                 event.stopPropagation();
                 void onDiscardFile?.(file.path);
               }}
               data-tooltip="Discard Changes"
+              data-tooltip-align="end"
               aria-label="Discard changes"
             >
               <RotateCcw size={12} aria-hidden />
@@ -263,6 +267,12 @@ type DiffSectionProps = {
   onUnstageFile?: (path: string) => Promise<void> | void;
   onDiscardFile?: (path: string) => Promise<void> | void;
   onDiscardFiles?: (paths: string[]) => Promise<void> | void;
+  onReviewUncommittedChanges?: () => Promise<void> | void;
+  showWorktreeApplyAction?: boolean;
+  worktreeApplyTitle?: string | null;
+  worktreeApplyLoading?: boolean;
+  worktreeApplySuccess?: boolean;
+  onApplyWorktreeChanges?: () => Promise<void> | void;
   onFileClick: (
     event: ReactMouseEvent<HTMLDivElement>,
     path: string,
@@ -287,6 +297,12 @@ export function DiffSection({
   onUnstageFile,
   onDiscardFile,
   onDiscardFiles,
+  onReviewUncommittedChanges,
+  showWorktreeApplyAction = false,
+  worktreeApplyTitle = null,
+  worktreeApplyLoading = false,
+  worktreeApplySuccess = false,
+  onApplyWorktreeChanges,
   onFileClick,
   onShowFileMenu,
 }: DiffSectionProps) {
@@ -297,7 +313,14 @@ export function DiffSection({
     filePaths.length > 0;
   const canUnstageAll = section === "staged" && Boolean(onUnstageFile) && filePaths.length > 0;
   const canDiscardAll = section === "unstaged" && Boolean(onDiscardFiles) && filePaths.length > 0;
-  const showSectionActions = canStageAll || canUnstageAll || canDiscardAll;
+  const canReviewUncommitted =
+    section === "unstaged" &&
+    Boolean(onReviewUncommittedChanges) &&
+    filePaths.length > 0;
+  const canApplyWorktree =
+    showWorktreeApplyAction && Boolean(onApplyWorktreeChanges) && filePaths.length > 0;
+  const showSectionActions =
+    canApplyWorktree || canStageAll || canUnstageAll || canDiscardAll || canReviewUncommitted;
 
   return (
     <div className="diff-section">
@@ -307,10 +330,39 @@ export function DiffSection({
         </span>
         {showSectionActions && (
           <div className="diff-section-actions" role="group" aria-label={`${title} actions`}>
+            {canApplyWorktree && (
+              <button
+                type="button"
+                className="diff-row-action diff-row-action--apply ds-tooltip-trigger"
+                onClick={() => {
+                  void onApplyWorktreeChanges?.();
+                }}
+                disabled={worktreeApplyLoading || worktreeApplySuccess}
+                data-tooltip={worktreeApplyTitle ?? "Apply changes to parent workspace"}
+                data-tooltip-align="end"
+                aria-label="Apply worktree changes"
+              >
+                <WorktreeApplyIcon success={worktreeApplySuccess} />
+              </button>
+            )}
+            {canReviewUncommitted && (
+              <button
+                type="button"
+                className="diff-row-action diff-row-action--review ds-tooltip-trigger"
+                onClick={() => {
+                  void onReviewUncommittedChanges?.();
+                }}
+                data-tooltip="Review Uncommitted Changes"
+                data-tooltip-align="end"
+                aria-label="Review uncommitted changes"
+              >
+                <MagicSparkleIcon size={12} />
+              </button>
+            )}
             {canStageAll && (
               <button
                 type="button"
-                className="diff-row-action diff-row-action--stage"
+                className="diff-row-action diff-row-action--stage ds-tooltip-trigger"
                 onClick={() => {
                   if (onStageAllChanges) {
                     void onStageAllChanges();
@@ -323,6 +375,7 @@ export function DiffSection({
                   })();
                 }}
                 data-tooltip="Stage All Changes"
+                data-tooltip-align="end"
                 aria-label="Stage all changes"
               >
                 <Plus size={12} aria-hidden />
@@ -331,7 +384,7 @@ export function DiffSection({
             {canUnstageAll && (
               <button
                 type="button"
-                className="diff-row-action diff-row-action--unstage"
+                className="diff-row-action diff-row-action--unstage ds-tooltip-trigger"
                 onClick={() => {
                   void (async () => {
                     for (const path of filePaths) {
@@ -340,6 +393,7 @@ export function DiffSection({
                   })();
                 }}
                 data-tooltip="Unstage All Changes"
+                data-tooltip-align="end"
                 aria-label="Unstage all changes"
               >
                 <Minus size={12} aria-hidden />
@@ -348,11 +402,12 @@ export function DiffSection({
             {canDiscardAll && (
               <button
                 type="button"
-                className="diff-row-action diff-row-action--discard"
+                className="diff-row-action diff-row-action--discard ds-tooltip-trigger"
                 onClick={() => {
                   void onDiscardFiles?.(filePaths);
                 }}
                 data-tooltip="Discard All Changes"
+                data-tooltip-align="end"
                 aria-label="Discard all changes"
               >
                 <RotateCcw size={12} aria-hidden />

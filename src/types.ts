@@ -2,9 +2,8 @@ export type WorkspaceSettings = {
   sidebarCollapsed: boolean;
   sortOrder?: number | null;
   groupId?: string | null;
+  cloneSourceWorkspaceId?: string | null;
   gitRoot?: string | null;
-  codexHome?: string | null;
-  codexArgs?: string | null;
   launchScript?: string | null;
   launchScripts?: LaunchScriptEntry[] | null;
   worktreeSetupScript?: string | null;
@@ -52,7 +51,6 @@ export type WorkspaceInfo = {
   name: string;
   path: string;
   connected: boolean;
-  codex_bin?: string | null;
   kind?: WorkspaceKind;
   parentId?: string | null;
   worktree?: WorktreeInfo | null;
@@ -64,10 +62,38 @@ export type AppServerEvent = {
   message: Record<string, unknown>;
 };
 
+export type TrayRecentThreadEntry = {
+  workspaceId: string;
+  workspaceLabel: string;
+  threadId: string;
+  threadLabel: string;
+  updatedAt: number;
+};
+
+export type TraySessionUsage = {
+  sessionLabel: string;
+  weeklyLabel: string | null;
+};
+
+export type TrayOpenThreadPayload = {
+  workspaceId: string;
+  threadId: string;
+};
+
 export type Message = {
   id: string;
   role: "user" | "assistant";
   text: string;
+};
+
+export type CollabAgentRef = {
+  threadId: string;
+  nickname?: string;
+  role?: string;
+};
+
+export type CollabAgentStatus = CollabAgentRef & {
+  status: string;
 };
 
 export type ConversationItem =
@@ -77,6 +103,17 @@ export type ConversationItem =
       role: "user" | "assistant";
       text: string;
       images?: string[];
+    }
+  | {
+      id: string;
+      kind: "userInput";
+      status: "answered";
+      questions: {
+        id: string;
+        header: string;
+        question: string;
+        answers: string[];
+      }[];
     }
   | { id: string; kind: "reasoning"; summary: string; content: string }
   | { id: string; kind: "diff"; title: string; diff: string; status?: string }
@@ -97,15 +134,27 @@ export type ConversationItem =
       output?: string;
       durationMs?: number | null;
       changes?: { path: string; kind?: string; diff?: string }[];
+      collabSender?: CollabAgentRef;
+      collabReceiver?: CollabAgentRef;
+      collabReceivers?: CollabAgentRef[];
+      collabStatuses?: CollabAgentStatus[];
     };
 
 export type ThreadSummary = {
   id: string;
   name: string;
   updatedAt: number;
+  createdAt?: number;
+  modelId?: string | null;
+  effort?: string | null;
+  isSubagent?: boolean;
 };
 
 export type ThreadListSortKey = "created_at" | "updated_at";
+export type ThreadListOrganizeMode =
+  | "by_project"
+  | "by_project_activity"
+  | "threads_only";
 
 export type ReviewTarget =
   | { type: "uncommittedChanges" }
@@ -113,12 +162,53 @@ export type ReviewTarget =
   | { type: "commit"; sha: string; title?: string }
   | { type: "custom"; instructions: string };
 
+export type PullRequestReviewIntent =
+  | "full"
+  | "risks"
+  | "tests"
+  | "summary"
+  | "question";
+
+export type PullRequestReviewAction = {
+  id: string;
+  label: string;
+  intent: PullRequestReviewIntent;
+};
+
+export type PullRequestSelectionLine = {
+  type: "add" | "del" | "context";
+  oldLine: number | null;
+  newLine: number | null;
+  text: string;
+};
+
+export type PullRequestSelectionRange = {
+  path: string;
+  status: string;
+  start: number;
+  end: number;
+  lines: PullRequestSelectionLine[];
+};
+
 export type AccessMode = "read-only" | "current" | "full-access";
+export type ServiceTier = "fast" | "flex";
 export type BackendMode = "local" | "remote";
-export type RemoteBackendProvider = "tcp" | "orbit";
+export type RemoteBackendProvider = "tcp";
+export type RemoteBackendTarget = {
+  id: string;
+  name: string;
+  provider: RemoteBackendProvider;
+  host: string;
+  token: string | null;
+  lastConnectedAtMs?: number | null;
+};
 export type ThemePreference = "system" | "light" | "dark" | "dim";
 export type PersonalityPreference = "friendly" | "pragmatic";
-
+export type FollowUpMessageBehavior = "queue" | "steer";
+export type ComposerSendIntent = "default" | "queue" | "steer";
+export type SendMessageResult = {
+  status: "sent" | "blocked" | "steer_failed";
+};
 
 export type ComposerEditorPreset = "default" | "helpful" | "smart";
 
@@ -149,14 +239,9 @@ export type AppSettings = {
   remoteBackendProvider: RemoteBackendProvider;
   remoteBackendHost: string;
   remoteBackendToken: string | null;
-  orbitWsUrl: string | null;
-  orbitAuthUrl: string | null;
-  orbitRunnerName: string | null;
-  orbitAutoStartRunner: boolean;
+  remoteBackends: RemoteBackendTarget[];
+  activeRemoteBackendId: string | null;
   keepDaemonRunningAfterAppClose: boolean;
-  orbitUseAccess: boolean;
-  orbitAccessClientId: string | null;
-  orbitAccessClientSecretRef: string | null;
   defaultAccessMode: AccessMode;
   reviewDeliveryMode: "inline" | "detached";
   composerModelShortcut: string | null;
@@ -183,16 +268,24 @@ export type AppSettings = {
   theme: ThemePreference;
   usageShowRemaining: boolean;
   showMessageFilePath: boolean;
+  chatHistoryScrollbackItems: number | null;
+  threadTitleAutogenerationEnabled: boolean;
   uiFontFamily: string;
   codeFontFamily: string;
   codeFontSize: number;
   notificationSoundsEnabled: boolean;
   systemNotificationsEnabled: boolean;
+  subagentSystemNotificationsEnabled: boolean;
+  splitChatDiffView: boolean;
   preloadGitDiffs: boolean;
   gitDiffIgnoreWhitespaceChanges: boolean;
-  experimentalCollabEnabled: boolean;
+  commitMessagePrompt: string;
+  commitMessageModelId: string | null;
   collaborationModesEnabled: boolean;
   steerEnabled: boolean;
+  followUpMessageBehavior: FollowUpMessageBehavior;
+  composerFollowUpHintEnabled: boolean;
+  pauseQueuedMessagesWhenResponseRequired: boolean;
   unifiedExecEnabled: boolean;
   experimentalAppsEnabled: boolean;
   personality: PersonalityPreference;
@@ -214,49 +307,21 @@ export type AppSettings = {
   selectedOpenAppId: string;
 };
 
-export type OrbitConnectTestResult = {
-  ok: boolean;
-  latencyMs: number | null;
-  message: string;
-  details?: string | null;
-};
+export type CodexFeatureStage =
+  | "under_development"
+  | "beta"
+  | "stable"
+  | "deprecated"
+  | "removed";
 
-export type OrbitDeviceCodeStart = {
-  deviceCode: string;
-  userCode: string | null;
-  verificationUri: string;
-  verificationUriComplete: string | null;
-  intervalSeconds: number;
-  expiresInSeconds: number;
-};
-
-export type OrbitSignInStatus =
-  | "pending"
-  | "authorized"
-  | "denied"
-  | "expired"
-  | "error";
-
-export type OrbitSignInPollResult = {
-  status: OrbitSignInStatus;
-  token: string | null;
-  message: string | null;
-  intervalSeconds: number | null;
-};
-
-export type OrbitSignOutResult = {
-  success: boolean;
-  message: string | null;
-};
-
-export type OrbitRunnerState = "stopped" | "running" | "error";
-
-export type OrbitRunnerStatus = {
-  state: OrbitRunnerState;
-  pid: number | null;
-  startedAtMs: number | null;
-  lastError: string | null;
-  orbitUrl: string | null;
+export type CodexFeature = {
+  name: string;
+  stage: CodexFeatureStage;
+  enabled: boolean;
+  defaultEnabled: boolean;
+  displayName: string | null;
+  description: string | null;
+  announcement: string | null;
 };
 
 export type TcpDaemonState = "stopped" | "running" | "error";
@@ -544,6 +609,12 @@ export type QueuedMessage = {
   text: string;
   createdAt: number;
   images?: string[];
+  appMentions?: AppMention[];
+};
+
+export type AppMention = {
+  name: string;
+  path: string;
 };
 
 export type ModelOption = {

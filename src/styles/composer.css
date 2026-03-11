@@ -27,6 +27,12 @@
   color: var(--text-fainter);
 }
 
+.composer-queue-hint {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-faint);
+}
+
 .composer-queue-list {
   display: flex;
   flex-direction: column;
@@ -60,8 +66,66 @@
   cursor: pointer;
 }
 
-.composer-queue-menu:hover {
+.composer-queue-menu-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.composer-queue-menu:hover,
+.composer-queue-menu.is-open {
   color: var(--text-stronger);
+}
+
+.composer-queue-item-popover {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 4px);
+  min-width: 110px;
+  padding: 4px;
+  z-index: 40;
+}
+
+.composer-followup-hint {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border-muted);
+  background: var(--surface-card);
+}
+
+.composer-followup-title {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-fainter);
+}
+
+.composer-followup-copy {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-subtle);
+}
+
+.composer-context-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.composer-context-action {
+  font-size: 11px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-muted);
+  background: var(--surface-card);
+  color: var(--text-muted);
+}
+
+.composer-context-action:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--text-strong);
 }
 
 .composer-input {
@@ -744,6 +808,17 @@
   transform: translateY(1px);
 }
 
+.composer-fast-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  color: var(--accent-warning-strong, #b45309);
+  background: color-mix(in srgb, var(--accent-warning-strong, #b45309) 16%, transparent);
+}
+
 .composer-select {
   appearance: none;
   border: none;
@@ -787,6 +862,11 @@
 
 .composer-select:focus {
   outline: none;
+  color: var(--text-strong);
+}
+
+.composer-select option {
+  background-color: var(--surface-popover);
   color: var(--text-strong);
 }
 
@@ -876,6 +956,10 @@
   }
 
   .app.layout-phone .composer-context {
+    display: none;
+  }
+
+  .app.layout-phone .composer-followup-hint {
     display: none;
   }
 
